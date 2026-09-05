@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ytedit — web editor</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🎬</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+<!-- UMD builds: wavesurfer defines window.WaveSurfer, the plugin attaches WaveSurfer.Regions -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/wavesurfer.js/7.12.11/wavesurfer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/wavesurfer.js/7.12.11/plugins/regions.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <a class="brand" href="/">ytedit <span>editor</span></a>
+    <select id="project-select" title="Switch project"></select>
+    <button id="btn-new-project" class="ghost small" title="Create a project">+ new</button>
+    <div class="hint" id="next-step">Loading…</div>
+    <div class="spend" id="spend"></div>
+    <button id="btn-refresh" class="ghost small" title="Reload state (R)">⟳</button>
+    <button id="btn-help" class="ghost small" title="Keyboard shortcuts">?</button>
+  </header>
+
+  <nav class="stagebar" id="stagebar"></nav>
+
+  <aside class="onboard hidden" id="onboard">
+    <b>Three views</b>
+    <span><b>Clips</b> (left) — review the raw sources, mute noise or bar music, read transcripts.</span>
+    <span><b>Program</b> — the final cut: watch it, trim, reorder, re-render.</span>
+    <span><b>Publish</b> — titles, description, chapters, thumbnails.</span>
+    <span class="grow"></span>
+    <button class="ghost small" id="onboard-close" title="Hide this (remembered)">got it</button>
+  </aside>
+
+  <section class="projects hidden" id="projects">
+    <h2>Projects</h2>
+    <p class="muted">Pick a project, or create one and drop clips into its <code>input/</code>.</p>
+    <div class="project-grid" id="project-grid"></div>
+  </section>
+
+  <!-- program-mode matches the Program tab being active below; boot() corrects
+       both once it knows whether this project has a timeline yet. -->
+  <main class="grid hidden program-mode" id="editor">
+
+    <aside class="col">
+      <header>
+        <span>Clips <b id="clip-count" class="mono"></b></span>
+        <label class="faint"><input type="checkbox" id="hide-excluded"> hide excluded</label>
+      </header>
+      <div class="scroll" id="clip-list"></div>
+    </aside>
+
+    <section class="col">
+      <div class="video-wrap"><video id="video" playsinline preload="metadata"></video></div>
+      <div class="player-meta" id="player-meta"></div>
+      <div id="waveform"></div>
+      <div class="wave-tools">
+        <span class="faint">drag on the waveform to select</span>
+        <span class="legend"><i style="background:#ff5c5c"></i>mute</span>
+        <span class="legend"><i style="background:#f0b429"></i>music</span>
+        <span class="legend"><i style="background:#a78bfa"></i>take</span>
+        <span class="grow"></span>
+        <span class="mono faint" id="sel-info">no selection</span>
+        <button class="small" id="btn-sel-mute" disabled title="Mute the selection (M)">Mute</button>
+        <button class="small" id="btn-sel-duck" disabled title="Duck the selection by 12 dB">Duck −12</button>
+        <button class="small primary" id="btn-sel-add" disabled title="Add the selection to the timeline">+ Timeline</button>
+        <button class="small ghost" id="btn-sel-clear" disabled>clear</button>
+      </div>
+      <div class="scroll" id="transcript"></div>
+      <div class="clip-editor">
+        <div class="row spread" style="margin-bottom:5px">
+          <label class="row faint"><input type="checkbox" id="clip-exclude"> exclude this clip from the edit</label>
+          <select id="clip-kind" title="Override the analysed kind">
+            <option value="">kind: auto</option>
+            <option>a-roll</option><option>b-roll</option><option>silent-broll</option>
+            <option>audio-only</option><option>instruction</option><option>still</option>
+          </select>
+        </div>
+        <textarea id="clip-notes" placeholder="Notes about this clip (saved on blur)…"></textarea>
+        <div class="row wrap denoise" id="clip-denoise"></div>
+      </div>
+    </section>
+
+    <section class="col">
+      <nav class="tabs" id="tabs">
+        <button data-tab="program" class="active">▶ Program</button>
+        <button data-tab="plan">Plan</button>
+        <button data-tab="footage">Footage log</button>
+        <button data-tab="preview">Preview</button>
+        <button data-tab="qc">QC</button>
+        <button data-tab="publish">Publish</button>
+        <button data-tab="advanced" title="Raw timeline lists (segments, captions, cues, markers)">Advanced</button>
+      </nav>
+      <div class="tab-panels">
+        <div class="panel active" data-panel="program" id="panel-program"></div>
+        <div class="panel" data-panel="advanced" id="panel-timeline"></div>
+        <div class="panel" data-panel="plan" id="panel-plan"></div>
+        <div class="panel" data-panel="footage" id="panel-footage"></div>
+        <div class="panel" data-panel="preview" id="panel-preview"></div>
+        <div class="panel" data-panel="qc" id="panel-qc"></div>
+        <div class="panel" data-panel="publish" id="panel-publish"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="jobbar collapsed hidden" id="jobbar">
+    <header id="jobbar-header">
+      <b id="job-title">Jobs</b>
+      <span class="progress" id="job-progress" hidden><i style="width:0%"></i></span>
+      <span class="mono" id="job-status"></span>
+      <span class="grow"></span>
+      <button class="small danger" id="btn-cancel-job" hidden>cancel</button>
+      <span class="faint" id="jobbar-toggle">▲</span>
+    </header>
+    <div class="jobs-list" id="jobs-list"></div>
+    <pre class="log" id="job-log"></pre>
+  </footer>
+</div>
+
+<div class="popover hidden" id="popover"></div>
+<div id="toasts"></div>
+
+<dialog id="dlg-new">
+  <h3>New project</h3>
+  <div class="row" style="margin:8px 0"><label style="width:80px">Slug</label>
+    <input type="text" id="np-slug" class="grow" placeholder="lisbon-day-1"></div>
+  <div class="row" style="margin:8px 0"><label style="width:80px">Title</label>
+    <input type="text" id="np-title" class="grow" placeholder="Lizbona, dzień 1"></div>
+  <div class="row" style="margin:8px 0"><label style="width:80px">Language</label>
+    <input type="text" id="np-language" class="grow" value="pl"></div>
+  <div class="row spread" style="margin-top:14px">
+    <button id="np-cancel" class="ghost">Cancel</button>
+    <button id="np-create" class="primary">Create</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-help">
+  <h3>Keyboard — Program view</h3>
+  <table class="data">
+    <tr><td><span class="kbd">space</span></td><td>play / pause the programme</td></tr>
+    <tr><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>step 0.1 s (with shift: 1 s)</td></tr>
+    <tr><td><span class="kbd">[</span> / <span class="kbd">]</span></td><td>set in / out of the selected segment at the source playhead</td></tr>
+    <tr><td><span class="kbd">del</span></td><td>delete the selected segment</td></tr>
+    <tr><td><span class="kbd">S</span></td><td>save the timeline</td></tr>
+  </table>
+  <h3 style="margin-top:14px">Keyboard — Clips view</h3>
+  <table class="data">
+    <tr><td><span class="kbd">space</span></td><td>play / pause</td></tr>
+    <tr><td><span class="kbd">I</span> / <span class="kbd">O</span></td><td>set selection in / out at the playhead</td></tr>
+    <tr><td><span class="kbd">M</span></td><td>mute the current selection</td></tr>
+    <tr><td><span class="kbd">S</span></td><td>save the timeline</td></tr>
+    <tr><td><span class="kbd">R</span></td><td>reload project state</td></tr>
+    <tr><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>nudge 1 s (with shift: 5 s)</td></tr>
+    <tr><td><span class="kbd">↑</span> / <span class="kbd">↓</span></td><td>previous / next clip</td></tr>
+    <tr><td><span class="kbd">esc</span></td><td>clear the selection</td></tr>
+  </table>
+  <div class="row spread" style="margin-top:14px"><span></span><button id="help-close" class="primary">Close</button></div>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

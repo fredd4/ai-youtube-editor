@@ -1,0 +1,100 @@
+# ASS (libass) caption styles. Sizes are given for the 1920x1080 canvas; the ASS
+# writer scales them by (canvas_height / reference_height) for other canvases.
+#
+# Font choice: "Arial Bold" ships with macOS as a single-file TTF (no TTC index
+# needed by libass) and covers the full Polish set (Ą Ć Ę Ł Ń Ó Ś Ź Ż ą ć ę ł ń
+# ó ś ź ż) — verified against its cmap.
+#
+# ASS colours are &HAABBGGRR (AA = 00 opaque, FF transparent).
+
+reference:
+  width: 1920
+  height: 1080
+
+font:
+  name: Arial
+  file: /System/Library/Fonts/Supplemental/Arial Bold.ttf
+  fonts_dir: /System/Library/Fonts/Supplemental
+  fallbacks:
+    - name: Helvetica Neue
+      file: /System/Library/Fonts/HelveticaNeue.ttc
+    - name: Avenir Next
+      file: /System/Library/Fonts/Avenir Next.ttc
+  polish_glyphs_verified: true
+
+safe_area:
+  # Fractions of the canvas. Titles never leave this box.
+  left: 0.05
+  right: 0.05
+  top: 0.05
+  bottom: 0.12
+
+styles:
+  # Location card: lower-left, e.g. "LIZBONA, PORTUGALIA".
+  location:
+    fontname: Arial
+    fontsize: 54          # ~5% of 1080
+    bold: 1
+    italic: 0
+    primary_colour: "&H00FFFFFF"
+    outline_colour: "&H00000000"
+    back_colour: "&H80000000"
+    border_style: 1        # 1 = outline + drop shadow
+    outline: 3
+    shadow: 2
+    alignment: 1           # bottom-left
+    margin_l: 96           # 5% of 1920
+    margin_r: 96
+    margin_v: 130          # 12% of 1080
+    spacing: 0.5
+    uppercase: true
+    fade_in_ms: 400
+    fade_out_ms: 400
+    default_duration: 3.0
+
+  # Hook / statement card: centered, large, short.
+  hook:
+    fontname: Arial
+    fontsize: 84           # ~7.8% of 1080
+    bold: 1
+    italic: 0
+    primary_colour: "&H00FFFFFF"
+    outline_colour: "&H00000000"
+    back_colour: "&H90000000"
+    border_style: 1
+    outline: 4
+    shadow: 3
+    alignment: 5           # middle-center
+    margin_l: 192          # 10% — keeps long lines off the edges
+    margin_r: 192
+    margin_v: 0
+    spacing: 0.0
+    uppercase: false
+    fade_in_ms: 250
+    fade_out_ms: 250
+    default_duration: 2.5
+
+  # Burned-in spoken subtitles: bottom center, 3-5 words per cue.
+  subtitle:
+    fontname: Arial
+    fontsize: 52
+    bold: 1
+    italic: 0
+    primary_colour: "&H00FFFFFF"
+    outline_colour: "&H00000000"
+    back_colour: "&H60000000"
+    border_style: 1
+    outline: 3
+    shadow: 1
+    alignment: 2           # bottom-center
+    margin_l: 192
+    margin_r: 192
+    margin_v: 108          # 10% of 1080
+    spacing: 0.0
+    uppercase: false
+    fade_in_ms: 0
+    fade_out_ms: 0
+    words_per_cue_min: 3
+    words_per_cue_max: 5
+    max_chars_per_line: 34
+    max_lines: 2

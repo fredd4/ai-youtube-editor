@@ -1,0 +1,123 @@
+# ElevenLabs Music presets for travel content.
+# Prompt formula (proven in amazonia-studio):
+#   genre/fusion sentence -> named instruments -> atmosphere -> arc -> BPM -> "Instrumental."
+# All presets are instrumental and generated in loop mode so beds can be
+# trimmed/extended to any cue length without an audible ending.
+
+defaults:
+  model_id: music_v2
+  force_instrumental: true
+  generation_mode: loop
+  output_format: mp3_44100_192
+  default_length_ms: 90000
+  gain_db: -18          # bed level under narration before ducking
+  fade_in: 2.0
+  fade_out: 3.0
+
+styles:
+  arrival-warm:
+    label: Arrival, warm
+    mood: [warm, nostalgic, welcoming]
+    bpm: 92
+    prompt: >-
+      Warm nostalgic acoustic folk travel bed with a gentle cinematic edge.
+      Fingerpicked nylon guitar as the lead, soft upright piano, light shaker and
+      brushed frame drum, warm analog pad underneath. Atmosphere of stepping off
+      a plane into golden late-afternoon light in an unfamiliar city, curious and
+      unhurried. Arc: single guitar figure opens alone, piano and shaker join after
+      eight bars, pad swells and holds, never resolves so it can loop. 92 BPM.
+      Instrumental.
+    negative: "No vocals, no heavy drums, no brass, no electronic drops."
+
+  city-energy:
+    label: City energy
+    mood: [energetic, modern, forward]
+    bpm: 112
+    prompt: >-
+      Modern indie-electronic travel groove, bright and forward-moving.
+      Muted staccato electric guitar, plucked synth arpeggio, tight kick and
+      rimshot, clean sub bass, occasional handclaps. Atmosphere of crossing a busy
+      European city on foot, trams and traffic, everything in motion. Arc: pulse
+      established immediately, arpeggio enters at bar five, a filter opens into a
+      wider chorus, then settles back to the pulse for a seamless loop.
+      112 BPM. Instrumental.
+    negative: "No vocals, no aggressive EDM drop, no distorted guitars."
+
+  market-bustle:
+    label: Market bustle
+    mood: [playful, rhythmic, colourful]
+    bpm: 104
+    prompt: >-
+      Playful world-fusion groove with a light latin swing. Nylon guitar
+      montuno, marimba, congas and shaker, muted trumpet stabs far back in the
+      mix, walking upright bass. Atmosphere of a crowded covered market, spices
+      and shouting vendors, warm and slightly chaotic. Arc: percussion opens,
+      marimba states the theme, guitar and bass lock in, brief break, then the
+      full groove returns and loops. 104 BPM. Instrumental.
+    negative: "No vocals, no synths, no drum machine."
+
+  nature-calm:
+    label: Nature, calm
+    mood: [calm, spacious, green]
+    bpm: 72
+    prompt: >-
+      Calm organic ambient bed with a folk heart. Soft felt piano, sustained
+      cello, breathy wooden flute, very light brushed cymbal texture, deep warm
+      pad. Atmosphere of a quiet forest trail or a lake at dawn, mist and cold
+      clean air, plenty of space between notes. Arc: piano motif alone, cello
+      answers, flute floats over the top, dynamics stay flat and wide throughout
+      so it loops invisibly. 72 BPM. Instrumental.
+    negative: "No drums, no percussion, no bass hits, no vocals."
+
+  sunset-reflective:
+    label: Sunset, reflective
+    mood: [reflective, bittersweet, cinematic]
+    bpm: 84
+    prompt: >-
+      Bittersweet cinematic ambient-folk bed. Reverbed electric guitar swells,
+      felt piano, warm string section held long, subtle vinyl texture, very soft
+      kick pulse. Atmosphere of the last hour of daylight over rooftops, the day
+      ending, a little melancholy under the beauty. Arc: guitar swell opens, piano
+      enters with a simple falling motif, strings lift once and release, ending
+      left open for a loop. 84 BPM. Instrumental.
+    negative: "No vocals, no big drums, no brass."
+
+  adventure-drive:
+    label: Adventure drive
+    mood: [driving, wide, optimistic]
+    bpm: 120
+    prompt: >-
+      Wide-screen indie rock travel motor. Palm-muted electric guitar ostinato,
+      driving floor tom and kick, bright piano octaves, layered handclaps,
+      soaring guitar lead in the second half. Atmosphere of a road trip through
+      open country, windows down, horizon everywhere. Arc: guitar ostinato and
+      kick from bar one, drums fill out, piano doubles the theme, lead guitar
+      takes over, then drops back to the ostinato and loops. 120 BPM.
+      Instrumental.
+    negative: "No vocals, no EDM synths, no orchestral brass."
+
+  night-mysterious:
+    label: Night, mysterious
+    mood: [mysterious, nocturnal, tense]
+    bpm: 96
+    prompt: >-
+      Nocturnal downtempo electronic bed with a noir edge. Deep analog sub bass,
+      muted Rhodes chords, sparse dubby snare with long tail, filtered pad drone,
+      distant metallic percussion. Atmosphere of narrow lit streets after
+      midnight, neon on wet stone, curiosity with a hint of unease. Arc: bass and
+      drone open, Rhodes enters sparsely, snare pattern builds slowly, filter
+      closes at the end back to the drone for a loop. 96 BPM. Instrumental.
+    negative: "No vocals, no bright melodies, no acoustic guitar."
+
+  outro-hopeful:
+    label: Outro, hopeful
+    mood: [hopeful, resolving, warm]
+    bpm: 88
+    prompt: >-
+      Hopeful cinematic acoustic outro bed. Layered acoustic guitars, warm piano
+      chords, soft string pad rising, gentle kick and tambourine, light glockenspiel
+      accents. Atmosphere of looking back on a good trip, gratitude and a smile,
+      the story closing well. Arc: guitar and piano together, strings rise steadily,
+      glockenspiel sparkles near the peak, dynamics stay full so the bed can be
+      faded out on any bar. 88 BPM. Instrumental.
+    negative: "No vocals, no heavy percussion, no dark harmonies."

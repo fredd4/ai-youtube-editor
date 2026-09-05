@@ -1,0 +1,228 @@
+# Global defaults for every project. A project may override any key in its own
+# projects/<slug>/project.yaml (deep-merged on top of this file).
+
+language: pl
+budget_usd: 20.0
+
+canvas:
+  width: 1920
+  height: 1080
+  fps: 30
+  sar: "1/1"
+
+proxy:
+  width: 1280
+  height: 720
+  # h264_videotoolbox quality (1-100, higher = better); libx264 fallback uses crf.
+  videotoolbox_q: 55
+  x264_crf: 23
+  x264_preset: veryfast
+
+encoding:
+  # Mezzanine written by ingest (normalized sources).
+  mezzanine:
+    vcodec: libx264
+    crf: 16
+    preset: fast
+    pix_fmt: yuv420p
+    acodec: aac
+    abitrate: 256k
+  # Per-segment intermediates written by render.
+  segment:
+    vcodec: libx264
+    crf: 16
+    preset: fast
+    pix_fmt: yuv420p
+  # Final YouTube master.
+  master:
+    vcodec: libx264
+    crf: 18
+    preset: slow
+    profile: high
+    level: "4.2"
+    pix_fmt: yuv420p
+    gop: 15
+    keyint_min: 15
+    bf: 2
+    sc_threshold: 0
+    movflags: "+faststart"
+    color_primaries: bt709
+    color_trc: bt709
+    colorspace: bt709
+  # Fast preview render (hardware encoder).
+  preview:
+    vcodec: h264_videotoolbox
+    q: 60
+    profile: high
+    level: "4.2"
+    pix_fmt: yuv420p
+    movflags: "+faststart"
+    fallback_vcodec: libx264
+    fallback_crf: 23
+    fallback_preset: veryfast
+
+audio:
+  sample_rate: 48000
+  channels: 2
+  acodec: aac
+  abitrate: 384k
+  # Mono 48k wav extracted by ingest for STT / analysis / peaks.
+  work_wav:
+    sample_rate: 48000
+    channels: 1
+    codec: pcm_s16le
+  loudnorm:
+    I: -14
+    TP: -1.5
+    LRA: 11
+    two_pass: true
+  silencedetect:
+    noise_db: -35
+    min_duration: 0.45
+    headroom: 0.12
+  # Narration cleanup applied to the program voice bus before loudnorm
+  # (playbook rule 17): none | light (highpass + compressor) | full (+ afftdn + deesser).
+  voice_cleanup: light
+
+ducking:
+  amount_db: -12
+  attack: 0.15
+  release: 0.6
+  pre_roll: 0.15
+  # Speech-range derivation from transcripts.
+  merge_gap: 0.4
+  pad: 0.15
+
+grade:
+  presets:
+    none: []
+    default:
+      - "eq=brightness=0.02:contrast=1.08:saturation=1.06:gamma=1.02"
+      - "colorbalance=rs=-0.02:bs=0.03:rm=0.01:bm=-0.01"
+      - "vibrance=intensity=0.25"
+    # Same look plus a light sharpen; only for non-iPhone / soft sources.
+    default_sharp:
+      - "eq=brightness=0.02:contrast=1.08:saturation=1.06:gamma=1.02"
+      - "colorbalance=rs=-0.02:bs=0.03:rm=0.01:bm=-0.01"
+      - "vibrance=intensity=0.25"
+      - "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.6"
+    warm:
+      - "eq=brightness=0.03:contrast=1.10:saturation=1.08:gamma=1.02"
+      - "colorbalance=rs=0.03:gs=0.01:bs=-0.03"
+      - "vibrance=intensity=0.30"
+    cool:
+      - "eq=brightness=0.02:contrast=1.08:saturation=1.04:gamma=1.02"
+      - "colorbalance=rs=-0.04:bs=0.05"
+      - "vibrance=intensity=0.20"
+  # unsharp is skipped for iPhone footage (already over-sharpened in camera).
+  unsharp_for_iphone: false
+
+tonemap:
+  # zscale/tonemap chain, HDR -> SDR bt709. npl differs per transfer function.
+  hlg_npl: 100
+  pq_npl: 1000
+  tonemap: hable
+  desat: 0
+
+fit:
+  # Default handling for a source whose aspect does not match the canvas.
+  default_mode: blur-fill
+  blur:
+    luma_radius: 45
+    luma_power: 2
+    chroma_radius: 25
+    chroma_power: 1
+    brightness: -0.06
+  scale_flags: lanczos
+
+models:
+  planner: anthropic/claude-opus-5
+  analyst: anthropic/claude-sonnet-5
+  vision: google/gemini-3.8-flash
+  writer: anthropic/claude-sonnet-5
+  stt: elevenlabs/scribe_v2
+  music: music_v2
+
+# LLM stages: output-token caps. The planner returns one compact JSON object
+# (see docs/playbook/prompts.md "plan.system"); if a model still stops at the cap
+# (finish_reason=length) the stage retries once with double this, up to 64000.
+plan:
+  max_tokens: 32000
+
+publish:
+  max_tokens: 12000
+
+prices:
+  elevenlabs:
+    stt_per_hour: 0.22
+    music_per_minute: 0.15
+    tts_per_1k_chars: 0.10
+    isolation_per_minute: 0.12
+    sfx_per_minute: 0.12
+  # OpenRouter: USD per 1M tokens.
+  openrouter:
+    anthropic/claude-fable-5.1: { in: 10.0, out: 50.0 }
+    anthropic/claude-opus-5: { in: 5.0, out: 25.0 }
+    anthropic/claude-sonnet-5: { in: 2.0, out: 10.0 }
+    anthropic/claude-haiku-4.5: { in: 1.0, out: 5.0 }
+    google/gemini-3.1-pro-preview: { in: 2.0, out: 12.0 }
+    google/gemini-3.8-flash: { in: 0.75, out: 3.75 }
+    google/gemini-3.5-flash-lite: { in: 0.30, out: 2.50 }
+    openai/gpt-5.6-terra: { in: 2.0, out: 12.0 }
+    openai/gpt-5.6-luna: { in: 0.2, out: 1.2 }
+  fal:
+    fal-ai/nano-banana-pro/edit: { per_image: 0.15 }
+    bytedance/seedance-2.5/image-to-video: { per_second_720p: 0.47, per_second_480p: 0.22 }
+    fal-ai/topaz/upscale/video: { per_second_1080p: 0.02 }
+
+pacing:
+  # Shot-length ceilings: viewers tolerate longer takes deeper into the video.
+  max_shot_seconds_early: 4.0
+  max_shot_seconds_late: 7.0
+  pacing_switch_at: 360.0
+  min_shot_seconds: 0.8
+  # Air around speech, enforced deterministically by `ytedit tidy` and at the
+  # end of every plan run (ytedit/ai/tidy.py). A cut is only ever moved
+  # outwards, never closer to a word.
+  speech_pad_before: 0.30      # seconds of air before the first word
+  speech_pad_after: 0.45       # seconds of air after the last word
+  speech_snap_window: 0.6      # only pad when the cut is this close to speech
+  merge_gap: 0.15              # same-clip jump cuts closer than this are merged
+  # Structural beats (seconds). "end-20" = 20 s before the end.
+  markers:
+    - { at: 0.0, label: hook }
+    - { at: 7.0, label: promise }
+    - { at: 30.0, label: pattern-interrupt }
+    - { at: 180.0, label: re-engagement-1 }
+    - { at: 360.0, label: re-engagement-2 }
+    - { at: -20.0, label: payoff-cta }   # negative = relative to the end
+
+ingest:
+  extensions: [".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".M4V"]
+  still_extensions: [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]
+  still_duration: 5.0
+  workers: 3
+  peaks_per_minute: 1000
+  poster_at: 1.0
+  frames:
+    interval: 3.0
+    max_frames: 40
+    width: 640
+
+paths:
+  # Relative to the project directory.
+  input: input
+  sources: media/sources
+  proxies: media/proxies
+  audio: media/audio
+  peaks: media/peaks
+  thumbs: media/thumbs
+  frames: media/thumbs/frames
+  transcripts: transcripts
+  analysis: analysis
+  plan: plan
+  music: music
+  voice: voice
+  renders: renders
+  exports: exports
+  jobs: jobs

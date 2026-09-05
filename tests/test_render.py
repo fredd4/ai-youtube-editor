@@ -1,0 +1,461 @@
+"""Tests for ``ytedit.media.render``: geometry, caching and a real render.
+
+The end-to-end test builds a throwaway project from the generated fixtures and
+renders a three-segment timeline (a horizontal clip, a vertical clip fitted
+with ``blur-fill`` behind an ``xfade``, and a silent clip), with one Polish
+location card, one auto-ducked music cue and one mute range. Nothing here
+touches a network API.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from fixtures.make_fixtures import build_all
+from ytedit.media import render as R
+from ytedit.media.ingest import ingest
+from ytedit.project import Project
+from ytedit.timeline import Timeline
+
+#: Programme length of :func:`timeline_document` (3.0 + 3.0 − 0.5 xfade + 2.0).
+EXPECTED_DURATION: float = 7.5
+
+LOCATION_TEXT = "LIZBONA, PORTUGALIA — ŁÓDŹ"
+
+
+# ----------------------------------------------------------------------
+# the test project
+# ----------------------------------------------------------------------
+def timeline_document() -> dict:
+    """The three-segment timeline used by the render and QC tests."""
+    return {
+        "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
+        "tracks": {
+            "video": [
+                {"id": "s001", "clip": "c001", "in": 0.5, "out": 3.5, "role": "cold-open",
+                 "transform": {"fit": "cover", "zoom": 1.0}, "grade": "default",
+                 "transition_in": {"type": "cut", "duration": 0.0}},
+                {"id": "s002", "clip": "c002", "in": 1.0, "out": 4.0, "role": "b-roll",
+                 "transform": {"fit": "blur-fill", "zoom": 1.0}, "grade": "default",
+                 "transition_in": {"type": "xfade", "duration": 0.5, "name": "fade"}},
+                {"id": "s003", "clip": "c003", "in": 0.0, "out": 2.0, "role": "b-roll",
+                 "transform": {"fit": "cover", "zoom": 1.0}, "grade": "default",
+                 "transition_in": {"type": "cut", "duration": 0.0}},
+            ],
+            "voice": [],
+            "music": [{"id": "m001", "file": "music/bed.wav", "at": 0.0, "end": 7.5,
+                       "gain_db": -18, "fade_in": 1.0, "fade_out": 1.0,
+                       "duck": {"mode": "auto", "amount_db": -12,
+                                "attack": 0.15, "release": 0.6}}],
+            "captions": [{"id": "t001", "at": 0.5, "end": 3.0, "text": LOCATION_TEXT,
+                          "style": "location", "position": "lower-left"}],
+            "sfx": [],
+        },
+        "mute_ranges": [{"clip": "c001", "s": 1.0, "e": 2.0, "gain_db": -60,
+                         "reason": "copyrighted bar music"}],
+        "markers": [{"at": 0.0, "label": "hook"}],
+        "chapters": [],
+        "meta": {"generated_by": "test", "edited_by_human": False},
+    }
+
+
+def build_render_project(root: Path, slug: str = "render-test") -> Project:
+    """Ingest three fixtures and write :func:`timeline_document` into a project.
+
+    Args:
+        root: Parent directory for the project (a pytest ``tmp_path``).
+        slug: Project slug.
+
+    Returns:
+        A project ready for :func:`ytedit.media.render.render`.
+    """
+    media = build_all()
+    project = Project.create(slug, language="pl", title="Render", root=root)
+    for name, fixture in {
+        "a_landscape.mp4": "landscape.mp4",   # 1920x1080, 6 s, 440 Hz
+        "b_vertical.mp4": "vertical.mp4",     # 1080x1920, 6 s, 660 Hz
+        "c_silent.mp4": "silent.mp4",         # 1280x720, 4 s, no audio stream
+    }.items():
+        shutil.copy(media[fixture], project.input_dir / name)
+    results = ingest(project, show_table=False)
+    assert not [r for r in results if r.error], [r.error for r in results]
+
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000:duration=20",
+         "-c:a", "pcm_s16le", "-ac", "2", str(project.music_dir / "bed.wav")],
+        check=True,
+    )
+    (project.transcripts_dir / "c001.json").write_text(
+        json.dumps({
+            "clip": "c001", "language": "pl", "project_language": "pl",
+            "text": "Dzień dobry z Lizbony.",
+            "words": [
+                {"t": "Dzień", "s": 2.0, "e": 2.3},
+                {"t": "dobry", "s": 2.35, "e": 2.7},
+                {"t": "z", "s": 2.75, "e": 2.85},
+                {"t": "Lizbony.", "s": 2.9, "e": 3.4},
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    project.timeline_file.write_text(
+        json.dumps(timeline_document(), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return project
+
+
+@pytest.fixture(scope="module")
+def rendered(tmp_path_factory) -> tuple[Project, Path]:
+    """A project with the preview rendered exactly once."""
+    project = build_render_project(tmp_path_factory.mktemp("render"))
+    return project, R.render(project, preview=True)
+
+
+def measure_volume(path: Path, start: float, length: float) -> float:
+    """Return the mean volume in dBFS of a window of an audio file."""
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-ss", f"{start}", "-t", f"{length}",
+         "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True, errors="replace",
+    )
+    match = re.search(r"mean_volume:\s*(-?[\d.]+) dB", proc.stderr)
+    assert match, proc.stderr[-1500:]
+    return float(match.group(1))
+
+
+def probe(path: Path) -> dict:
+    """ffprobe a file as JSON."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format",
+         "-show_streams", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+# ----------------------------------------------------------------------
+# geometry and time mapping (no ffmpeg)
+# ----------------------------------------------------------------------
+def test_canvas_for_preview_letterboxes_to_720p() -> None:
+    timeline = Timeline.model_validate({"width": 1920, "height": 1080, "fps": 30})
+    assert R.canvas_for(timeline, preview=True) == R.Canvas(1280, 720, 30)
+    assert R.canvas_for(timeline, preview=False) == R.Canvas(1920, 1080, 30)
+
+
+def test_canvas_for_never_upscales_a_small_timeline() -> None:
+    timeline = Timeline.model_validate({"width": 640, "height": 360, "fps": 24})
+    assert R.canvas_for(timeline, preview=True) == R.Canvas(640, 360, 24)
+
+
+def test_render_positions_overlap_both_fade_and_xfade() -> None:
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "a", "clip": "c1", "in": 0, "out": 3},
+        {"id": "b", "clip": "c2", "in": 0, "out": 3,
+         "transition_in": {"type": "fade", "duration": 0.5}},
+    ]}})
+    # the timeline model treats "fade" as non-overlapping ...
+    assert timeline.duration() == pytest.approx(6.0)
+    # ... but ffmpeg renders it with xfade, which does overlap
+    assert R.render_duration(timeline) == pytest.approx(5.5)
+    assert [p.start for p in R.render_positions(timeline)] == [0.0, 2.5]
+
+
+def test_build_time_map_is_the_identity_for_cuts_and_xfades() -> None:
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "a", "clip": "c1", "in": 0, "out": 3},
+        {"id": "b", "clip": "c2", "in": 0, "out": 3,
+         "transition_in": {"type": "xfade", "duration": 0.5}},
+    ]}})
+    to_render = R.build_time_map(timeline)
+    for t in (0.0, 1.0, 2.5, 5.5):
+        assert to_render(t) == pytest.approx(t)
+
+
+def test_build_time_map_shifts_everything_after_a_fade() -> None:
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "a", "clip": "c1", "in": 0, "out": 3},
+        {"id": "b", "clip": "c2", "in": 0, "out": 3,
+         "transition_in": {"type": "fade", "duration": 0.5}},
+    ]}})
+    to_render = R.build_time_map(timeline)
+    assert to_render(1.0) == pytest.approx(1.0)      # inside the first segment
+    assert to_render(3.0) == pytest.approx(2.5)      # start of the second
+    assert to_render(6.0) == pytest.approx(5.5)      # the tail
+
+
+def test_segment_mute_ranges_are_clip_time_shifted_into_segment_time() -> None:
+    timeline = Timeline.model_validate({
+        "tracks": {"video": [{"id": "s1", "clip": "c001", "in": 2.0, "out": 8.0}]},
+        "mute_ranges": [
+            {"clip": "c001", "s": 3.0, "e": 5.0, "gain_db": -60},
+            {"clip": "c001", "s": 0.0, "e": 1.0, "gain_db": -60},   # before the cut
+            {"clip": "c002", "s": 3.0, "e": 5.0, "gain_db": -60},   # another clip
+        ],
+    })
+    seg = timeline.tracks.video[0]
+    assert R.segment_mute_ranges(timeline, seg) == [(1.0, 3.0, -60.0)]
+
+
+def test_segment_mute_ranges_are_divided_by_the_speed() -> None:
+    timeline = Timeline.model_validate({
+        "tracks": {"video": [{"id": "s1", "clip": "c1", "in": 0.0, "out": 8.0, "speed": 2.0}]},
+        "mute_ranges": [{"clip": "c1", "s": 2.0, "e": 4.0, "gain_db": -12}],
+    })
+    assert R.segment_mute_ranges(timeline, timeline.tracks.video[0]) == [(1.0, 2.0, -12.0)]
+
+
+def test_escape_filter_path_escapes_the_ffmpeg_specials() -> None:
+    assert R.escape_filter_path("/a b/c:d,e.ass") == "/a b/c\\:d\\,e.ass"
+    assert R.escape_filter_path("/x[1]/y.ass") == "/x\\[1\\]/y.ass"
+
+
+def test_atempo_chains_for_extreme_speeds() -> None:
+    assert R._atempo(1.0) == ""
+    assert R._atempo(2.0) == "atempo=2.000000"
+    assert R._atempo(0.25) == "atempo=0.5,atempo=0.500000"
+
+
+def test_parse_bitrate_understands_ffmpeg_suffixes() -> None:
+    assert R.parse_bitrate("384k") == 384_000
+    assert R.parse_bitrate("1.5M") == 1_500_000
+    assert R.parse_bitrate(256000) == 256_000
+    assert R.parse_bitrate("nonsense", default=7) == 7
+
+
+def test_audio_encoder_args_target_48k_stereo(project: Project) -> None:
+    args = R.audio_encoder_args(project.settings)
+    assert args[args.index("-ar") + 1] == "48000"
+    assert args[args.index("-ac") + 1] == "2"
+    assert args[args.index("-b:a") + 1] == "384k"
+    # ffmpeg's native aac cannot reach 384k, so aac_at is preferred when present
+    assert args[args.index("-c:a") + 1] in ("aac", "aac_at")
+
+
+def test_color_tag_filter_stamps_bt709(project: Project) -> None:
+    chain = R.color_tag_filter(project.settings)
+    assert chain.startswith("setparams=")
+    for key in ("color_primaries=bt709", "color_trc=bt709", "colorspace=bt709"):
+        assert key in chain
+
+
+def test_render_refuses_a_project_without_a_timeline(project: Project) -> None:
+    with pytest.raises(R.RenderError, match="no timeline"):
+        R.render(project, preview=True)
+
+
+def test_render_refuses_an_invalid_timeline(project: Project) -> None:
+    project.timeline_file.write_text(json.dumps({
+        "tracks": {"video": [{"id": "s1", "clip": "c1", "in": 5.0, "out": 1.0}]},
+    }), encoding="utf-8")
+    with pytest.raises(R.RenderError, match="issue"):
+        R.render(project, preview=True)
+
+
+# ----------------------------------------------------------------------
+# the real render
+# ----------------------------------------------------------------------
+def test_preview_lands_where_it_should(rendered: tuple[Project, Path]) -> None:
+    project, out = rendered
+    assert out == project.renders_dir / "preview.mp4"
+    assert out.exists() and out.stat().st_size > 10_000
+
+
+def test_preview_has_the_expected_duration_and_canvas(rendered: tuple[Project, Path]) -> None:
+    _project, out = rendered
+    data = probe(out)
+    assert float(data["format"]["duration"]) == pytest.approx(EXPECTED_DURATION, abs=0.1)
+    video = next(s for s in data["streams"] if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (1280, 720)
+    assert video["codec_name"] == "h264"
+    assert video["pix_fmt"] == "yuv420p"
+    audio = next(s for s in data["streams"] if s["codec_type"] == "audio")
+    assert audio["codec_name"] == "aac"
+    assert int(audio["sample_rate"]) == 48000
+    assert audio["channels"] == 2
+
+
+def test_preview_is_colour_tagged_bt709(rendered: tuple[Project, Path]) -> None:
+    _project, out = rendered
+    video = next(s for s in probe(out)["streams"] if s["codec_type"] == "video")
+    assert video.get("color_primaries") == "bt709"
+    assert video.get("color_transfer") == "bt709"
+    assert video.get("color_space") == "bt709"
+
+
+def test_ass_document_is_written_with_the_caption_text(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    ass = project.renders_dir / "captions.ass"
+    assert ass.exists()
+    text = ass.read_text(encoding="utf-8")
+    assert LOCATION_TEXT in text
+    assert "PlayResY: 720" in text          # scaled to the preview canvas
+    assert "\\fad(" in text
+
+
+def test_srt_is_written_for_upload_and_not_burned(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    srt = project.exports_dir / "captions.srt"
+    assert srt.exists()
+    assert "Dzień dobry" in srt.read_text(encoding="utf-8")
+
+
+def test_duck_automation_file_has_ramps(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    cmd = project.renders_dir / "duck.cmd"
+    assert cmd.exists()
+    commands = re.findall(r"^(\d+\.\d{3}) volume volume (\d+\.\d+);$",
+                          cmd.read_text(encoding="utf-8"), re.M)
+    assert len(commands) >= 6, "expected a ramped envelope, not a step"
+    gains = [float(g) for _, g in commands]
+    assert min(gains) < max(gains) * 0.5, "the music must actually duck"
+
+
+def test_mute_range_silences_the_source_bus(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    bus = project.renders_dir / "program_audio.wav"
+    assert bus.exists()
+    # clip time 1.0-2.0 with the segment starting at in=0.5 -> timeline 0.5-1.5
+    inside = measure_volume(bus, 0.6, 0.8)
+    outside = measure_volume(bus, 2.0, 0.9)
+    assert inside < -60.0, f"the muted window is not silent ({inside} dB)"
+    assert outside > inside + 30.0, "audio outside the mute range went missing"
+
+
+def test_preview_loudness_is_close_to_the_target(rendered: tuple[Project, Path]) -> None:
+    from ytedit.media.audio import measure_loudness
+
+    _project, out = rendered
+    measured = measure_loudness(out)
+    assert measured["input_i"] == pytest.approx(-14.0, abs=1.5)
+
+
+def test_state_and_job_record_the_render(rendered: tuple[Project, Path]) -> None:
+    project, out = rendered
+    stage = project.load_state()["stages"]["render"]
+    assert stage["status"] == "done"
+    assert stage["preset"] == "preview"
+    assert stage["output"] == project.rel(out)
+    job = json.loads((project.jobs_dir / "render_preview.json").read_text())
+    assert job["status"] == "done"
+    assert job["percent"] == 100.0
+    assert job["output"] == str(out)
+
+
+def test_segments_are_cached_between_renders(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    timeline = Timeline.load(project.timeline_file)
+    canvas = R.canvas_for(timeline, preview=True)
+    cached = [
+        project.renders_dir / "segments"
+        / f"{R.segment_key(project, timeline, seg, canvas, 'preview')}.mp4"
+        for seg in timeline.tracks.video
+    ]
+    assert all(p.exists() for p in cached), cached
+    before = [p.stat().st_mtime_ns for p in cached]
+    for seg in timeline.tracks.video:
+        R.render_segment(project, timeline, seg, canvas, "preview")
+    assert [p.stat().st_mtime_ns for p in cached] == before
+
+
+def test_changing_a_segment_changes_its_cache_key(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    timeline = Timeline.load(project.timeline_file)
+    canvas = R.canvas_for(timeline, preview=True)
+    seg = timeline.tracks.video[0]
+    first = R.segment_key(project, timeline, seg, canvas, "preview")
+    moved = seg.model_copy(update={"out": seg.out + 0.5})
+    assert R.segment_key(project, timeline, moved, canvas, "preview") != first
+    assert R.segment_key(project, timeline, seg, canvas, "master") != first
+
+
+def test_silent_clip_still_produces_an_audio_stream(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    timeline = Timeline.load(project.timeline_file)
+    canvas = R.canvas_for(timeline, preview=True)
+    seg = timeline.tracks.video[2]           # c003, the fixture with no audio stream
+    path = R.render_segment(project, timeline, seg, canvas, "preview")
+    streams = probe(path)["streams"]
+    assert any(s["codec_type"] == "audio" for s in streams), "anullsrc fallback missing"
+    assert float(probe(path)["format"]["duration"]) == pytest.approx(2.0, abs=0.1)
+
+
+# ----------------------------------------------------------------------
+# denoised source audio
+# ----------------------------------------------------------------------
+def _denoised_project(project: Project) -> tuple[Timeline, Path]:
+    """A one-segment timeline whose clip has an active denoised WAV."""
+    project.source_path("c001").parent.mkdir(parents=True, exist_ok=True)
+    project.source_path("c001").write_bytes(b"not really an mp4")
+    cleaned = project.audio_dir / "c001.denoised.wav"
+    cleaned.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.write_bytes(b"not really a wav")
+    project.add_clip({
+        "id": "c001", "order": 1, "duration": 10.0, "width": 1920, "height": 1080,
+        "has_audio": True, "denoised": "media/audio/c001.denoised.wav",
+        "denoise_engine": "local", "use_denoised": True,
+    })
+    timeline = Timeline.model_validate(
+        {"tracks": {"video": [{"id": "s001", "clip": "c001", "in": 2.0, "out": 5.0}]}}
+    )
+    return timeline, cleaned
+
+
+def test_denoised_audio_is_only_used_when_enabled_and_present(project: Project) -> None:
+    _timeline, cleaned = _denoised_project(project)
+    assert R.denoised_audio(project, "c001") == cleaned
+
+    project.set_clip_stage("c001", "denoise", "done", use_denoised=False)
+    assert R.denoised_audio(project, "c001") is None
+
+    project.set_clip_stage("c001", "denoise", "done", use_denoised=True)
+    cleaned.unlink()
+    assert R.denoised_audio(project, "c001") is None
+
+
+def test_render_segment_feeds_ffmpeg_the_denoised_wav(
+    project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeline, cleaned = _denoised_project(project)
+    seg = timeline.tracks.video[0]
+    canvas = R.Canvas(1920, 1080, 30)
+    captured: list[list[str]] = []
+
+    def fake_ff(*args, **kwargs) -> str:
+        captured.append([str(a) for a in args])
+        Path(str(args[-1])).write_bytes(b"segment")
+        return ""
+
+    monkeypatch.setattr(R, "ff", fake_ff)
+    monkeypatch.setattr(R, "_segment_is_valid", lambda *a, **k: True)
+
+    out = R.render_segment(project, timeline, seg, canvas, "preview")
+    assert out.exists()
+
+    args = captured[0]
+    assert str(cleaned) in args, args
+    # The denoised file is the second input, cut with the same -ss as the video.
+    assert args.index(str(cleaned)) == args.index(str(project.source_path("c001"))) + 4
+    assert args.count("-ss") == 2 and args.count("2.000000") == 2
+    # ...and it is the audio the filter graph maps.
+    graph = args[args.index("-filter_complex") + 1]
+    assert "[1:a]" in graph
+
+
+def test_re_denoising_a_clip_invalidates_the_segment_cache(project: Project) -> None:
+    timeline, cleaned = _denoised_project(project)
+    seg = timeline.tracks.video[0]
+    canvas = R.Canvas(1920, 1080, 30)
+    first = R.segment_key(project, timeline, seg, canvas, "preview")
+
+    cleaned.write_bytes(b"a different denoised wav")
+    assert R.segment_key(project, timeline, seg, canvas, "preview") != first
+
+    project.set_clip_stage("c001", "denoise", "done", use_denoised=False)
+    assert R.segment_key(project, timeline, seg, canvas, "preview") != first
