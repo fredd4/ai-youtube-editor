@@ -69,6 +69,12 @@ make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 1. Confirm the target project (`projects/<slug>/input/`) — ask if ambiguous.
 2. `ytedit ingest <slug>`; check `state.json.clips[*]` for anything flagged (VFR jitter, missing audio, corrupt/zero-duration files) before spending money on the next stage.
 3. `ytedit transcribe <slug>`, then `ytedit analyze <slug>`. Spot-check a few `analysis/<clip>.json` entries against the raw transcript for correct `kind`, honored editor instructions, and sane take selection (playbook §2.2, §3) before trusting `footage_log.json`.
-4. `ytedit plan <slug>`. Review the draft against the structure template and pacing rules (playbook §2.3, §4) — never forward the LLM's output to the user unreviewed.
-5. Summarize for the user: proposed structure, footage gaps or narration requests, open editorial questions. Point him at `http://localhost:8765` for the timeline review.
-6. Only after his review: music generation, preview render, QC, master render, publish pack — each gated per the playbook and the cost rules above.
+4. `ytedit plan <slug>` (or `ytedit run <slug>` for steps 2–4). Review `plan/edit_plan.md` against the structure template and pacing rules (playbook §2.3, §4) — never forward the LLM's output to the user unreviewed. Speech padding (`tidy`) is applied automatically.
+5. Windy or noisy narration clips (footage log `visual.issues` / your own listen): `ytedit denoise <slug> --clip cNNN --preview`, send the user the A/B wav, keep ElevenLabs on if it helps.
+6. Summarize for the user in Polish: proposed structure, footage gaps, narration requests (`plan/narration_requests.md`), open editorial questions. Point him at `make serve` → Program view for the cut review; anything he saves there is human-edited (see Safety rules).
+7. Only after his review: `music` (one or two beds are fine, more → ask), `render --preview`, `qc`, `render --master`, `publish` — each gated per the playbook and the cost rules above. Send him the preview with SendUserFile (masters are usually too big).
+8. After manual edits in the editor: `ytedit tidy <slug>` then re-render. Commit only when the user asks.
+
+## Starting a new video
+
+`make new NAME=<slug> LANG=pl TITLE="..."`, tell the user to drop clips into `projects/<slug>/input/`, then follow the runbook above. Each project is independent; `projects/my-video` is the reference run (a location, Portugal, 4 clips) — look at its `plan/edit_plan.md` and `exports/publish.md` to see what good output looks like.

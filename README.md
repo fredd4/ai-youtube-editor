@@ -40,20 +40,21 @@ cp ~/Movies/IMG_*.MOV projects/lisbon-day-1/input/
 make ingest NAME=lisbon-day-1           # normalize, proxies, audio, peaks, thumbs
 make status NAME=lisbon-day-1           # clip registry + stage status + spend
 
-ytedit transcribe lisbon-day-1          # ElevenLabs scribe_v2 -> transcripts/
-ytedit analyze    lisbon-day-1          # transcripts + frames -> analysis/
-ytedit plan       lisbon-day-1          # -> plan/edit_plan.json + plan/timeline.json
-ytedit music      lisbon-day-1          # -> music/*.mp3
+ytedit run        lisbon-day-1          # transcribe -> analyze -> plan (skips what is done)
+ytedit denoise    lisbon-day-1 --clip c004 --preview   # optional: voice isolation for a windy clip
+ytedit music      lisbon-day-1          # -> music/*.mp3 (ElevenLabs, ~$0.15/min)
 ytedit render     lisbon-day-1 --preview
-ytedit render     lisbon-day-1 --master
 ytedit qc         lisbon-day-1
-ytedit publish    lisbon-day-1
+ytedit render     lisbon-day-1 --master
+ytedit publish    lisbon-day-1          # titles, description, chapters, thumbnails
 
 make serve                              # web editor on http://localhost:8765
 ```
 
-Stages after `ingest` live in modules that are still landing; the CLI reports
-`not implemented yet` for anything missing instead of failing.
+Review and adjust the cut in the web editor's **Program** view (final-cut strip,
+segment inspector, "Save & render preview"); `ytedit tidy <slug>` re-applies the
+air-around-speech rule after manual edits. Every stage also has a `make` target
+(`make help`).
 
 ## Repository layout
 

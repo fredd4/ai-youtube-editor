@@ -91,6 +91,8 @@ ai-youtube-editor/
 | 2 | transcribe | `ytedit transcribe <slug>` | audio/*.wav → transcripts/*.json + .srt | ElevenLabs scribe_v2 (fallback whisper) |
 | 3 | analyze | `ytedit analyze <slug>` | transcripts + frames → analysis/*.json + footage_log.json | OpenRouter (Claude/Gemini) |
 | 4 | plan | `ytedit plan <slug>` | footage_log → plan/edit_plan.json + plan/timeline.json (draft) + narration_requests.md | OpenRouter (Opus) |
+| 4b | tidy | `ytedit tidy <slug>` | timeline.json → padded cuts (~0.3 s before / 0.45 s after speech); auto at the end of plan | deterministic (`ytedit/ai/tidy.py`) |
+| 1b | denoise | `ytedit denoise <slug> --clip cNNN` | media/audio/<clip>.wav → <clip>.denoised.wav; render uses it when `clips[id].use_denoised` | ElevenLabs Audio Isolation or local afftdn |
 | 5 | music | `ytedit music <slug>` | plan music cues → music/*.mp3 | ElevenLabs Music |
 | 6 | render | `ytedit render <slug> --preview` / `--master` | timeline.json → renders/preview.mp4 / exports/master.mp4 | ffmpeg |
 | 7 | qc | `ytedit qc <slug>` | timeline + master → qc_report.json/md | rules + loudnorm measure |
@@ -205,7 +207,9 @@ Story outline (beats with target timecodes per playbook: 0:00 hook, 0:07 promise
 
 FastAPI on `http://localhost:8765`. Pages: project list → project page (clip grid with status, footage log, plan) → timeline editor.
 
-Timeline editor features (v1):
+Views: **Clips** (source review: transcript, waveform, mute tool, denoise buttons), **Program** (default when a timeline exists: final-cut strip with frames, lanes for captions/music/mutes/markers, segment inspector with in/out nudges + looping source player + transcript-word snapping, split/reorder/delete, Save, Save & render preview, Tidy cuts, Accept draft), **Advanced** (raw lists), Plan / Footage log / QC / Publish tabs.
+
+Original v1 feature list (still valid, lives under Clips/Advanced):
 - Video player (proxy) synced with wavesurfer waveform + regions: transcript words rendered under the waveform, takes highlighted, detected music regions shaded.
 - Clip list in order with kind/role badges; drag to reorder segments; set in/out; toggle include; choose transform for vertical clips.
 - **Mute/duck tool**: select a range on the waveform → set gain (mute / −12 dB / custom) → saved to `mute_ranges`.
