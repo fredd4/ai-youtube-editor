@@ -360,6 +360,8 @@ def check_timeline(project: Project, timeline: Timeline, report: Report) -> None
     # --- A-roll share (measured; rule 9 warns via pacing_report) --------
     roles = [seg.role for seg in segments if seg.role]
     if roles and total > 0:
+        # Role-keyed on purpose: an overlay cutaway (``audio_from`` set) is heard
+        # as narration but seen as B-roll, and the share measures the picture.
         aroll = sum(
             seg.duration
             for seg in segments

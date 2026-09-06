@@ -29,8 +29,13 @@ Deterministic post-processing, in order:
 6. Captions / music cues / chapters are clamped and de-overlapped, then
    :meth:`Timeline.validate` runs and trivially fixable issues are fixed.
 7. :func:`ytedit.ai.tidy.pad_segments_to_speech` gives every speech cut ~0.3 s of
-   air before the first word and ~0.45 s after the last one, and merges
+   air before the first word and ~0.45 s after the last one, snaps a cut that
+   still lands mid-sentence out to that sentence's own boundary, and merges
    same-clip jump cuts closer than ``pacing.merge_gap``.
+7b. :func:`ytedit.ai.overlay.overlay_cutaways` finds a cutaway (or a run of them)
+   dropped between two contiguous pieces of one take and gives it ``audio_from``
+   so the narration keeps running underneath the cutaway instead of stopping
+   dead; the continuation is moved (or, when too little is left of it, dropped).
 8. A segment carrying ``voice_over`` (playbook §3: post-trip narration clips) has
    its own clip audio extracted into ``tracks.voice`` and is replaced on screen by
    its ``picture`` cuts (``mute_source: true``); the voice item's position is
@@ -58,7 +63,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ytedit.ai.openrouter import OpenRouter, OpenRouterError
 from ytedit.ai.prompts import render
-from ytedit.ai.tidy import pad_segments_to_speech
+from ytedit.ai.overlay import overlay_cutaways
+from ytedit.ai.tidy import pad_segments_to_speech, sentence_snap_count
 from ytedit.config import Settings
 from ytedit.costs import charge
 from ytedit.log import get_logger
@@ -875,6 +881,15 @@ def build_timeline(
     #    it (see ytedit/ai/tidy.py). Ids are re-assigned because a merge drops one.
     timeline, padded = pad_segments_to_speech(timeline, project, cfg)
     stats["padded"] = padded
+    stats["sentence_snapped"] = sentence_snap_count(padded)
+    for i, segment in enumerate(timeline.tracks.video):
+        segment.id = f"s{i + 1:03d}"
+
+    # 7b. A cutaway dropped between two contiguous pieces of one take keeps the
+    #     narration running underneath it (ytedit/ai/overlay.py). Ids are
+    #     re-assigned again because the pass can drop the continuation segment.
+    timeline, overlaid = overlay_cutaways(timeline, project, cfg)
+    stats["overlaid"] = overlaid
     for i, segment in enumerate(timeline.tracks.video):
         segment.id = f"s{i + 1:03d}"
     video = timeline.tracks.video
@@ -1492,6 +1507,9 @@ def pacing_report(timeline: Timeline, settings: Settings) -> list[str]:
     run_end = 0.0
     aroll_total = 0.0
     for pos in positions:
+        # Keyed on the role alone (plus mute): an overlay cutaway carrying
+        # ``audio_from`` is still a cutaway on screen, so it deliberately keeps
+        # failing this regex and keeps breaking the A-roll run.
         is_aroll = bool(AROLL_ROLE_RE.search(pos.segment.role or "")) and not pos.segment.mute_source
         if is_aroll:
             aroll_total += pos.segment.duration
@@ -1619,10 +1637,19 @@ def render_edit_plan_md(
         seg = pos.segment
         mute = " 🔇" if seg.mute_source else ""
         vo = " 🎙" if seg.notes.startswith("VO picture for ") else ""
+        overlay = " 🎞" if seg.audio_from is not None else ""
+        note = _md_cell(seg.notes)
+        if seg.audio_from is not None:
+            borrowed = (
+                f"audio: `{seg.audio_from.clip}` "
+                f"{seg.audio_from.in_:.2f}–{seg.audio_from.out:.2f}"
+            )
+            note = f"{note} · {borrowed}" if note else borrowed
         lines.append(
             f"| {i} | {_mmss(pos.start)} | `{seg.clip}` | "
-            f"{seg.in_:.1f}–{seg.out:.1f} | {seg.duration:.1f}s | {seg.role or '—'}{mute}{vo} | "
-            f"{seg.transform.fit} | {_md_cell(seg.notes)} |"
+            f"{seg.in_:.1f}–{seg.out:.1f} | {seg.duration:.1f}s | "
+            f"{seg.role or '—'}{mute}{vo}{overlay} | "
+            f"{seg.transform.fit} | {note} |"
         )
     lines.append("")
 
@@ -1749,6 +1776,8 @@ def render_edit_plan_md(
         f"- clips with rejected takes excised: {stats.get('take_cuts', 0)}",
         f"- segments split around excised ranges: {stats.get('split_segments', 0)}",
         f"- speech-air / jump-cut edits: {len(stats.get('padded') or [])}",
+        f"- segments snapped to a sentence boundary: {stats.get('sentence_snapped', 0)}",
+        f"- overlay-cutaway edits (🎞): {len(stats.get('overlaid') or [])}",
     ]
     padded = list(stats.get("padded") or [])
     if padded:
@@ -1758,6 +1787,15 @@ def render_edit_plan_md(
         lines += [f"  - {change}" for change in padded[:20]]
         if len(padded) > 20:
             lines.append(f"  - ... and {len(padded) - 20} more")
+        lines.append("")
+    overlaid = list(stats.get("overlaid") or [])
+    if overlaid:
+        lines.append("")
+        lines.append("Overlay cutaways (narration kept running underneath):")
+        lines.append("")
+        lines += [f"  - {change}" for change in overlaid[:20]]
+        if len(overlaid) > 20:
+            lines.append(f"  - ... and {len(overlaid) - 20} more")
         lines.append("")
     for key, label in (
         ("dropped_unknown_clip", "dropped (unknown clip)"),

@@ -373,3 +373,126 @@ def test_tidy_reports_nothing_when_the_cuts_are_already_clean(project: Project) 
     timeline_of(seg("s001", "c002", 1.0, 5.0)).save(project.timeline_file)
     result = tidy(project)
     assert result["changes"] == [] and result["written"] is None
+
+
+# ----------------------------------------------------------------------
+# sentence-boundary snapping
+# ----------------------------------------------------------------------
+#: Two sentences 1.0 s apart; the second one runs on well past a naive pad.
+TWO_SENTENCES = [
+    (1.0, 1.4, "Alfa"),
+    (1.6, 3.0, "Beta."),
+    (4.0, 4.4, "Gamma"),
+    (4.6, 6.0, "Delta."),
+    (7.0, 7.4, "Epsilon"),
+    (7.6, 9.0, "Zeta."),
+]
+
+#: The first ~15 s of ``projects/the reference project/transcripts/c030.json`` — the real cut
+#: that motivated sentence snapping (see ``test_the_real_c030_cut_*``).
+C030 = [
+    (2.18, 2.579, "Jestem"), (2.679, 2.779, "na"), (2.819, 3.259, "drodze"),
+    (3.399, 3.659, "do"), (4.599, 4.799, "Góry"), (4.9, 5.159, "Siedmiu"),
+    (5.199, 5.719, "Kolorów."),
+    (6.42, 6.679, "Obecnie"), (6.719, 6.759, "na"), (6.819, 7.539, "wysokości"),
+    (8.5, 8.76, "cztery"), (8.88, 9.26, "tysiące"), (9.38, 9.619, "sześćset"),
+    (9.699, 10.099, "metrów."),
+    (10.979, 11.34, "Wchodzimy"), (11.399, 11.46, "na"), (11.559, 11.699, "pięć"),
+    (11.8, 12.339, "tysięcy."),
+    (14.139, 14.679, "Dokładnie"), (14.739, 14.819, "tam"), (14.859, 15.399, "wchodzimy."),
+]
+
+
+def test_the_real_c030_cut_finishes_its_sentence(project: Project) -> None:
+    """s036 ``c030 1.8-7.989`` stopped on 'wysokości'; it must reach 'metrów.'."""
+    add_clip(project, "c030", 60.0, C030)
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s036", "c030", 1.8, 7.989)), project)
+    moved = tl.tracks.video[0]
+    assert moved.in_ == 1.8                    # already had more than 0.3 s of air
+    assert moved.out == pytest.approx(10.549)  # 'metrów.' ends 10.099, + 0.45
+    assert changes == ["s036 out 7.99→10.55 (sentence-snap to 'metrów.')"]
+
+
+def test_a_cut_on_a_sentence_boundary_is_not_snapped(project: Project) -> None:
+    """s038 ``c030 13.8-21.97`` deliberately skips a whole sentence — leave it."""
+    add_clip(project, "c030", 60.0, C030)
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s038", "c030", 13.8, 21.97)), project)
+    assert (tl.tracks.video[0].in_, tl.tracks.video[0].out) == (13.8, 21.97)
+    assert changes == []
+
+
+def test_out_snaps_forward_to_the_end_of_the_sentence(project: Project) -> None:
+    add_clip(project, "c001", 60.0, TWO_SENTENCES)
+    # 4.5 sits between 'Gamma' and 'Delta.' — mid-sentence.
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c001", 3.9, 4.5)), project)
+    assert tl.tracks.video[0].out == pytest.approx(6.45)  # 6.0 + 0.45
+    assert any("sentence-snap to 'Delta.'" in c for c in changes)
+
+
+def test_out_does_not_snap_across_a_gap_wider_than_sentence_gap_max(project: Project) -> None:
+    # 'Beta' does not close a sentence, but the next word is 2.0 s away.
+    add_clip(project, "c001", 60.0, [(1.0, 1.4, "Alfa"), (1.6, 2.0, "Beta"), (4.0, 4.4, "Gamma.")])
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c001", 0.9, 2.45)), project)
+    assert tl.tracks.video[0].out == pytest.approx(2.45)
+    assert not any("sentence-snap" in c for c in changes)
+
+
+def test_in_snaps_back_to_the_start_of_the_sentence(project: Project) -> None:
+    add_clip(
+        project, "c001", 60.0,
+        [(1.0, 1.4, "Alfa."), (2.0, 2.4, "Beta"), (2.6, 3.0, "Gamma"),
+         (3.2, 3.6, "Delta."), (6.0, 6.4, "Eps.")],
+    )
+    # The cut opens on 'Gamma', in the middle of "Beta Gamma Delta."
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c001", 2.55, 3.9)), project)
+    assert tl.tracks.video[0].in_ == pytest.approx(1.7)   # 'Beta' starts 2.0, − 0.30
+    assert any("sentence-snap to 'Beta'" in c for c in changes)
+
+
+def test_in_does_not_snap_when_the_cut_already_opens_a_sentence(project: Project) -> None:
+    add_clip(project, "c001", 60.0, TWO_SENTENCES)
+    # 'Gamma' opens its sentence ('Beta.' before it closed one), so only the
+    # ordinary 0.30 s pad applies to ``in`` — no reach back into "Alfa Beta.".
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c001", 3.9, 6.45)), project)
+    assert tl.tracks.video[0].in_ == pytest.approx(3.7)
+    assert not any(c.startswith("s001 in ") and "sentence-snap" in c for c in changes)
+
+
+def test_a_sentence_longer_than_the_cap_is_only_extended_by_the_cap(project: Project) -> None:
+    # One 20 s sentence: a word every second, the full stop only at the very end.
+    words = [(float(i), i + 0.4, f"w{i}") for i in range(1, 20)] + [(20.0, 20.4, "w20.")]
+    add_clip(project, "c001", 60.0, words)
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c001", 0.8, 2.9)), project)
+    # 2.9 + pacing.sentence_extend_max (8.0), not 20.4 + 0.45.
+    assert tl.tracks.video[0].out == pytest.approx(10.9)
+    assert any("sentence-snap" in c for c in changes)
+
+
+def test_a_sentence_snap_never_enters_an_excised_instruction(project: Project) -> None:
+    add_clip(project, "c030", 60.0, C030, instructions=[(9.0, 9.5)])
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s036", "c030", 1.8, 7.989)), project)
+    # The sentence ends at 10.099 but a spoken editor instruction starts at 9.0.
+    assert tl.tracks.video[0].out == pytest.approx(9.0)
+    assert any("sentence-snap" in c for c in changes)
+
+
+def test_a_sentence_snap_never_enters_the_next_cut_of_the_same_clip(project: Project) -> None:
+    add_clip(project, "c030", 60.0, C030)
+    tl, _ = pad_segments_to_speech(
+        timeline_of(
+            seg("s036", "c030", 1.8, 7.989, grade="warm"),
+            seg("s037", "c030", 9.4, 12.4, grade="default"),
+        ),
+        project,
+    )
+    assert tl.tracks.video[0].out == pytest.approx(9.4)
+
+
+def test_an_unpunctuated_transcript_is_never_sentence_snapped(project: Project) -> None:
+    """Without a single full stop there is no sentence to snap to — only pad."""
+    add_clip(project, "c001", 60.0, SPACED)
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c001", 3.1, 5.4)), project)
+    assert not any("sentence-snap" in c for c in changes)
+    assert (tl.tracks.video[0].in_, tl.tracks.video[0].out) == (
+        pytest.approx(2.8), pytest.approx(5.85),
+    )

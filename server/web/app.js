@@ -1176,6 +1176,13 @@ async function acceptDraft() {
 const ROLES = ['', 'cold-open', 'hook', 'a-roll', 'b-roll', 'cutaway', 'transition',
   'payoff', 'cta', 'outro'];
 
+/** Read-only label for an overlay cutaway: which clip range it is heard as. */
+function audioFromLabel(seg) {
+  const a = seg?.audio_from;
+  if (!a) return '';
+  return `audio: ${a.clip} ${(+a.in || 0).toFixed(2)}–${(+a.out || 0).toFixed(2)}`;
+}
+
 /** Segment geometry: server-computed when saved, locally mirrored while dirty. */
 function progPositions() {
   const tl = S.timeline;
@@ -1366,6 +1373,7 @@ function renderProgStrip() {
       el('div', { class: 'lbl' },
         el('span', { class: 'cid' }, p.clip),
         seg?.mute_source ? el('span', { class: 'mute-ic', title: 'source audio muted' }, '🔇') : null,
+        seg?.audio_from ? el('span', { class: 'mute-ic', title: audioFromLabel(seg) }, '🎞') : null,
         p.role ? el('span', { class: 'role' }, p.role) : null),
       w > 54 ? el('div', { class: 'tcs' }, `${(p.end - p.start).toFixed(1)}s`) : null);
     strip.append(block);
@@ -1651,6 +1659,10 @@ function renderProgInspector() {
           type: 'checkbox', checked: !!seg.mute_source,
           onchange: (e) => { seg.mute_source = e.target.checked; progTouch(); },
         }), 'mute source'),
+      seg.audio_from
+        ? el('div', { class: 'field', title: 'overlay cutaway — audio comes from another clip' },
+          '🎞 ', audioFromLabel(seg))
+        : null,
       el('div', { class: 'field wide' }, 'notes',
         textInput(seg.notes, (v) => { seg.notes = v; markDirty(); }, 'why this cut is here'))),
 

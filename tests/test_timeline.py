@@ -8,6 +8,7 @@ import pytest
 
 from ytedit.project import Project
 from ytedit.timeline import (
+    AudioFrom,
     Caption,
     Chapter,
     MusicCue,
@@ -274,3 +275,54 @@ def test_speech_ranges_tolerate_elevenlabs_key_spelling(project: Project) -> Non
 def test_speech_ranges_without_transcripts(project: Project) -> None:
     tl = _timeline(_segment("s001", "c001", 0.0, 4.0))
     assert speech_ranges_from_transcripts(project, tl) == []
+
+
+# ----------------------------------------------------------------------
+# audio_from (overlay cutaways)
+# ----------------------------------------------------------------------
+def test_audio_from_alias_roundtrips() -> None:
+    seg = _segment(
+        "s001", "c033", 0.0, 3.0,
+        audio_from=AudioFrom(clip="c030", **{"in": 10.549}, out=13.549),
+    )
+    raw = seg.model_dump(by_alias=True, mode="json")
+    assert raw["audio_from"] == {"clip": "c030", "in": 10.549, "out": 13.549}
+    assert "in_" not in raw["audio_from"]
+
+    again = VideoSegment.model_validate(raw)
+    assert again.audio_from is not None
+    assert again.audio_from.in_ == 10.549
+    assert again.audio_from.out == 13.549
+    assert again.audio_from.duration == pytest.approx(3.0)
+    assert again.audio_source == ("c030", 10.549, 13.549)
+    # the picture is untouched by the override
+    assert (again.clip, again.in_, again.out) == ("c033", 0.0, 3.0)
+
+
+def test_audio_source_defaults_to_the_segments_own_cut() -> None:
+    assert _segment("s001", "c001", 2.0, 5.0).audio_source == ("c001", 2.0, 5.0)
+
+
+def test_validate_catches_a_missing_audio_from_clip(project: Project) -> None:
+    project.add_clip({"id": "c001", "order": 1})
+    tl = _timeline(
+        _segment("s001", "c001", 0.0, 4.0,
+                 audio_from=AudioFrom(clip="c777", **{"in": 0.0}, out=4.0)),
+    )
+    issues = tl.validate(project)
+    assert any("missing audio_from clip 'c777'" in i for i in issues)
+
+    project.add_clip({"id": "c777", "order": 2})
+    assert not any("audio_from" in i for i in tl.validate(project))
+
+
+def test_speech_ranges_follow_audio_from_to_the_other_clip(project: Project) -> None:
+    _write_transcript(project, "c001", [("Alfa", 1.0, 1.4), ("Beta", 2.0, 2.4)])
+    _write_transcript(project, "c002", [("Cisza", 0.1, 0.5)])
+    tl = _timeline(
+        # picture from c002 (whose own word must be ignored), audio from c001
+        _segment("s001", "c002", 0.0, 2.0,
+                 audio_from=AudioFrom(clip="c001", **{"in": 1.0}, out=3.0)),
+    )
+    # 'Alfa' 1.0-1.4 in c001 is 0.0-0.4 into the segment; 'Beta' 2.0-2.4 -> 1.0-1.4
+    assert speech_ranges_from_transcripts(project, tl) == [(0.0, 1.55)]

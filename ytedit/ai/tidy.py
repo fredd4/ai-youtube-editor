@@ -11,6 +11,13 @@ without asking a model anything:
 * a segment whose last word ends within that window of its ``out`` gets ``out``
   moved forward to ``last_word.end + pacing.speech_pad_after``;
 * a cut that lands *inside* a word snaps to that word's boundary first;
+* a cut that still lands **mid-sentence** is then extended to the sentence's own
+  boundary: forward through the following words (while consecutive gaps stay
+  under ``pacing.sentence_gap_max``) up to and including the first word ending
+  in ``.?!…``, or backward to the first word of the sentence the cut opens in —
+  plus the usual pad. The extra reach is capped at ``pacing.sentence_extend_max``
+  per side. Cutting a narrator off in the middle of "Obecnie na wysokości cztery
+  tysiące…" is the one thing a word-level pad cannot fix by itself;
 * the move never crosses a neighbouring word (``GUARD`` seconds of clearance),
   an excised editor instruction, a rejected take, clip 0, the clip duration, or
   another segment of the same clip;
@@ -50,6 +57,13 @@ GUARD: float = 0.05
 
 #: How far a cut may sit inside a word before it counts as cutting the word.
 _INSIDE_WORD: float = 0.02
+
+#: A transcript word ending in one of these closes a sentence.
+SENTENCE_END: str = ".?!…"
+
+#: Marker used in the change log for a sentence-boundary snap (see
+#: :func:`sentence_snap_count`).
+SENTENCE_SNAP_TAG: str = "sentence-snap"
 
 #: Backups of ``plan/timeline.json`` kept in ``plan/history/`` (mirrors server/app.py).
 MAX_HISTORY = 20
@@ -249,6 +263,140 @@ def _pad_out(
 
 
 # ----------------------------------------------------------------------
+# sentence-boundary snapping
+# ----------------------------------------------------------------------
+def ends_sentence(word: Word) -> bool:
+    """True when the word's text closes a sentence (``.``, ``?``, ``!``, ``…``)."""
+    text = word.text.strip()
+    return bool(text) and text[-1] in SENTENCE_END
+
+
+def has_sentence_marks(words: Sequence[Word]) -> bool:
+    """True when a transcript punctuates at all, so sentences can be located.
+
+    A transcript that never writes a full stop (a hand-made one, or an STT run
+    with punctuation disabled) carries no sentence information: snapping on it
+    would glue every word within ``sentence_gap_max`` of the cut into one
+    "sentence" and swallow whole takes. Sentence snapping is skipped for such a
+    clip and only the word-level padding applies.
+    """
+    return any(ends_sentence(w) for w in words)
+
+
+def _inside(seg: VideoSegment, words: Sequence[Word]) -> list[int]:
+    """Indices of the words lying wholly inside ``[seg.in, seg.out]``."""
+    return [
+        i
+        for i, w in enumerate(words)
+        if w.s >= seg.in_ - _EPS and w.e <= seg.out + _EPS
+    ]
+
+
+def _snap_out_to_sentence(
+    seg: VideoSegment,
+    words: Sequence[Word],
+    cuts: Sequence[tuple[float, float]],
+    high: float,
+    duration: float,
+    pad_after: float,
+    gap_max: float,
+    extend_max: float,
+) -> tuple[float, Word] | None:
+    """Extend ``out`` to the end of the sentence the cut lands inside.
+
+    Returns ``(new_out, last_word_of_the_sentence)``, or ``None`` when the cut
+    already sits on a sentence boundary, the next word is further than
+    ``gap_max`` away, or nothing can be gained without crossing a guard.
+    """
+    indices = _inside(seg, words)
+    if not indices:
+        return None
+    last = indices[-1]
+    if ends_sentence(words[last]):
+        return None
+
+    tail: list[Word] = []
+    previous = words[last]
+    for word in words[last + 1:]:
+        if word.s - previous.e > gap_max + _EPS:
+            break
+        tail.append(word)
+        previous = word
+        if ends_sentence(word):
+            break
+    if not tail:
+        return None
+    anchor = tail[-1]
+
+    desired = anchor.e + pad_after
+    limit = min(float(high), seg.out + extend_max)
+    if duration > 0:
+        limit = min(limit, duration)
+    following = [w for w in words if w.s >= anchor.e - _EPS]
+    if following:
+        limit = min(limit, following[0].s - GUARD)
+    for cut_s, _cut_e in cuts:
+        if cut_s >= words[last].e - _EPS:
+            limit = min(limit, cut_s)
+    new_out = min(desired, limit)
+    if new_out <= seg.out + 1e-3:
+        return None
+    return round(new_out, 3), anchor
+
+
+def _snap_in_to_sentence(
+    seg: VideoSegment,
+    words: Sequence[Word],
+    cuts: Sequence[tuple[float, float]],
+    low: float,
+    pad_before: float,
+    gap_max: float,
+    extend_max: float,
+) -> tuple[float, Word] | None:
+    """Move ``in`` back to the start of the sentence the cut opens inside."""
+    indices = _inside(seg, words)
+    if not indices:
+        return None
+    first = indices[0]
+    if first == 0:
+        return None
+    if ends_sentence(words[first - 1]):
+        return None
+    if words[first].s - words[first - 1].e > gap_max + _EPS:
+        return None
+
+    head: list[Word] = []
+    current = words[first]
+    for i in range(first - 1, -1, -1):
+        word = words[i]
+        if current.s - word.e > gap_max + _EPS or ends_sentence(word):
+            break
+        head.append(word)
+        current = word
+    if not head:
+        return None
+    anchor = head[-1]
+
+    desired = anchor.s - pad_before
+    limit = max(0.0, float(low), seg.in_ - extend_max)
+    previous = [w for w in words if w.e <= anchor.s + _EPS]
+    if previous:
+        limit = max(limit, previous[-1].e + GUARD)
+    for _cut_s, cut_e in cuts:
+        if cut_e <= words[first].s + _EPS:
+            limit = max(limit, cut_e)
+    new_in = max(desired, limit)
+    if new_in >= seg.in_ - 1e-3:
+        return None
+    return round(new_in, 3), anchor
+
+
+def sentence_snap_count(changes: Sequence[str]) -> int:
+    """How many distinct segments a change log sentence-snapped."""
+    return len({line.split(" ", 1)[0] for line in changes if SENTENCE_SNAP_TAG in line})
+
+
+# ----------------------------------------------------------------------
 # the pass
 # ----------------------------------------------------------------------
 def pad_segments_to_speech(
@@ -279,6 +427,8 @@ def pad_segments_to_speech(
     pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
     window = max(0.0, float(cfg.get("pacing.speech_snap_window", 0.6)))
     merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
+    gap_max = max(0.0, float(cfg.get("pacing.sentence_gap_max", 1.2)))
+    extend_max = max(0.0, float(cfg.get("pacing.sentence_extend_max", 8.0)))
 
     clips = project.load_state().get("clips", {})
     words_cache: dict[str, list[Word]] = {}
@@ -325,6 +475,38 @@ def pad_segments_to_speech(
                 f"({'snap+pad' if snapped else 'pad'} after '{anchor.text}')"
             )
             seg.out = new_out
+
+        # The word-level pad can still leave the cut in the middle of a
+        # sentence; finish the thought before handing over to the next shot.
+        # Bounds are recomputed because in/out just moved.
+        if not has_sentence_marks(words):
+            continue
+        low, high = _clip_bounds(video, index)
+        snap_out = _snap_out_to_sentence(
+            seg, words, cuts, high, duration, pad_after, gap_max, extend_max
+        )
+        if snap_out is not None:
+            new_out, anchor = snap_out
+            changes.append(
+                f"{seg.id} out {_fmt(seg.out)}→{_fmt(new_out)} "
+                f"({SENTENCE_SNAP_TAG} to '{anchor.text}')"
+            )
+            seg.out = new_out
+        snap_in = _snap_in_to_sentence(
+            seg, words, cuts, low, pad_before, gap_max, extend_max
+        )
+        if snap_in is not None:
+            new_in, anchor = snap_in
+            changes.append(
+                f"{seg.id} in {_fmt(seg.in_)}→{_fmt(new_in)} "
+                f"({SENTENCE_SNAP_TAG} to '{anchor.text}')"
+            )
+            seg.in_ = new_in
+
+    snapped_segments = sentence_snap_count(changes)
+    if snapped_segments:
+        log.info("sentence-snapped %d segment(s) to their sentence boundaries",
+                 snapped_segments)
 
     timeline.tracks.video = _merge_jump_cuts(video, cuts_cache, merge_gap, changes)
 
@@ -472,11 +654,15 @@ def tidy(
 
     Returns:
         ``{"changes", "written", "backup", "dry_run", "edited_by_human",
-        "duration_before", "duration_after", "issues"}``.
+        "duration_before", "duration_after", "issues", "sentence_snapped",
+        "overlaid"}``.
 
     Raises:
         TidyError: When the project has no timeline yet.
     """
+    # Imported lazily: overlay.py imports this module for its re-timing helpers.
+    from ytedit.ai.overlay import overlay_cutaways
+
     if not project.timeline_file.exists():
         raise TidyError(
             f"no timeline at {project.timeline_file} — run `ytedit plan {project.slug}` first"
@@ -486,6 +672,9 @@ def tidy(
     before = timeline.duration()
 
     timeline, changes = pad_segments_to_speech(timeline, project)
+    snapped = sentence_snap_count(changes)
+    timeline, overlaid = overlay_cutaways(timeline, project)
+    changes = changes + overlaid
     result: dict[str, Any] = {
         "changes": changes,
         "written": None,
@@ -495,6 +684,8 @@ def tidy(
         "duration_before": before,
         "duration_after": timeline.duration(),
         "issues": [],
+        "sentence_snapped": snapped,
+        "overlaid": len(overlaid),
     }
     if not changes or dry_run:
         return result
@@ -518,11 +709,16 @@ def tidy(
 
 __all__ = [
     "GUARD",
+    "SENTENCE_END",
+    "SENTENCE_SNAP_TAG",
     "TidyError",
     "Word",
     "backup_timeline",
+    "ends_sentence",
+    "has_sentence_marks",
     "excised_ranges",
     "load_words",
     "pad_segments_to_speech",
+    "sentence_snap_count",
     "tidy",
 ]

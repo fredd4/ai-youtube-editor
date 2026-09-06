@@ -21,7 +21,7 @@ from fixtures.make_fixtures import build_all
 from ytedit.media import render as R
 from ytedit.media.ingest import ingest
 from ytedit.project import Project
-from ytedit.timeline import Timeline
+from ytedit.timeline import AudioFrom, Timeline
 
 #: Programme length of :func:`timeline_document` (3.0 + 3.0 − 0.5 xfade + 2.0).
 EXPECTED_DURATION: float = 7.5
@@ -646,3 +646,107 @@ def test_xfade_join_is_frame_exact(
     assert float(probe(audio_out)["format"]["duration"]) == pytest.approx(
         expected_frames / 30, abs=0.001
     )
+
+
+# ----------------------------------------------------------------------
+# overlay cutaways: picture from one clip, audio from another
+# ----------------------------------------------------------------------
+def measure_band_volume(path: Path, freq: int, start: float = 0.2,
+                        length: float = 1.0, width: int = 40, passes: int = 3) -> float:
+    """Mean volume in dBFS of a narrow band around ``freq``.
+
+    The fixtures carry pure sines (440 Hz landscape, 660 Hz vertical), so a
+    bandpass plus ``volumedetect`` says which clip's audio ended up in a file.
+    One biquad leaks a good 15 dB of a neighbouring tone, so the filter is
+    chained ``passes`` times to make the two fixtures unmistakable.
+    """
+    band = ",".join([f"bandpass=f={freq}:width_type=h:w={width}"] * passes)
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-ss", f"{start}", "-t", f"{length}",
+         "-i", str(path),
+         "-af", f"{band},volumedetect",
+         "-f", "null", "-"],
+        capture_output=True, text=True, errors="replace",
+    )
+    match = re.search(r"mean_volume:\s*(-?[\d.]+) dB", proc.stderr)
+    assert match, proc.stderr[-1500:]
+    return float(match.group(1))
+
+
+def test_audio_from_renders_the_other_clips_tone_at_the_pictures_length(
+    rendered: tuple[Project, Path],
+) -> None:
+    """Picture c001 (440 Hz), audio borrowed from c002 (660 Hz)."""
+    project, _out = rendered
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {"video": [
+            {"id": "s001", "clip": "c001", "in": 0.5, "out": 2.0, "role": "cutaway",
+             "audio_from": {"clip": "c002", "in": 1.0, "out": 2.5}},
+        ]},
+    })
+    seg = timeline.tracks.video[0]
+    canvas = R.canvas_for(timeline, preview=True)
+    path = R.render_segment(project, timeline, seg, canvas, "preview")
+
+    # exactly as many frames as the picture asks for
+    frames = seg.frames(canvas.fps)
+    assert frames == 45
+    assert int(video_stream(path)["nb_frames"]) == frames
+    assert float(probe(path)["format"]["duration"]) == pytest.approx(
+        frames / canvas.fps, abs=1.0 / canvas.fps
+    )
+
+    # ... and the sound is the *audio* clip's tone, not the picture clip's
+    at_660 = measure_band_volume(path, 660)
+    at_440 = measure_band_volume(path, 440)
+    assert at_660 > at_440 + 30, (at_660, at_440)
+
+
+def test_audio_from_takes_part_in_the_segment_cache_key(rendered: tuple[Project, Path]) -> None:
+    project, _out = rendered
+    timeline = Timeline.model_validate({
+        "tracks": {"video": [{"id": "s001", "clip": "c001", "in": 0.5, "out": 2.0}]},
+    })
+    seg = timeline.tracks.video[0]
+    canvas = R.Canvas(1280, 720, 30)
+    plain = R.segment_key(project, timeline, seg, canvas, "preview")
+
+    borrowed = seg.model_copy(update={
+        "audio_from": AudioFrom(clip="c002", **{"in": 1.0}, out=2.5)
+    })
+    key = R.segment_key(project, timeline, borrowed, canvas, "preview")
+    assert key != plain
+
+    moved = borrowed.model_copy(update={
+        "audio_from": AudioFrom(clip="c002", **{"in": 1.5}, out=3.0)
+    })
+    assert R.segment_key(project, timeline, moved, canvas, "preview") != key
+
+
+def test_audio_from_mute_ranges_are_read_in_the_audio_clips_time_base() -> None:
+    timeline = Timeline.model_validate({
+        "tracks": {"video": [
+            {"id": "s1", "clip": "c033", "in": 0.0, "out": 3.0,
+             "audio_from": {"clip": "c030", "in": 10.0, "out": 13.0}},
+        ]},
+        "mute_ranges": [
+            {"clip": "c030", "s": 11.0, "e": 12.0, "gain_db": -60},   # the audio clip
+            {"clip": "c033", "s": 0.0, "e": 1.0, "gain_db": -60},     # the picture clip
+        ],
+    })
+    assert R.segment_mute_ranges(timeline, timeline.tracks.video[0]) == [(1.0, 2.0, -60.0)]
+
+
+def test_a_missing_audio_from_source_is_a_render_error(project: Project) -> None:
+    project.source_path("c001").parent.mkdir(parents=True, exist_ok=True)
+    project.source_path("c001").write_bytes(b"not really an mp4")
+    project.add_clip({"id": "c001", "order": 1, "duration": 10.0,
+                      "width": 1920, "height": 1080, "has_audio": True})
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "s001", "clip": "c001", "in": 0.0, "out": 2.0,
+         "audio_from": {"clip": "c999", "in": 0.0, "out": 2.0}},
+    ]}})
+    with pytest.raises(R.RenderError, match="audio_from clip 'c999'"):
+        R.render_segment(project, timeline, timeline.tracks.video[0], R.Canvas(1920, 1080, 30),
+                         "preview")

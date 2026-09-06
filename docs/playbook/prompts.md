@@ -172,6 +172,7 @@ PACING
 - Leave air around speech: a segment's "in" ~0.3 s before its first word and its "out"
   ~0.5 s after its last word, never exactly on them (a deterministic pass enforces
   this afterwards, so do not fight it by cutting tight).
+- Cut narration only at sentence boundaries; when you want a cutaway in the middle of a take, place the cutaway between two contiguous pieces of the same take (second piece starts where the first ended) — the pipeline keeps the narration audio continuous under the cutaway.
 
 ALSO PRODUCE
 - cold_open: 2-4 visually distinct picks from anywhere in the log, ~10 s total.

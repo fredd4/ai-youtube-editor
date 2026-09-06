@@ -188,6 +188,10 @@ pacing:
   speech_pad_after: 0.45       # seconds of air after the last word
   speech_snap_window: 0.6      # only pad when the cut is this close to speech
   merge_gap: 0.15              # same-clip jump cuts closer than this are merged
+  # Sentence-boundary snapping: a cut that lands mid-sentence is extended to the
+  # end (or back to the start) of that sentence before the pad is applied.
+  sentence_gap_max: 1.2        # words further apart than this end the sentence
+  sentence_extend_max: 8.0     # most a sentence snap may add to one side of a cut
   # Structural beats (seconds). "end-20" = 20 s before the end.
   markers:
     - { at: 0.0, label: hook }

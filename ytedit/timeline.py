@@ -100,6 +100,26 @@ class Duck(_Model):
     ranges: list[tuple[float, float]] = Field(default_factory=list)
 
 
+class AudioFrom(_Model):
+    """Audio-only override: where a segment's *sound* comes from.
+
+    A cutaway placed in the middle of a take keeps its own picture but should
+    not interrupt the narration underneath it. Setting ``audio_from`` makes the
+    render take the segment's audio from ``clip[in, out]`` instead of the
+    segment's own clip range, trimmed/padded to the segment's exact frame count
+    (see :func:`ytedit.ai.overlay.overlay_cutaways`).
+    """
+
+    clip: str
+    in_: float = Field(0.0, alias="in", serialization_alias="in")
+    out: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        """Length of the borrowed audio range in seconds."""
+        return max(0.0, self.out - self.in_)
+
+
 class VideoSegment(_Model):
     """One cut from a normalized source clip."""
 
@@ -115,6 +135,16 @@ class VideoSegment(_Model):
     mute_source: bool = False
     source_audio_gain_db: float = 0.0
     notes: str = ""
+    #: Take the audio from another clip range instead of this segment's own
+    #: (``mute_source`` still wins and renders silence).
+    audio_from: AudioFrom | None = None
+
+    @property
+    def audio_source(self) -> tuple[str, float, float]:
+        """``(clip, in, out)`` the segment's audio is actually read from."""
+        if self.audio_from is not None:
+            return self.audio_from.clip, self.audio_from.in_, self.audio_from.out
+        return self.clip, self.in_, self.out
 
     @property
     def source_duration(self) -> float:
@@ -399,6 +429,16 @@ class Timeline(_Model):
                 issues.append(f"{seg.id}: speed must be > 0 (got {seg.speed})")
             if project is not None and known_clips and seg.clip not in known_clips:
                 issues.append(f"{seg.id}: missing clip {seg.clip!r} in project registry")
+            if (
+                seg.audio_from is not None
+                and project is not None
+                and known_clips
+                and seg.audio_from.clip not in known_clips
+            ):
+                issues.append(
+                    f"{seg.id}: missing audio_from clip {seg.audio_from.clip!r} "
+                    "in project registry"
+                )
             if seg.transition_in.duration < 0:
                 issues.append(f"{seg.id}: negative transition duration")
             if seg.transition_in.duration > seg.duration + 1e-6:
@@ -546,7 +586,9 @@ def speech_ranges_from_transcripts(
 
     Every video segment contributes the words of its clip that fall inside
     ``[in, out)``, translated to the segment's absolute position (and divided by
-    ``speed``). Ranges shorter than ``merge_gap`` apart are merged and padded by
+    ``speed``). A segment with :attr:`VideoSegment.audio_from` contributes the
+    words of *that* clip range instead, still placed at the picture segment's
+    position. Ranges shorter than ``merge_gap`` apart are merged and padded by
     ``pad`` — the result drives ``duck.mode == "auto"`` music automation.
 
     Args:
@@ -567,8 +609,11 @@ def speech_ranges_from_transcripts(
         seg = pos.segment
         if seg.mute_source:
             continue
-        if seg.clip not in cache:
-            path = project.transcript_path(seg.clip)
+        # An overlay cutaway is heard as the clip underneath it, not as its own
+        # picture clip: read the words from wherever the audio really comes from.
+        src_clip, src_in, src_out = seg.audio_source
+        if src_clip not in cache:
+            path = project.transcript_path(src_clip)
             words: list[tuple[float, float]] = []
             if path.exists():
                 try:
@@ -581,16 +626,16 @@ def speech_ranges_from_transcripts(
                     if span:
                         words.append(span)
             else:
-                log.debug("no transcript for clip %s", seg.clip)
-            cache[seg.clip] = words
+                log.debug("no transcript for clip %s", src_clip)
+            cache[src_clip] = words
 
         speed = seg.speed if seg.speed > 0 else 1.0
-        for w_start, w_end in cache[seg.clip]:
-            if w_end <= seg.in_ or w_start >= seg.out:
+        for w_start, w_end in cache[src_clip]:
+            if w_end <= src_in or w_start >= src_out:
                 continue
-            s = max(w_start, seg.in_)
-            e = min(w_end, seg.out)
-            spans.append((pos.start + (s - seg.in_) / speed, pos.start + (e - seg.in_) / speed))
+            s = max(w_start, src_in)
+            e = min(w_end, src_out)
+            spans.append((pos.start + (s - src_in) / speed, pos.start + (e - src_in) / speed))
 
     return merge_ranges(spans, merge_gap=merge_gap, pad=pad)
 

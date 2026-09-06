@@ -10,6 +10,11 @@ can be resumed and a preview can be diffed against a master):
    segments are reused across renders. A clip with ``use_denoised`` set in
    ``state.json`` takes its audio from ``media/audio/<clip>.denoised.wav``
    instead of the mezzanine's own stream (that file's mtime is in the key too).
+   A segment carrying ``audio_from`` keeps its own picture but reads its audio
+   from another clip's range (an overlay cutaway with the narration running on
+   underneath); that range is trimmed or padded to the segment's own frame
+   count, and the audio clip's mute ranges, denoised WAV and mtime all take part
+   in the cache key.
 2. **Join pass** — hard cuts go through the concat demuxer with ``-c copy``;
    ``fade``/``xfade`` transitions build a chained ``xfade`` + ``acrossfade``
    ``filter_complex`` with accumulating offsets. Produces
@@ -351,7 +356,9 @@ def segment_mute_ranges(
 
     ``mute_ranges`` are expressed in the *clip*'s own time base and apply
     wherever that clip range is used. A segment only sees the intersection with
-    ``[in, out)``, shifted by ``in`` and divided by ``speed``.
+    ``[in, out)``, shifted by ``in`` and divided by ``speed``. For an overlay
+    cutaway (``audio_from`` set) the ranges are read in the **audio** clip's
+    time base — that is the audio the filter graph actually attenuates.
 
     Args:
         timeline: Timeline holding ``mute_ranges``.
@@ -361,18 +368,19 @@ def segment_mute_ranges(
         ``(start, end, gain_db)`` triples in seconds from the segment start.
     """
     speed = seg.speed if seg.speed > 0 else 1.0
+    clip_id, src_in, src_out = seg.audio_source
     out: list[tuple[float, float, float]] = []
     for mute in timeline.mute_ranges:
-        if mute.clip != seg.clip:
+        if mute.clip != clip_id:
             continue
-        start = max(float(mute.s), seg.in_)
-        end = min(float(mute.e), seg.out)
+        start = max(float(mute.s), src_in)
+        end = min(float(mute.e), src_out)
         if end <= start:
             continue
         out.append(
             (
-                round((start - seg.in_) / speed, 4),
-                round((end - seg.in_) / speed, 4),
+                round((start - src_in) / speed, 4),
+                round((end - src_in) / speed, 4),
                 float(mute.gain_db),
             )
         )
@@ -412,6 +420,17 @@ def denoised_audio(
     return path
 
 
+def _denoise_stamp(project: Project, clip_id: str) -> list[Any] | None:
+    """``[name, mtime]`` of a clip's active denoised WAV, for the segment cache key."""
+    denoised = denoised_audio(project, clip_id)
+    if denoised is None:
+        return None
+    try:
+        return [denoised.name, denoised.stat().st_mtime_ns]
+    except OSError:  # pragma: no cover - raced deletion
+        return None
+
+
 def segment_key(
     project: Project,
     timeline: Timeline,
@@ -427,13 +446,21 @@ def segment_key(
     except OSError:
         mtime, size = 0, 0
     # Re-denoising a clip must invalidate every segment cut from it.
-    denoised = denoised_audio(project, seg.clip)
-    try:
-        denoise_stamp = (
-            [denoised.name, denoised.stat().st_mtime_ns] if denoised is not None else None
-        )
-    except OSError:  # pragma: no cover - raced deletion
-        denoise_stamp = None
+    denoise_stamp = _denoise_stamp(project, seg.clip)
+    # An overlay cutaway is only as fresh as the clip it borrows its audio from.
+    audio_stamp: list[Any] | None = None
+    audio_denoise_stamp: list[Any] | None = None
+    if seg.audio_from is not None:
+        audio_source = project.source_path(seg.audio_from.clip)
+        try:
+            audio_stamp = [
+                audio_source.name,
+                audio_source.stat().st_mtime_ns,
+                audio_source.stat().st_size,
+            ]
+        except OSError:
+            audio_stamp = [audio_source.name, 0, 0]
+        audio_denoise_stamp = _denoise_stamp(project, seg.audio_from.clip)
     payload = {
         "segment": seg.model_dump(by_alias=True, mode="json"),
         "canvas": [canvas.width, canvas.height, canvas.fps],
@@ -441,9 +468,16 @@ def segment_key(
         "mute": segment_mute_ranges(timeline, seg),
         "source": [source.name, mtime, size],
         "denoised": denoise_stamp,
+        "audio_from": (
+            seg.audio_from.model_dump(by_alias=True, mode="json")
+            if seg.audio_from is not None
+            else None
+        ),
+        "audio_source": audio_stamp,
+        "audio_denoised": audio_denoise_stamp,
         "grade": project.settings.get(f"grade.presets.{seg.grade}", []),
         "frames": seg.frames(canvas.fps),
-        "version": 3,
+        "version": 4,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
@@ -502,7 +536,8 @@ def render_segment(
         Path to ``renders/segments/<hash>.mp4``.
 
     Raises:
-        RenderError: When the clip's mezzanine is missing.
+        RenderError: When the clip's mezzanine (or that of an ``audio_from``
+            clip) is missing.
     """
     settings = project.settings
     source = project.source_path(seg.clip)
@@ -571,9 +606,31 @@ def render_segment(
         f":channel_layouts={'stereo' if channels == 2 else 'mono'}"
     )
 
+    # An overlay cutaway keeps this picture but borrows its sound (and its
+    # denoise state, and the time base of its mute ranges) from another clip.
+    audio_clip, audio_in, _audio_out = seg.audio_source
+    if seg.audio_from is not None:
+        audio_source = project.source_path(audio_clip)
+        if not audio_source.exists():
+            raise RenderError(
+                f"{seg.id}: missing normalized source {audio_source} "
+                f"for audio_from clip {audio_clip!r}"
+            )
+        audio_clip_state = state.get("clips", {}).get(audio_clip, {})
+        audio_has = bool(audio_clip_state.get("has_audio", True))
+        if audio_has and not _source_has_audio(audio_source):
+            log.warning(
+                "%s: audio_from source %s has no audio stream, using silence",
+                seg.id, audio_source.name,
+            )
+            audio_has = False
+    else:
+        audio_source = source
+        audio_has = has_audio
+
     inputs: list[Any] = ["-ss", f"{seg.in_:.6f}", "-i", str(source)]
-    silent = seg.mute_source or not has_audio
-    cleaned = None if silent else denoised_audio(project, seg.clip, state)
+    silent = seg.mute_source or not audio_has
+    cleaned = None if silent else denoised_audio(project, audio_clip, state)
     if silent:
         inputs += [
             "-f", "lavfi",
@@ -585,7 +642,13 @@ def render_segment(
         # The denoised WAV is the full clip, aligned with the mezzanine, so the
         # same -ss applies. Gains and mute ranges are unchanged below.
         log.debug("segment %s: using denoised audio %s", seg.id, cleaned.name)
-        inputs += ["-ss", f"{seg.in_:.6f}", "-i", str(cleaned)]
+        inputs += ["-ss", f"{audio_in:.6f}", "-i", str(cleaned)]
+        audio_index = 1
+    elif seg.audio_from is not None:
+        log.debug(
+            "segment %s: audio from %s %.3f-%.3f", seg.id, audio_clip, audio_in, _audio_out
+        )
+        inputs += ["-ss", f"{audio_in:.6f}", "-i", str(audio_source)]
         audio_index = 1
     else:
         audio_index = 0

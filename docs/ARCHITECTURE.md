@@ -178,6 +178,8 @@ Clip ids are `c` + zero-padded index in **recording order** (from `creation_time
 ```
 Rules: times in seconds (float). Timeline time for a video segment = cumulative position; `render.py` computes absolute placement. Captions/music/voice use absolute timeline time. `mute_ranges` are in **clip** time and apply to source audio wherever that clip range is used.
 
+A video segment also accepts an optional `audio_from: {"clip", "in", "out"}` (an *overlay cutaway*): the picture stays `clip[in, out]` but the rendered audio is read from `audio_from.clip[audio_from.in, audio_from.out]` instead, trimmed or padded to the segment's own picture frame count, with the segment's own `speed`/`source_audio_gain_db` and the audio clip's mute ranges and denoised WAV. `mute_source: true` still wins and renders silence. `ytedit/ai/overlay.py` sets it so a cutaway dropped between two contiguous pieces of one take does not interrupt the narration underneath.
+
 `plan.py`'s planner-facing segment schema (before deterministic post-processing) also accepts an optional `voice_over: {"picture": [{"clip", "in", "out"}]}` on a segment: `build_timeline` extracts that segment's own clip audio as a `tracks.voice` item (a WAV cut from `media/audio/<clip>.wav`, or the denoised variant when active, written to `voice/vo_<clip>_<in>_<out>.wav`) and replaces the segment with the listed picture cuts (`mute_source: true`, `role: "b-roll"`) so the narrator is heard but not seen, except where those cuts fall short of the narration's length — then the clip's own picture fills the gap.
 
 ### plan/edit_plan.json (LLM reasoning, human-readable)

@@ -246,7 +246,9 @@ def tidy(
     for change in changes:
         console.print(f"[dim]-[/] {change}")
     console.print(
-        f"[bold]{len(changes)}[/] change(s) · duration "
+        f"[bold]{len(changes)}[/] change(s) · "
+        f"{result['sentence_snapped']} sentence-snapped · "
+        f"{result['overlaid']} overlay change(s) · duration "
         f"{result['duration_before']:.2f}s -> {result['duration_after']:.2f}s"
     )
     for issue in result["issues"]:
@@ -329,6 +331,118 @@ def denoise(
             str(item.get("error") or item["engine_file"]),
         )
     console.print(table)
+    if any(item["status"] == "error" for item in results):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def noise(
+    slug: str = typer.Argument(..., help="Project slug."),
+    used_only: bool = typer.Option(
+        None,
+        "--used-only/--all",
+        help="Restrict to clips used unmuted in plan/timeline.json "
+        "(default: on when a timeline exists, otherwise every clip is scanned).",
+    ),
+    denoise_flag: bool = typer.Option(
+        False, "--denoise", help="Run denoise on every windy clip that isn't denoised yet."
+    ),
+    engine: str = typer.Option(
+        "elevenlabs", "--engine", "-e", help="Engine for --denoise: elevenlabs (paid) or local (free)."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the cost confirmation gate for --denoise."
+    ),
+    threshold_snr: float | None = typer.Option(
+        None, "--threshold-snr", help="Override noise.snr_flag_db (windy cutoff) for this run."
+    ),
+    threshold_low: float | None = typer.Option(
+        None, "--threshold-low", help="Override noise.low_band_flag (windy cutoff) for this run."
+    ),
+) -> None:
+    """Scan clip audio for wind/noise and flag which clips need denoise."""
+    from .media.audio import DenoiseError, denoise_clips
+    from .media.noise import (
+        NoiseError,
+        estimate_denoise_cost,
+        scan_project,
+        windy_undenoised_clips,
+        write_report,
+    )
+
+    project = _load(slug)
+    resolved_used_only = project.timeline_file.exists() if used_only is None else used_only
+    try:
+        report = scan_project(
+            project,
+            used_only=resolved_used_only,
+            snr_flag_db=threshold_snr,
+            low_band_flag=threshold_low,
+        )
+    except NoiseError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(code=2) from exc
+
+    json_path, md_path = write_report(project, report)
+
+    table = Table(title="noise scan (worst first)", header_style="bold cyan")
+    for column in ("clip", "snr db", "gap db", "speech db", "low band", "gap s", "speech s", "flag", "denoised"):
+        table.add_column(column)
+    for row in report["clips"]:
+        flag = row["flags"][0] if row["flags"] else "-"
+        style = {"windy": "red", "noisy": "yellow"}.get(flag, "")
+        table.add_row(
+            f"[{style}]{row['clip']}[/]" if style else row["clip"],
+            f"{row['snr_db']:.1f}",
+            f"{row['gap_rms_db']:.1f}",
+            f"{row['speech_rms_db']:.1f}",
+            f"{row['low_band_ratio']:.2f}",
+            f"{row['gap_seconds']:.1f}",
+            f"{row['speech_seconds']:.1f}",
+            f"[{style}]{flag}[/]" if style else flag,
+            f"yes ({row['denoise_engine']})" if row["use_denoised"] else "-",
+        )
+    console.print(table)
+    console.print(f"[dim]wrote[/] {project.rel(json_path)}, {project.rel(md_path)}")
+    if report["skipped"]:
+        console.print(
+            f"[dim]skipped (not enough gap/speech signal): {', '.join(report['skipped'])}[/]"
+        )
+
+    windy = windy_undenoised_clips(report)
+    if not windy:
+        if denoise_flag:
+            console.print("[green]nothing to denoise[/] — no un-denoised windy clips")
+        return
+
+    if not denoise_flag:
+        console.print(
+            f"[yellow]{len(windy)} windy clip(s) not yet denoised:[/] {', '.join(windy)} "
+            "— re-run with --denoise to clean them up"
+        )
+        return
+
+    estimated = estimate_denoise_cost(project, windy, engine)
+    console.print(
+        f"[bold]denoise estimate:[/] {len(windy)} clip(s) with [bold]{engine}[/], "
+        f"~[cost]${estimated:.2f}[/]"
+    )
+    if estimated > 2.0 and not yes:
+        console.print(
+            "[bold red]estimated cost exceeds $2[/] — re-run with --yes to proceed"
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        results = denoise_clips(project, clip_ids=windy, engine=engine)
+    except DenoiseError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(code=2) from exc
+
+    for item in results:
+        style = {"done": "green", "cached": "dim", "error": "red"}.get(item["status"], "")
+        line = f"{item['clip']}: {item['status']}"
+        console.print(f"[{style}]{line}[/]" if style else line)
     if any(item["status"] == "error" for item in results):
         raise typer.Exit(code=1)
 
