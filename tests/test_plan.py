@@ -7,6 +7,7 @@ Every test here is offline: the planner model is replaced with a fake
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +185,18 @@ def planned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Project:
     return project
 
 
+def sine(path: Path, seconds: float = 20.0) -> Path:
+    """Write a mono 48 kHz sine WAV standing in for a clip's work audio."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error",
+         "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={seconds}",
+         "-ac", "1", "-c:a", "pcm_s16le", str(path)],
+        check=True,
+    )
+    return path
+
+
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
@@ -287,6 +300,242 @@ def test_markers_come_from_settings(planned: Project) -> None:
 
 
 # ----------------------------------------------------------------------
+# voice-over segments (post-trip narration clips, playbook §3)
+# ----------------------------------------------------------------------
+def _add_narration_clip(
+    planned: Project, instructions: list[dict[str, Any]] | None = None, seconds: float = 20.0
+) -> dict[str, Any]:
+    """Register a narration clip (``c004``) with real work audio on disk."""
+    sine(planned.audio_path("c004"), seconds=seconds)
+    with planned.edit_state() as state:
+        state["clips"]["c004"] = {
+            "id": "c004", "order": 4, "duration": seconds, "width": 1920, "height": 1080,
+            "orientation": "horizontal",
+        }
+    log = json.loads(json.dumps(FOOTAGE_LOG))
+    log["clips"].append(
+        {
+            "clip": "c004",
+            "summary": "Nagranie z domu po podróży.",
+            "kind": "a-roll",
+            "instructions": instructions or [],
+            "takes": [],
+            "background_music": [],
+        }
+    )
+    return log
+
+
+def test_voice_over_extracts_audio_and_places_a_voice_item(planned: Project) -> None:
+    footage_log = _add_narration_clip(
+        planned, instructions=[{"s": 0.0, "e": 2.0, "text": "to o plaży", "action": "drop"}]
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c004", "in": 2.2, "out": 8.0, "role": "a-roll",
+            "voice_over": {
+                "picture": [
+                    {"clip": "c001", "in": 5.0, "out": 8.0},
+                    {"clip": "c002", "in": 2.0, "out": 4.0},
+                ]
+            },
+            "notes": "narracja z domu",
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, footage_log)
+
+    # No normal (heard *and* seen) segment survives for the narration clip.
+    assert not any(s.clip == "c004" and not s.mute_source for s in timeline.tracks.video)
+
+    assert stats["voice_over_segments"] == 1
+    assert len(timeline.tracks.voice) == 1
+    voice = timeline.tracks.voice[0]
+
+    # The padded range (2.2-0.30, 8.0+0.45) = (1.9, 8.45) would reach into the
+    # excised instruction (0.0-2.0); it must clamp to the instruction's end.
+    assert voice.file == "voice/vo_c004_002.00_008.45.wav"
+    assert (planned.path / voice.file).exists()
+    assert voice.at == pytest.approx(0.0)
+    assert voice.end == pytest.approx(6.45, abs=1e-2)
+
+    # Picture cuts stand in for the narration clip: muted B-roll, in screen order.
+    picture = [s for s in timeline.tracks.video if s.notes == "VO picture for c004"]
+    assert all(p.mute_source and p.role == "b-roll" for p in picture)
+    assert (picture[0].in_, picture[0].out) == (5.0, 8.0)
+
+    # Picture cuts (3s + 2s) fall 1.45s short of the 6.45s narration. That's a
+    # sub-second-shot-sized shortfall — it is absorbed by extending the LAST
+    # real picture cut (c002 has 36s of headroom on its own clip), never by
+    # flashing back to the narrator's own face for a fraction of a second.
+    assert [p.clip for p in picture] == ["c001", "c002"]
+    assert picture[1].in_ == pytest.approx(2.0)
+    assert picture[1].out == pytest.approx(5.45, abs=1e-2)
+    total_picture = sum(p.duration for p in picture)
+    assert total_picture == pytest.approx(voice.end - voice.at, abs=1e-2)
+
+
+def test_voice_over_picture_cuts_alone_are_trimmed_when_they_overshoot(planned: Project) -> None:
+    footage_log = _add_narration_clip(planned)
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c004", "in": 5.0, "out": 8.0, "role": "a-roll",
+            "voice_over": {
+                "picture": [
+                    {"clip": "c002", "in": 0.0, "out": 3.0},
+                    {"clip": "c003", "in": 0.0, "out": 3.0},
+                ]
+            },
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, footage_log)
+    assert stats["voice_over_segments"] == 1
+
+    voice = timeline.tracks.voice[0]
+    assert voice.end - voice.at == pytest.approx(3.75, abs=1e-2)  # (5-0.3) to (8+0.45)
+
+    picture = [s for s in timeline.tracks.video if s.mute_source]
+    # No fallback picture from c004: the two picture cuts alone (6s) already
+    # cover the 3.75s narration, so the second one is trimmed, not replaced.
+    assert [p.clip for p in picture] == ["c002", "c003"]
+    assert not any(p.clip == "c004" for p in picture)
+    assert picture[0].duration == pytest.approx(3.0)
+    assert picture[1].in_ == pytest.approx(0.0)
+    assert picture[1].duration == pytest.approx(0.75, abs=1e-2)
+    # c003 is vertical: the picture cut gets the vertical-clip fit rule too.
+    assert picture[1].transform.fit == "blur-fill"
+    total = sum(p.duration for p in picture)
+    assert total == pytest.approx(voice.end - voice.at, abs=1e-2)
+
+
+def test_voice_over_small_shortfall_extends_last_cut_with_no_fallback(planned: Project) -> None:
+    """A ~0.75s shortfall (the speech-padding amount) must never flash the
+    narrator's own face — it belongs on the real picture cut that has room."""
+    footage_log = _add_narration_clip(planned)
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c004", "in": 5.0, "out": 8.0, "role": "a-roll",
+            "voice_over": {"picture": [{"clip": "c002", "in": 0.0, "out": 3.0}]},
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, footage_log)
+    assert stats["voice_over_segments"] == 1
+
+    voice = timeline.tracks.voice[0]
+    assert voice.end - voice.at == pytest.approx(3.75, abs=1e-2)  # (5-0.3) to (8+0.45)
+
+    picture = [s for s in timeline.tracks.video if s.mute_source]
+    # The single picture cut (3s) is 0.75s short of the 3.75s narration; c002
+    # has 37s of headroom on its own clip, so the cut is simply extended.
+    assert [p.clip for p in picture] == ["c002"]
+    assert picture[0].in_ == pytest.approx(0.0)
+    assert picture[0].out == pytest.approx(3.75, abs=1e-2)
+    assert not any(p.clip == "c004" for p in picture)
+    total = sum(p.duration for p in picture)
+    assert total == pytest.approx(voice.end - voice.at, abs=1e-2)
+
+
+def test_voice_over_large_shortfall_with_no_room_falls_back_to_own_picture(
+    planned: Project,
+) -> None:
+    """A shortfall the real cuts cannot absorb, and that is a full shot on its
+    own (>= ``pacing.min_shot_seconds``), still falls back to the narration
+    clip's own picture — never left uncovered."""
+    footage_log = _add_narration_clip(planned)
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c004", "in": 5.0, "out": 10.0, "role": "a-roll",
+            # c002's cut already runs to its clip's own duration (40s): no
+            # room at all to extend it.
+            "voice_over": {"picture": [{"clip": "c002", "in": 38.0, "out": 40.0}]},
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, footage_log)
+    assert stats["voice_over_segments"] == 1
+
+    voice = timeline.tracks.voice[0]
+    assert voice.end - voice.at == pytest.approx(5.75, abs=1e-2)  # (5-0.3) to (10+0.45)
+
+    picture = [s for s in timeline.tracks.video if s.mute_source]
+    assert [p.clip for p in picture] == ["c002", "c004"]
+    assert picture[0].out == pytest.approx(40.0)  # unextended: no room left
+    assert picture[1].in_ == pytest.approx(5.0)
+    total = sum(p.duration for p in picture)
+    assert total == pytest.approx(voice.end - voice.at, abs=1e-2)
+
+
+def test_voice_over_tiny_shortfall_with_no_room_is_absorbed_by_first_cut(
+    planned: Project,
+) -> None:
+    """A shortfall too small to justify its own shot, with no room to extend
+    the real cut, is absorbed as a last resort by pulling the first cut's
+    in-point back rather than appending a fallback shot."""
+    footage_log = _add_narration_clip(planned)
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c004", "in": 10.0, "out": 10.25, "role": "a-roll",
+            "voice_over": {"picture": [{"clip": "c002", "in": 39.5, "out": 40.0}]},
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, footage_log)
+    assert stats["voice_over_segments"] == 1
+
+    voice = timeline.tracks.voice[0]
+    assert voice.end - voice.at == pytest.approx(1.0, abs=1e-2)  # (10-0.3) to (10.25+0.45)
+
+    picture = [s for s in timeline.tracks.video if s.mute_source]
+    assert [p.clip for p in picture] == ["c002"]
+    assert picture[0].in_ == pytest.approx(39.0)
+    assert picture[0].out == pytest.approx(40.0)
+    assert not any(p.clip == "c004" for p in picture)
+
+
+def test_consecutive_voice_over_segments_from_same_clip_are_merged(planned: Project) -> None:
+    """Three planner proposals splitting one narration take must become one
+    audio extraction, not three overlapping ones (each padded independently)."""
+    footage_log = _add_narration_clip(planned)
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c004", "in": 1.0, "out": 4.0, "role": "a-roll",
+            "voice_over": {"picture": [{"clip": "c001", "in": 0.0, "out": 3.0}]},
+            "notes": "część 1",
+        },
+        {
+            "clip": "c004", "in": 4.2, "out": 7.0, "role": "a-roll",
+            "voice_over": {"picture": [{"clip": "c002", "in": 0.0, "out": 2.5}]},
+            "notes": "część 2",
+        },
+        {
+            "clip": "c004", "in": 7.1, "out": 9.0, "role": "a-roll",
+            "voice_over": {"picture": [{"clip": "c003", "in": 0.0, "out": 1.5}]},
+            "notes": "część 3",
+        },
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, footage_log)
+
+    # A chain of 3 merges away 2 segments into the first.
+    assert stats["voice_over_merged"] == 2
+    assert stats["voice_over_segments"] == 1
+    assert len(timeline.tracks.voice) == 1
+
+    voice = timeline.tracks.voice[0]
+    # merged in/out 1.0-9.0, padded by 0.3/0.45 -> 0.7-9.45 (8.75s) — one WAV,
+    # not three overlapping ones.
+    assert voice.end - voice.at == pytest.approx(8.75, abs=1e-2)
+
+    picture = [s for s in timeline.tracks.video if s.mute_source]
+    assert [p.clip for p in picture] == ["c001", "c002", "c003"]
+    assert not any(p.clip == "c004" for p in picture)
+    total = sum(p.duration for p in picture)
+    assert total == pytest.approx(voice.end - voice.at, abs=1e-2)
+
+
+# ----------------------------------------------------------------------
 # stage behaviour
 # ----------------------------------------------------------------------
 def test_plan_writes_all_artifacts(planned: Project) -> None:
@@ -328,6 +577,47 @@ def test_human_edited_timeline_is_never_overwritten(planned: Project) -> None:
     forced = plan(planned, force=True)
     assert Path(forced["timeline"]).name == "timeline.json"
     assert Timeline.load(planned.timeline_file).meta.edited_by_human is False
+
+
+def test_plan_from_response_rebuilds_without_calling_the_llm(
+    planned: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = plan(planned)
+    raw_path = planned.plan_dir / "planner_response.json"
+    assert raw_path.exists()
+    assert FakeOpenRouter.calls  # the first run really did call the LLM
+    costs_before = len(planned.load_state().get("costs", []))
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("--from-response must never construct the LLM client")
+
+    monkeypatch.setattr("ytedit.ai.plan.OpenRouter", boom)
+
+    result = plan(planned, from_response=True)
+    assert result["cost_usd"] == 0.0
+    assert result["segments"] == first["segments"]
+    timeline = Timeline.load(Path(result["timeline"]))
+    assert len(timeline.tracks.video) == len(Timeline.load(Path(first["timeline"])).tracks.video)
+    # No new charge was recorded against the project's cost ledger.
+    assert len(planned.load_state().get("costs", [])) == costs_before
+
+
+def test_plan_from_response_honours_the_human_edited_guard(planned: Project) -> None:
+    plan(planned)
+    timeline = Timeline.load(planned.timeline_file)
+    timeline.meta.edited_by_human = True
+    timeline.meta.notes = "hand-edited cut"
+    timeline.save(planned.timeline_file)
+
+    result = plan(planned, from_response=True)
+    assert result["draft"] is True
+    assert Path(result["timeline"]).name == "timeline.draft.json"
+    assert Timeline.load(planned.timeline_file).meta.notes == "hand-edited cut"
+
+
+def test_plan_from_response_without_a_prior_run_fails_clearly(planned: Project) -> None:
+    with pytest.raises(PlanError, match="planner_response.json"):
+        plan(planned, from_response=True)
 
 
 def test_plan_records_an_error_status(planned: Project, monkeypatch: pytest.MonkeyPatch) -> None:

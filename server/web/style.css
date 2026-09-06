@@ -355,6 +355,7 @@ table.data tr:hover td { background: var(--bg-1); }
 .lane-block.cap { background: #1e3348; color: #a8cdf0; border-color: #2d4a63; }
 .lane-block.mus { background: #3b2f12; color: #ffd79a; border-color: #5a4a20; }
 .lane-block.mut { background: #3a2020; color: #f0a8a8; border-color: #5a2e2e; }
+.lane-block.voi { background: #1e3a2c; color: #a8e0bd; border-color: #2d5a41; }
 .markers-lane { height: 20px; }
 .markers-lane .tick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--take); cursor: pointer; }
 .markers-lane .tick.chap { background: var(--ok); }

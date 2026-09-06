@@ -90,11 +90,44 @@ def test_segment_positions_are_cumulative() -> None:
 def test_xfade_overlaps_previous_segment() -> None:
     tl = _timeline(
         _segment("s001", "c001", 0.0, 4.0),
-        _segment("s002", "c002", 0.0, 4.0, transition_in={"type": "xfade", "duration": 0.75}),
+        _segment("s002", "c002", 0.0, 4.0, transition_in={"type": "xfade", "duration": 0.8}),
     )
     positions = tl.segment_positions()
-    assert positions[1].start == pytest.approx(3.25)
-    assert tl.duration() == pytest.approx(7.25)
+    assert positions[1].start == pytest.approx(3.2)
+    assert tl.duration() == pytest.approx(7.2)
+
+
+def test_segment_positions_snap_to_whole_frames() -> None:
+    """Fractional in/out points place the *next* segment on a frame boundary.
+
+    1.62 s is 48.6 frames at 30 fps and renders as 49; 1.64 s is 49.2 frames
+    and renders as 49 too. The raw sum (3.26 s) is not where the third segment
+    starts — frame 98 (3.266667 s) is, and the positions say so.
+    """
+    tl = _timeline(
+        _segment("s001", "c001", 0.51, 2.13),
+        _segment("s002", "c002", 1.07, 2.71),
+        _segment("s003", "c003", 0.33, 1.5),
+        _segment("s004", "c001", 0.0, 1.0, transition_in={"type": "xfade", "duration": 0.75}),
+    )
+    fps = tl.fps
+    assert [seg.frames(fps) for seg in tl.tracks.video] == [49, 49, 35, 30]
+    assert tl.tracks.video[3].transition_in.frames(fps) == 23      # 22.5 rounds up
+    positions = tl.segment_positions()
+    assert [p.start for p in positions] == [0.0, 1.633333, 3.266667, 3.666667]
+    assert positions[2].end == pytest.approx(133 / 30, abs=1e-6)
+    assert tl.frame_count() == 49 + 49 + 35 + 30 - 23
+    assert tl.duration() == pytest.approx(tl.frame_count() / fps, abs=1e-6)
+    # every position is a whole number of frames
+    for pos in positions:
+        assert abs(pos.start * fps - round(pos.start * fps)) < 1e-4
+        assert abs(pos.end * fps - round(pos.end * fps)) < 1e-4
+
+
+def test_a_sub_frame_segment_still_renders_one_frame() -> None:
+    tl = _timeline(_segment("s001", "c001", 0.0, 0.01))
+    assert tl.tracks.video[0].frames(tl.fps) == 1
+    assert tl.duration() == pytest.approx(1 / 30, abs=1e-6)
 
 
 def test_speed_shortens_a_segment() -> None:

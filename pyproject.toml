@@ -37,5 +37,7 @@ packages = ["ytedit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package from this checkout (a git worktree), not the editable install.
+pythonpath = ["."]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]

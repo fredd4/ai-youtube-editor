@@ -13,7 +13,7 @@ import pytest
 
 from ytedit.ai.tidy import TidyError, pad_segments_to_speech, tidy
 from ytedit.project import Project
-from ytedit.timeline import Timeline, VideoSegment, new_timeline
+from ytedit.timeline import Caption, Timeline, VideoSegment, VoiceItem, new_timeline
 
 
 # ----------------------------------------------------------------------
@@ -260,6 +260,54 @@ def test_a_muted_cutaway_is_not_merged_into_a_live_one(project: Project) -> None
         project,
     )
     assert len(tl.tracks.video) == 2
+
+
+# ----------------------------------------------------------------------
+# voice items (and other absolute-time tracks) shift with the padding
+# ----------------------------------------------------------------------
+def test_voice_items_shift_with_padding(project: Project) -> None:
+    add_clip(project, "c001", 60.0, SPACED)
+    # s001 pads from (3.1, 5.4) [dur 2.3] to (2.8, 5.85) [dur 3.05]: +0.75s.
+    # s002 is a muted VO picture cut that starts right after it and must not
+    # itself be padded, but its absolute position (and anything pinned to it)
+    # still needs to move by the growth s001 picked up.
+    tl = timeline_of(
+        seg("s001", "c001", 3.1, 5.4),
+        seg("s002", "c001", 10.0, 12.0, mute_source=True, role="b-roll",
+            notes="VO picture for c004"),
+    )
+    tl.tracks.voice = [
+        VoiceItem(id="v001", file="voice/vo_c004_000.00_002.00.wav", at=2.3, end=4.3)
+    ]
+    tl.tracks.captions = [Caption(id="t001", at=2.3, end=3.0, text="LIZBONA")]
+
+    tl2, changes = pad_segments_to_speech(tl, project)
+    assert changes  # s001 was in fact padded
+
+    # Positions are frame-exact: 3.05 s is 91.5 frames at 30 fps -> 92 frames.
+    frame = 1 / 30
+    expected_start = 92 * frame
+    seg2_start = next(p for p in tl2.segment_positions() if p.segment.id == "s002").start
+    assert seg2_start == pytest.approx(expected_start, abs=1e-3)
+
+    voice = tl2.tracks.voice[0]
+    assert voice.at == pytest.approx(expected_start, abs=1e-3)
+    assert voice.end == pytest.approx(expected_start + 2.0, abs=1e-3)  # duration preserved
+
+    caption = tl2.tracks.captions[0]
+    assert caption.at == pytest.approx(expected_start, abs=1e-3)
+    assert caption.end == pytest.approx(expected_start + 0.7, abs=1e-3)  # duration preserved
+
+
+def test_voice_items_are_untouched_when_nothing_moves(project: Project) -> None:
+    add_clip(project, "c002", 30.0)  # no transcript: padding never fires
+    tl = timeline_of(seg("s001", "c002", 1.0, 5.0))
+    tl.tracks.voice = [VoiceItem(id="v001", file="voice/vo_c004_000.00_002.00.wav", at=1.0, end=3.0)]
+
+    tl2, changes = pad_segments_to_speech(tl, project)
+    assert changes == []
+    assert tl2.tracks.voice[0].at == 1.0
+    assert tl2.tracks.voice[0].end == 3.0
 
 
 # ----------------------------------------------------------------------

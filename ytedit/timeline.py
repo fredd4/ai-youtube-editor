@@ -5,11 +5,18 @@ laid end to end (an ``xfade`` transition overlaps the previous segment by its
 duration); voice, music, captions, sfx, markers and chapters all use absolute
 timeline time. ``mute_ranges`` are in *clip* time and apply wherever that clip
 range is used.
+
+Segment geometry is computed in **whole frames** at the timeline ``fps``: a
+segment's ``in``/``out`` may be any float, but it renders as
+:meth:`VideoSegment.frames` frames and the next segment starts right after
+them. :meth:`Timeline.segment_positions` and :meth:`Timeline.duration` report
+those frame-snapped values, so absolute placements match the rendered file.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -39,6 +46,24 @@ class _Model(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
+def frames_for(seconds: float, fps: float) -> int:
+    """Round a duration to the nearest whole frame (never negative).
+
+    Half a frame rounds up, so the result is stable and matches the JavaScript
+    mirror in the web editor (``Math.floor(x + 0.5)``).
+    """
+    if fps <= 0:
+        return 0
+    return max(0, int(math.floor(float(seconds) * float(fps) + 0.5)))
+
+
+def frames_to_seconds(frames: int, fps: float) -> float:
+    """Convert a whole number of frames back to seconds (6 decimals)."""
+    if fps <= 0:
+        return 0.0
+    return round(int(frames) / float(fps), 6)
+
+
 class Transform(_Model):
     """How a source frame is fitted into the canvas."""
 
@@ -56,6 +81,12 @@ class Transition(_Model):
     duration: float = 0.0
     #: ffmpeg ``xfade`` transition name when ``type == "xfade"``.
     name: str = "fade"
+
+    def frames(self, fps: float) -> int:
+        """Overlap length in whole frames at ``fps`` (0 for a cut)."""
+        if self.type == "cut":
+            return 0
+        return frames_for(self.duration, fps)
 
 
 class Duck(_Model):
@@ -95,6 +126,19 @@ class VideoSegment(_Model):
         """Length of the cut on the timeline, after ``speed``."""
         speed = self.speed if self.speed > 0 else 1.0
         return self.source_duration / speed
+
+    def frames(self, fps: float) -> int:
+        """Whole frames the segment occupies when rendered at ``fps``.
+
+        The render cuts every segment on frame boundaries, so this — not the
+        fractional :attr:`duration` — determines where the next segment
+        starts. A segment always renders at least one frame.
+        """
+        return max(1, frames_for(self.duration, fps))
+
+    def rendered_duration(self, fps: float) -> float:
+        """Length of the cut once snapped to whole frames at ``fps``."""
+        return frames_to_seconds(self.frames(fps), fps)
 
 
 class VoiceItem(_Model):
@@ -250,24 +294,44 @@ class Timeline(_Model):
     # ------------------------------------------------------------------
     # geometry
     # ------------------------------------------------------------------
-    def segment_positions(self) -> list[SegmentPosition]:
+    def segment_positions(self, fade_overlaps: bool = False) -> list[SegmentPosition]:
         """Return every video segment with its absolute start/end.
 
+        Placement is computed in whole frames at :attr:`fps` — each segment
+        occupies :meth:`VideoSegment.frames` frames and an overlapping
+        transition removes :meth:`Transition.frames` — then converted back to
+        seconds. That is exactly how the render lays the programme out, so a
+        caption, voice pickup or music cue placed at ``positions[i].start``
+        lands on the first frame of segment ``i``.
+
         A segment whose ``transition_in`` is an ``xfade`` overlaps the previous
-        segment by the transition duration; ``cut`` and ``fade`` do not.
+        segment by the transition length; ``cut`` and ``fade`` do not, unless
+        ``fade_overlaps`` is set (the render treats ``fade`` as an ``xfade``
+        too — see :func:`ytedit.media.render.render_positions`).
         """
+        overlapping = ("fade", "xfade") if fade_overlaps else ("xfade",)
+        fps = self.fps
         out: list[SegmentPosition] = []
-        cursor = 0.0
+        cursor = 0
+        previous = 0
         for i, seg in enumerate(self.tracks.video):
-            overlap = 0.0
-            if i > 0 and seg.transition_in.type == "xfade":
-                overlap = max(0.0, float(seg.transition_in.duration))
-                overlap = min(overlap, out[-1].end - out[-1].start, seg.duration)
-            start = max(0.0, cursor - overlap)
-            end = start + seg.duration
-            out.append(SegmentPosition(seg, round(start, 6), round(end, 6)))
+            length = seg.frames(fps)
+            overlap = 0
+            if i > 0 and seg.transition_in.type in overlapping:
+                overlap = min(seg.transition_in.frames(fps), previous, length)
+            start = max(0, cursor - overlap)
+            end = start + length
+            out.append(
+                SegmentPosition(seg, frames_to_seconds(start, fps), frames_to_seconds(end, fps))
+            )
             cursor = end
+            previous = length
         return out
+
+    def frame_count(self, fade_overlaps: bool = False) -> int:
+        """Programme length in whole frames — the end of the video track."""
+        positions = self.segment_positions(fade_overlaps=fade_overlaps)
+        return frames_for(positions[-1].end, self.fps) if positions else 0
 
     def duration(self) -> float:
         """Programme length in seconds — the end of the video track.

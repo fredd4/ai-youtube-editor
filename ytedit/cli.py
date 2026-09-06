@@ -206,12 +206,18 @@ def plan(
     notes: str | None = typer.Option(
         None, "--notes", help="Editor notes appended to the planner prompt."
     ),
+    from_response: bool = typer.Option(
+        False,
+        "--from-response",
+        help="Skip the LLM call; rebuild from the last plan/planner_response.json "
+        "(no cost, e.g. after a post-processing fix).",
+    ),
 ) -> None:
     """Turn the footage log into an edit plan and a draft timeline."""
     fn = _lazy("ytedit.ai.plan", "plan")
     if fn is None:
         _not_implemented("plan", "ytedit.ai.plan")
-    fn(_load(slug), force=force, notes=notes)
+    fn(_load(slug), force=force, notes=notes, from_response=from_response)
 
 
 @app.command()

@@ -760,21 +760,29 @@ async function loadPositions() {
   }
 }
 
-/** Absolute start/end of every video segment (mirrors Timeline.segment_positions). */
+/** Absolute start/end of every video segment (mirrors Timeline.segment_positions).
+ *  Everything is counted in whole frames at the timeline fps — that is how the
+ *  render cuts, so a fractional in/out never drifts the segments after it. */
 function segmentPositions(tl) {
   const out = [];
+  const fps = +tl?.fps > 0 ? +tl.fps : 30;
+  const toFrames = (s) => Math.max(0, Math.floor(s * fps + 0.5));
+  const toSeconds = (f) => Math.round((f / fps) * 1e6) / 1e6;
   let cursor = 0;
+  let previous = 0;
   (tl?.tracks?.video || []).forEach((seg, i) => {
     const speed = +seg.speed > 0 ? +seg.speed : 1;
-    const dur = Math.max(0, (+seg.out || 0) - (+seg.in || 0)) / speed;
+    const frames = Math.max(1, toFrames(Math.max(0, (+seg.out || 0) - (+seg.in || 0)) / speed));
     let overlap = 0;
     if (i > 0 && seg.transition_in?.type === 'xfade') {
-      overlap = Math.max(0, +seg.transition_in.duration || 0);
-      overlap = Math.min(overlap, out[i - 1].end - out[i - 1].start, dur);
+      overlap = toFrames(Math.max(0, +seg.transition_in.duration || 0));
+      overlap = Math.min(overlap, previous, frames);
     }
     const start = Math.max(0, cursor - overlap);
-    out.push({ seg, start, end: start + dur, dur });
-    cursor = start + dur;
+    const end = start + frames;
+    out.push({ seg, start: toSeconds(start), end: toSeconds(end), dur: toSeconds(frames) });
+    cursor = end;
+    previous = frames;
   });
   return out;
 }
@@ -1388,6 +1396,14 @@ function renderProgStrip() {
       label: `♪ ${m.id} ${m.gain_db ?? -18} dB`, cls: 'mus',
       title: `${m.file || ''}\n${tc(m.at)}–${tc(m.end)} · ${m.gain_db} dB · duck ${m.duck?.amount_db ?? -12} dB`,
     })), pps),
+    lane('voice', width, (S.timeline.tracks?.voice || []).map((v) => {
+      const end = v.end != null ? +v.end : +v.at || 0;
+      const name = (v.file || '').split('/').pop() || v.id;
+      return {
+        start: +v.at || 0, end, label: `🎙 ${name}`, cls: 'voi',
+        title: `${v.file || ''}\n${tc(v.at)}–${tc(end)} · ${v.gain_db ?? 0} dB`,
+      };
+    }), pps),
     lane('muted src', width, progMutes(positions).map((m) => ({
       start: m.start, end: m.end,
       label: m.gain_db <= -40 ? 'mute' : `${m.gain_db} dB`, cls: 'mut',

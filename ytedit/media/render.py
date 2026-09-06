@@ -34,6 +34,17 @@ the placement with *both* transition types overlapping, and
 caption, music cue, voice pickup and speech range is passed through that map
 before it reaches ffmpeg. On a timeline whose only transitions are cuts and
 ``xfade``s the map is the identity.
+
+Frame-exact segments
+--------------------
+A segment's ``in``/``out`` are arbitrary floats but video only exists in whole
+frames, so every segment is rendered to exactly
+:meth:`~ytedit.timeline.VideoSegment.frames` frames (``-frames:v`` on a
+``setpts=PTS-STARTPTS`` video graph, ``atrim``/``apad`` to the same number of
+samples) and the concat list pins each file's ``duration`` to that length.
+:meth:`Timeline.segment_positions` does the same arithmetic in frames, so
+:func:`render_duration` equals the joined programme to the frame and an item
+placed at a segment's start lands on its first frame, however long the cut.
 """
 
 from __future__ import annotations
@@ -53,7 +64,13 @@ from typing import Any, Callable, Sequence
 from ..config import Settings
 from ..log import console, get_logger
 from ..project import Project
-from ..timeline import Caption, Timeline, VideoSegment, speech_ranges_from_transcripts
+from ..timeline import (
+    Caption,
+    Timeline,
+    VideoSegment,
+    frames_to_seconds,
+    speech_ranges_from_transcripts,
+)
 from . import audio as audio_mod
 from . import captions as captions_mod
 from .color import even, source_chain
@@ -158,20 +175,13 @@ def render_positions(timeline: Timeline) -> list[SegmentPlacement]:
     """Compute segment placement as ffmpeg will actually lay it out.
 
     Unlike :meth:`Timeline.segment_positions`, a ``fade`` transition overlaps
-    the previous segment too — that is what ``xfade`` does.
+    the previous segment too — that is what ``xfade`` does. Everything is in
+    whole frames at the timeline fps, exactly like the segment pass.
     """
-    out: list[SegmentPlacement] = []
-    cursor = 0.0
-    for i, seg in enumerate(timeline.tracks.video):
-        overlap = 0.0
-        if i > 0 and seg.transition_in.type in ("fade", "xfade"):
-            overlap = max(0.0, float(seg.transition_in.duration))
-            overlap = min(overlap, out[-1].end - out[-1].start, seg.duration)
-        start = max(0.0, cursor - overlap)
-        end = start + seg.duration
-        out.append(SegmentPlacement(seg, round(start, 6), round(end, 6)))
-        cursor = end
-    return out
+    return [
+        SegmentPlacement(pos.segment, pos.start, pos.end)
+        for pos in timeline.segment_positions(fade_overlaps=True)
+    ]
 
 
 def render_duration(timeline: Timeline) -> float:
@@ -432,18 +442,20 @@ def segment_key(
         "source": [source.name, mtime, size],
         "denoised": denoise_stamp,
         "grade": project.settings.get(f"grade.presets.{seg.grade}", []),
-        "version": 2,
+        "frames": seg.frames(canvas.fps),
+        "version": 3,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
 
-def _segment_is_valid(path: Path, expected: float, tolerance: float = 0.25) -> bool:
+def _segment_is_valid(path: Path, expected: float, tolerance: float = 0.034) -> bool:
     """True when ``path`` probes cleanly and is within ``tolerance`` s of ``expected``.
 
     A crashed or interrupted ffmpeg leaves a headerless ``.mp4`` behind; the
     concat demuxer then skips it *silently* (exit code 0) and the programme
     comes out short. Never trust a cached segment without this check.
+    Segments are cut to whole frames, so the default tolerance is one frame.
     """
     try:
         if path.stat().st_size == 0:
@@ -501,8 +513,11 @@ def render_segment(
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{segment_key(project, timeline, seg, canvas, mode)}.mp4"
     tmp = out.with_name(out.stem + ".partial.mp4")
+    frames = seg.frames(canvas.fps)
+    length = frames_to_seconds(frames, canvas.fps)
+    frame_tolerance = 1.0 / canvas.fps
     if out.exists() and not force:
-        if _segment_is_valid(out, seg.duration):
+        if _segment_is_valid(out, length, tolerance=frame_tolerance):
             log.debug("segment %s cached at %s", seg.id, out.name)
             return out
         log.warning("segment %s: cached file %s is corrupt/short, re-rendering", seg.id, out.name)
@@ -521,7 +536,10 @@ def render_segment(
     speed = seg.speed if seg.speed > 0 else 1.0
 
     # --- video -------------------------------------------------------
-    in_label = "spd" if abs(speed - 1.0) > 1e-6 else "0:v"
+    # Input seeking leaves the first decoded frame up to one frame *after*
+    # ``in``; rebasing its pts to 0 keeps the CFR grid aligned so the segment is
+    # exactly ``frames`` frames long (see ``-frames:v`` below).
+    in_label = "src"
     chain, needs_split = source_chain(
         hdr=None,  # ingest already tonemapped the mezzanine to bt709 SDR
         grade=seg.grade,
@@ -538,8 +556,10 @@ def render_segment(
         out_label="v",
     )
     graph: list[str] = []
-    if in_label != "0:v":
-        graph.append(f"[0:v]setpts={1.0 / speed:.6f}*PTS[{in_label}]")
+    if abs(speed - 1.0) > 1e-6:
+        graph.append(f"[0:v]setpts=(PTS-STARTPTS)*{1.0 / speed:.6f}[{in_label}]")
+    else:
+        graph.append(f"[0:v]setpts=PTS-STARTPTS[{in_label}]")
     graph.append(chain if needs_split else f"[{in_label}]{chain}[v]")
 
     # --- audio -------------------------------------------------------
@@ -579,6 +599,11 @@ def render_segment(
         if mutes:
             achain.append(audio_mod.mute_ranges_expr(mutes))
     achain.append("asetpts=N/SR/TB")
+    # Exactly as many samples as the video has frames: trim a long take, pad a
+    # short one (a source that ends early, or the infinite anullsrc).
+    samples = int(round(frames * sample_rate / canvas.fps))
+    achain.append(f"atrim=end_sample={samples}")
+    achain.append(f"apad=whole_len={samples}")
     graph.append(f"[{audio_index}:a]{_join(achain)}[a]")
 
     args: list[Any] = [
@@ -586,7 +611,7 @@ def render_segment(
         "-filter_complex", ";".join(graph),
         "-map", "[v]",
         "-map", "[a]",
-        "-t", f"{seg.duration:.6f}",
+        "-frames:v", str(frames),
         "-r", str(canvas.fps),
         "-fps_mode", "cfr",
         *segment_encoder_args(settings, mode),
@@ -604,10 +629,11 @@ def render_segment(
     except FFmpegError:
         tmp.unlink(missing_ok=True)
         raise
-    if not _segment_is_valid(tmp, seg.duration):
+    if not _segment_is_valid(tmp, length, tolerance=frame_tolerance):
         tmp.unlink(missing_ok=True)
         raise RenderError(
-            f"segment {seg.id}: ffmpeg produced an unreadable or short file for {seg.clip}"
+            f"segment {seg.id}: ffmpeg produced an unreadable or short file for {seg.clip} "
+            f"(expected {frames} frames = {length:.6f}s)"
         )
     tmp.replace(out)
     return out
@@ -616,9 +642,22 @@ def render_segment(
 # ----------------------------------------------------------------------
 # pass 2: join
 # ----------------------------------------------------------------------
-def _concat_list(paths: Sequence[Path], destination: Path) -> Path:
-    """Write a concat-demuxer list file and return it."""
-    lines = [f"file {shlex.quote(str(p.resolve()))}" for p in paths]
+def _concat_list(
+    paths: Sequence[Path],
+    destination: Path,
+    durations: Sequence[float] | None = None,
+) -> Path:
+    """Write a concat-demuxer list file and return it.
+
+    With ``durations`` every entry gets a ``duration`` directive, so the next
+    file starts exactly there instead of wherever the container's
+    millisecond-precision header says the previous one ended.
+    """
+    lines: list[str] = []
+    for i, p in enumerate(paths):
+        lines.append(f"file {shlex.quote(str(p.resolve()))}")
+        if durations is not None:
+            lines.append(f"duration {durations[i]:.6f}")
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return destination
 
@@ -667,8 +706,12 @@ def join_segments(
         and seg.transition_in.duration > 0
     ]
 
+    fps = canvas.fps
     if not transitions:
-        listing = _concat_list(segments, renders / "concat.txt")
+        listing = _concat_list(
+            segments, renders / "concat.txt",
+            durations=[seg.rendered_duration(fps) for seg in tracks],
+        )
         ff(
             "-f", "concat", "-safe", "0", "-i", str(listing),
             "-map", "0:v", "-c:v", "copy", "-movflags", "+faststart", str(video_out),
@@ -679,7 +722,9 @@ def join_segments(
             "-map", "0:a", "-c:a", "pcm_s24le",
             "-ar", str(sample_rate), "-ac", str(channels), str(audio_out),
         )
-        _check_joined_duration(video_out, render_duration(timeline))
+        _check_joined_duration(
+            video_out, render_duration(timeline), tolerance=_frame_drift_tolerance(timeline)
+        )
         return video_out, audio_out
 
     inputs: list[Any] = []
@@ -689,27 +734,33 @@ def join_segments(
     vgraph: list[str] = []
     agraph: list[str] = []
     vlabel, alabel = "0:v", "0:a"
-    total = tracks[0].duration if tracks else 0.0
+    # Offsets and overlaps in whole frames, mirroring Timeline.segment_positions.
+    total = tracks[0].frames(fps) if tracks else 0
+    previous = total
 
     for i, seg in enumerate(tracks[1:], start=1):
         trans = seg.transition_in
         nv, na = f"vx{i}", f"ax{i}"
-        if trans.type in ("fade", "xfade") and trans.duration > 0:
-            overlap = min(float(trans.duration), total, seg.duration)
-            name = trans.name or DEFAULT_XFADE if trans.type == "xfade" else (
-                trans.name or DEFAULT_XFADE
-            )
-            offset = max(0.0, total - overlap)
+        length = seg.frames(fps)
+        if trans.type in ("fade", "xfade") and trans.frames(fps) > 0:
+            overlap = min(trans.frames(fps), previous, length)
+            name = trans.name or DEFAULT_XFADE
+            offset = max(0, total - overlap)
             vgraph.append(
                 f"[{vlabel}][{i}:v]xfade=transition={name}"
-                f":duration={overlap:.6f}:offset={offset:.6f}[{nv}]"
+                f":duration={frames_to_seconds(overlap, fps):.6f}"
+                f":offset={frames_to_seconds(offset, fps):.6f}[{nv}]"
             )
-            agraph.append(f"[{alabel}][{i}:a]acrossfade=d={overlap:.6f}:c1=tri:c2=tri[{na}]")
-            total += seg.duration - overlap
+            agraph.append(
+                f"[{alabel}][{i}:a]acrossfade=d={frames_to_seconds(overlap, fps):.6f}"
+                f":c1=tri:c2=tri[{na}]"
+            )
+            total += length - overlap
         else:
             vgraph.append(f"[{vlabel}][{i}:v]concat=n=2:v=1:a=0[{nv}]")
             agraph.append(f"[{alabel}][{i}:a]concat=n=2:v=0:a=1[{na}]")
-            total += seg.duration
+            total += length
+        previous = length
         vlabel, alabel = nv, na
 
     ff(
@@ -732,8 +783,27 @@ def join_segments(
         "-ar", str(sample_rate), "-ac", str(channels),
         str(audio_out),
     )
-    _check_joined_duration(video_out, render_duration(timeline))
+    _check_joined_duration(
+        video_out, render_duration(timeline), tolerance=_frame_drift_tolerance(timeline)
+    )
     return video_out, audio_out
+
+
+def _frame_drift_tolerance(timeline: Timeline) -> float:
+    """Tolerance for the joined-duration check.
+
+    Segments are cut to whole frames and the concat list pins every offset, so
+    a hard-cut programme joins to the frame. The ``xfade``/``acrossfade`` chain
+    is allowed one frame per overlapping transition on top of a two-frame
+    floor (never under 100 ms); anything beyond that is a missing or corrupt
+    segment, not rounding.
+    """
+    fps = float(timeline.fps or 30)
+    overlapping = sum(
+        1 for i, seg in enumerate(timeline.tracks.video)
+        if i > 0 and seg.transition_in.type in ("fade", "xfade")
+    )
+    return max(0.1, (2 + overlapping) / fps)
 
 
 def _check_joined_duration(path: Path, expected: float, tolerance: float = 0.5) -> None:
@@ -1106,7 +1176,7 @@ def render(
             *video_encoder_args(project.settings, mode, canvas.fps),
             *audio_encoder_args(project.settings),
             "-movflags", "+faststart",
-            "-t", f"{duration:.3f}",
+            "-t", f"{duration:.6f}",
             str(target),
         ]
 

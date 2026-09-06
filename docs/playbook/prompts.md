@@ -130,6 +130,13 @@ FOOTAGE RULES
 - Vertical clips (height > width) get transform.fit "blur-fill", never "cover".
 - Never invent footage. A beat with no supporting clip goes in risks[], not into a
   fabricated segment.
+- Clips whose source_file contains "post recording" (or that the editor notes name
+  as post-trip / studio narration) are recorded at home after the trip: prefer their
+  audio as voice_over over trip B-roll picture rather than showing them on screen.
+  Show the narrator on camera only where it earns it — typically a first on-camera
+  appearance early on and the ending. Their opening sentence usually describes the
+  clip to the editor, not the audience — that is an instruction (instructions[]
+  already excises it), never voice_over.script or on-screen content.
 
 SEGMENTS
 - Prefer FEW, LONG segments: one per continuous usable stretch of a clip, not one
@@ -198,6 +205,10 @@ do not echo them. Include every top-level key, using [] or "" when you have noth
     "transform": {"fit": "cover|contain|blur-fill|crop-pan"},   // vertical => blur-fill
     "transition_in": {"type": "cut|fade|xfade", "duration": 0.0},  // cut unless meant
     "mute_source": false,                               // true = deliberate silent B-roll
+    "voice_over": {"picture": [{"clip": "", "in": 0.0, "out": 0.0}]},  // optional: use this
+                     // segment's audio as narration; show these cuts instead of the talking
+                     // head. Picture cuts sum to roughly the segment's duration, each cut
+                     // 2-6 s, from other clips (b-roll / silent-broll first).
     "notes": ""                                         // <= 20 words, English
   }],
   "captions": [{"at": 0.0, "end": 0.0, "text": "", "style": "location|hook"}],  // timeline time

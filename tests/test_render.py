@@ -65,12 +65,15 @@ def timeline_document() -> dict:
     }
 
 
-def build_render_project(root: Path, slug: str = "render-test") -> Project:
-    """Ingest three fixtures and write :func:`timeline_document` into a project.
+def build_render_project(
+    root: Path, slug: str = "render-test", document: dict | None = None
+) -> Project:
+    """Ingest three fixtures and write a timeline into a project.
 
     Args:
         root: Parent directory for the project (a pytest ``tmp_path``).
         slug: Project slug.
+        document: Timeline JSON to write (default :func:`timeline_document`).
 
     Returns:
         A project ready for :func:`ytedit.media.render.render`.
@@ -106,9 +109,74 @@ def build_render_project(root: Path, slug: str = "render-test") -> Project:
         encoding="utf-8",
     )
     project.timeline_file.write_text(
-        json.dumps(timeline_document(), indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(document or timeline_document(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
     return project
+
+
+# ----------------------------------------------------------------------
+# the frame-exactness project
+# ----------------------------------------------------------------------
+#: Whole frames each :func:`fractional_document` segment renders to at 30 fps:
+#: 1.62 s -> 48.6 -> 49, 1.64 s -> 49.2 -> 49, 1.17 s -> 35.1 -> 35, 0.995 s -> 29.85 -> 30.
+FRACTIONAL_FRAMES: list[int] = [49, 49, 35, 30]
+
+#: Timeline time of the third segment's first frame: (49 + 49) / 30. The raw
+#: in/out arithmetic says 3.26 s, which is *not* a frame boundary.
+THIRD_SEGMENT_AT: float = 98 / 30
+
+
+def fractional_document() -> dict:
+    """Four hard-cut segments with in/out points that are not on frame boundaries.
+
+    Every source is muted so the only audio in the programme is the voice pickup
+    placed at the third segment's first frame; a location card starts on the
+    same frame.
+    """
+    at = round(THIRD_SEGMENT_AT, 6)
+    return {
+        "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
+        "tracks": {
+            "video": [
+                {"id": "s001", "clip": "c001", "in": 0.51, "out": 2.13, "role": "cold-open",
+                 "mute_source": True, "transition_in": {"type": "cut", "duration": 0.0}},
+                {"id": "s002", "clip": "c002", "in": 1.07, "out": 2.71, "role": "b-roll",
+                 "mute_source": True, "transform": {"fit": "blur-fill", "zoom": 1.0},
+                 "transition_in": {"type": "cut", "duration": 0.0}},
+                {"id": "s003", "clip": "c003", "in": 0.33, "out": 1.5, "role": "b-roll",
+                 "mute_source": True, "transition_in": {"type": "cut", "duration": 0.0}},
+                {"id": "s004", "clip": "c001", "in": 2.005, "out": 3.0, "role": "outro",
+                 "mute_source": True, "transition_in": {"type": "cut", "duration": 0.0}},
+            ],
+            "voice": [{"id": "v001", "file": "voice/v001.wav", "at": at, "gain_db": 0.0}],
+            "music": [],
+            "captions": [{"id": "t001", "at": at, "end": round(at + 0.5, 6),
+                          "text": "KLATKA 98", "style": "location",
+                          "position": "lower-left"}],
+            "sfx": [],
+        },
+        "mute_ranges": [],
+        "markers": [{"at": 0.0, "label": "hook"}],
+        "chapters": [],
+        "meta": {"generated_by": "test", "edited_by_human": False},
+    }
+
+
+@pytest.fixture(scope="module")
+def fractional(tmp_path_factory) -> tuple[Project, Path]:
+    """A project built from :func:`fractional_document`, preview rendered once."""
+    project = build_render_project(
+        tmp_path_factory.mktemp("frames"), slug="frame-test", document=fractional_document()
+    )
+    project.voice_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=0.6",
+         "-c:a", "pcm_s16le", "-ac", "2", str(project.voice_dir / "v001.wav")],
+        check=True,
+    )
+    return project, R.render(project, preview=True)
 
 
 @pytest.fixture(scope="module")
@@ -128,6 +196,26 @@ def measure_volume(path: Path, start: float, length: float) -> float:
     match = re.search(r"mean_volume:\s*(-?[\d.]+) dB", proc.stderr)
     assert match, proc.stderr[-1500:]
     return float(match.group(1))
+
+
+def video_stream(path: Path) -> dict:
+    """ffprobe the first video stream of a file."""
+    return next(s for s in probe(path)["streams"] if s["codec_type"] == "video")
+
+
+def keyframe_times(path: Path) -> list[float]:
+    """Presentation times of every keyframe packet in a video file."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
+         "packet=pts_time,flags", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    times: list[float] = []
+    for line in proc.stdout.splitlines():
+        pts, _, flags = line.partition(",")
+        if "K" in flags:
+            times.append(float(pts))
+    return times
 
 
 def probe(path: Path) -> dict:
@@ -459,3 +547,102 @@ def test_re_denoising_a_clip_invalidates_the_segment_cache(project: Project) -> 
 
     project.set_clip_stage("c001", "denoise", "done", use_denoised=False)
     assert R.segment_key(project, timeline, seg, canvas, "preview") != first
+
+
+
+# ----------------------------------------------------------------------
+# frame-exact cutting and joining
+# ----------------------------------------------------------------------
+def test_fractional_segments_are_snapped_to_whole_frames() -> None:
+    timeline = Timeline.model_validate(fractional_document())
+    assert [seg.frames(30) for seg in timeline.tracks.video] == FRACTIONAL_FRAMES
+    assert timeline.duration() == pytest.approx(sum(FRACTIONAL_FRAMES) / 30, abs=1e-6)
+    assert R.render_duration(timeline) == timeline.duration()
+    # the raw arithmetic (5.425 s) is not what gets rendered
+    assert sum(seg.duration for seg in timeline.tracks.video) == pytest.approx(5.425)
+
+
+def test_joined_programme_is_the_sum_of_frame_rounded_segments(
+    fractional: tuple[Project, Path],
+) -> None:
+    """Four fractional cuts join to exactly 49 + 49 + 35 + 30 frames."""
+    project, _out = fractional
+    expected = sum(FRACTIONAL_FRAMES) / 30
+    joined = project.renders_dir / "program_video.mp4"
+    video = video_stream(joined)
+    assert int(video["nb_frames"]) == sum(FRACTIONAL_FRAMES)
+    assert float(video["duration"]) == pytest.approx(expected, abs=0.001)
+    assert float(probe(joined)["format"]["duration"]) == pytest.approx(expected, abs=0.001)
+    # every cached segment is exactly as long as the timeline says
+    for seg, frames in zip(Timeline.load(project.timeline_file).tracks.video, FRACTIONAL_FRAMES):
+        assert seg.rendered_duration(30) == pytest.approx(frames / 30, abs=1e-6)
+    # ... and each one starts on the frame the positions predict (a hard-cut
+    # concat keeps every segment's first frame as a keyframe)
+    starts = [round(p.start, 6) for p in Timeline.load(project.timeline_file).segment_positions()]
+    keyframes = keyframe_times(joined)
+    for start in starts:
+        assert any(abs(k - start) < 0.5 / 30 for k in keyframes), (start, keyframes)
+
+
+def test_caption_and_voice_land_on_the_expected_frame(
+    fractional: tuple[Project, Path],
+) -> None:
+    """Items placed at the third segment's start hit frame 98, not the raw 3.26 s."""
+    from ytedit.media.captions import ass_time
+
+    project, out = fractional
+    frame_time = THIRD_SEGMENT_AT
+    frame = 1 / 30
+
+    # the location card is written at the frame time (centisecond ASS clock)
+    ass = (project.renders_dir / "captions.ass").read_text(encoding="utf-8")
+    dialogue = next(line for line in ass.splitlines() if line.startswith("Dialogue:"))
+    assert ass_time(frame_time) == "0:00:03.27"
+    assert dialogue.split(",")[1] == ass_time(frame_time)
+    assert dialogue.split(",")[1] != ass_time(3.26)
+
+    # the joined video really does switch to the third segment on that frame
+    assert any(abs(k - frame_time) < 0.5 * frame for k in keyframe_times(
+        project.renders_dir / "program_video.mp4"
+    ))
+
+    # every source is muted, so the voice pickup is the only sound: the frame
+    # before its position is digital silence, the frame at its position is not
+    final_audio = project.renders_dir / "final_audio.wav"
+    assert measure_volume(final_audio, frame_time - frame, frame) < -80
+    assert measure_volume(final_audio, frame_time, frame) > -40
+
+    # and the finished preview carries exactly the timeline's frames
+    assert int(video_stream(out)["nb_frames"]) == sum(FRACTIONAL_FRAMES)
+
+
+def test_xfade_join_is_frame_exact(
+    fractional: tuple[Project, Path], tmp_path: Path, monkeypatch
+) -> None:
+    """The filter-graph join (xfade + concat) also lands on the frame count."""
+    project, _out = fractional
+    doc = fractional_document()
+    doc["tracks"]["video"] = doc["tracks"]["video"][:3]
+    # 0.37 s is 11.1 frames -> an 11-frame overlap
+    doc["tracks"]["video"][1]["transition_in"] = {"type": "xfade", "duration": 0.37, "name": "fade"}
+    doc["tracks"]["voice"] = []
+    doc["tracks"]["captions"] = []
+    timeline = Timeline.model_validate(doc)
+    expected_frames = 49 + 49 - 11 + 35
+    assert timeline.frame_count() == expected_frames
+    assert R.render_duration(timeline) == pytest.approx(expected_frames / 30, abs=1e-6)
+
+    # keep the module fixture's renders untouched
+    monkeypatch.setattr(Project, "renders_dir", property(lambda self: tmp_path / "renders"))
+    canvas = R.canvas_for(timeline, preview=True)
+    segments = [
+        R.render_segment(project, timeline, seg, canvas, "preview")
+        for seg in timeline.tracks.video
+    ]
+    video_out, audio_out = R.join_segments(project, timeline, segments, canvas, "preview")
+    video = video_stream(video_out)
+    assert int(video["nb_frames"]) == expected_frames
+    assert float(video["duration"]) == pytest.approx(expected_frames / 30, abs=0.001)
+    assert float(probe(audio_out)["format"]["duration"]) == pytest.approx(
+        expected_frames / 30, abs=0.001
+    )
