@@ -125,7 +125,11 @@ def parse_loudnorm(stderr: str) -> dict[str, float]:
 
 
 def measure_loudness(
-    path: Path | str, I: float = -14.0, TP: float = -1.0, LRA: float = 11.0
+    path: Path | str,
+    I: float = -14.0,
+    TP: float = -1.0,
+    LRA: float = 11.0,
+    pre_chain: str = "",
 ) -> dict[str, float]:
     """Run the loudnorm analysis pass over a file.
 
@@ -134,14 +138,19 @@ def measure_loudness(
         I: Target integrated loudness in LUFS.
         TP: Target true peak in dBTP.
         LRA: Target loudness range in LU.
+        pre_chain: Optional filters applied before the measurement (the same
+            chain :func:`normalize` will apply before ``loudnorm``).
 
     Returns:
         The parsed pass-1 report (see :func:`parse_loudnorm`).
     """
+    chain = f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json"
+    if pre_chain:
+        chain = f"{pre_chain},{chain}"
     stderr = ff(
         "-i", str(path),
         "-map", "0:a:0",
-        "-af", f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json",
+        "-af", chain,
         "-f", "null", "-",
     )
     return parse_loudnorm(stderr)
@@ -184,6 +193,16 @@ def loudnorm_filter(
     )
 
 
+def peak_limiter_filter(TP: float = -1.0, headroom_db: float = 0.5) -> str:
+    """``alimiter`` string that keeps sample peaks ``headroom_db`` under ``TP``.
+
+    ``level=false`` so the limiter only catches peaks and never re-normalizes
+    the programme; loudnorm right after it sets the actual level.
+    """
+    limit = 10 ** ((float(TP) - headroom_db) / 20.0)
+    return f"alimiter=limit={limit:.4f}:attack=5:release=50:level=false"
+
+
 def normalize(
     path: Path | str,
     out: Path | str,
@@ -213,8 +232,12 @@ def normalize(
     """
     target = Path(out)
     target.parent.mkdir(parents=True, exist_ok=True)
-    measured = measure_loudness(path, I=I, TP=TP, LRA=LRA) if two_pass else None
-    chain = loudnorm_filter(measured, I=I, TP=TP, LRA=LRA)
+    # A true-peak limiter ahead of loudnorm: without it a mix whose peaks sit
+    # near the TP ceiling cannot be raised to the integrated target at all, and
+    # a two-pass master lands a whole LU quiet (YouTube never boosts it back).
+    pre = peak_limiter_filter(TP)
+    measured = measure_loudness(path, I=I, TP=TP, LRA=LRA, pre_chain=pre) if two_pass else None
+    chain = f"{pre},{loudnorm_filter(measured, I=I, TP=TP, LRA=LRA)}"
     codec = "pcm_s24le" if target.suffix.lower() == ".wav" else "aac"
     ff(
         "-i", str(path),
