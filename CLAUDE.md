@@ -23,7 +23,8 @@ ytedit new <slug> --language pl        # scaffold a project
 ytedit ingest <slug>                   # normalize, proxies, audio, peaks, thumbs
 ytedit transcribe <slug>               # ElevenLabs Scribe v2 -> transcripts/
 ytedit analyze <slug>                  # transcript+frames -> analysis/ + footage_log.json
-ytedit plan <slug>                     # footage_log -> plan/edit_plan.json + timeline draft
+ytedit sentences <slug>                # transcripts+analysis -> analysis/sentences.json (numbered sentence catalogue; auto-runs at the start of plan)
+ytedit plan <slug>                     # footage_log (script-first: sentence ids, not seconds) -> plan/edit_plan.json + timeline draft
 ytedit plan <slug> --from-response     # rebuild the timeline from the last plan/planner_response.json, no LLM call, no cost
 ytedit tidy <slug> [--dry-run]         # pad cuts ~0.3 s before / 0.45 s after speech, merge tiny gaps (auto in plan; use after manual edits)
 ytedit denoise <slug> --clip c004 [--engine elevenlabs|local] [--preview] [--off]  # voice isolation for windy clips ($0.12/min ElevenLabs, local free); render uses it automatically
@@ -37,7 +38,7 @@ ytedit run <slug> [--until music]      # ingest -> transcribe -> analyze -> plan
 ytedit serve                           # web editor at http://localhost:8765
 
 make serve                             # same as `ytedit serve`
-make new NAME=<slug>                   # every stage also has a make target: make ingest|transcribe|analyze|plan|music|preview|master|qc|publish|run NAME=<slug>
+make new NAME=<slug>                   # every stage also has a make target: make ingest|transcribe|analyze|sentences|plan|music|preview|master|qc|publish|run NAME=<slug>
 make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 ```
 

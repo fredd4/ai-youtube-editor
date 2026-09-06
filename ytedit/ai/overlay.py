@@ -95,11 +95,20 @@ def overlay_cutaways(
     clips = project.load_state().get("clips", {})
     words_cache: dict[str, list[Word]] = {}
     changes: list[str] = []
-    rewrites = 0
+    patterns = 0
+    mutations = 0
 
     video: Sequence[VideoSegment] = timeline.tracks.video
     before_positions = timeline.segment_positions()
     dropped: set[int] = set()
+
+    # Per-clip "audio consumed up to" cursor, carried across the whole pass —
+    # not just within one A → cutaways → A2 pattern. A clip can reappear later
+    # in the timeline outside any cutaway run (a stray a-roll piece the
+    # planner or a human edit left behind); without this, that reappearance
+    # would be treated as a fresh take even though a chain resolved earlier in
+    # this same call already committed its audio range.
+    consumed: dict[str, float] = {}
 
     i = 0
     while i < len(video) - 1:
@@ -107,6 +116,28 @@ def overlay_cutaways(
         if a.mute_source or not _has_speech(project, a, words_cache):
             i += 1
             continue
+
+        # --- catch a stray reappearance before treating A as a fresh take --
+        cursor_for_a = consumed.get(a.clip, 0.0)
+        if a.audio_from is None and a.in_ < cursor_for_a - _EPS:
+            new_a_in = min(cursor_for_a, a.out)
+            speed_a = a.speed if a.speed > 0 else 1.0
+            if (a.out - new_a_in) / speed_a < min_shot - _EPS:
+                changes.append(
+                    f"{a.id} dropped: {a.clip} {_fmt(a.in_)}-{_fmt(a.out)} is entirely "
+                    f"covered by narration an earlier cutaway run already carried "
+                    f"(up to {_fmt(cursor_for_a)}s)"
+                )
+                dropped.add(id(a))
+                mutations += 1
+                i += 1
+                continue
+            changes.append(
+                f"{a.id} in {_fmt(a.in_)}→{_fmt(new_a_in)} (an earlier cutaway run "
+                f"already carried {a.clip} audio up to {_fmt(cursor_for_a)}s)"
+            )
+            a.in_ = round(new_a_in, 3)
+            mutations += 1
 
         # --- the run of cutaways immediately after A ----------------------
         j = i + 1
@@ -144,7 +175,9 @@ def overlay_cutaways(
             continue
 
         # --- rewrite --------------------------------------------------------
-        cursor = a.out
+        # Never start the narration handoff behind what an earlier, unrelated
+        # pattern already committed for this clip.
+        cursor = max(a.out, consumed.get(a.clip, 0.0))
         for cutaway in run:
             end = round(cursor + cutaway.duration, 3)
             cutaway.audio_from = AudioFrom(clip=a.clip, **{"in": round(cursor, 3)}, out=end)
@@ -155,25 +188,44 @@ def overlay_cutaways(
             )
             cursor = end
 
-        new_in = round(a.out + covered, 3)
+        new_in = round(cursor, 3)
         speed = a2.speed if a2.speed > 0 else 1.0
         if (a2.out - new_in) / speed < min_shot - _EPS:
             # What is left of the continuation is a sub-second flash; show the
-            # last cutaway for that bit longer instead and drop it.
+            # last cutaway for that bit longer instead and drop it. The
+            # narration ends exactly where the planner ended it (A2.out) —
+            # extending the picture further than that would manufacture
+            # audio nobody wrote.
             last = run[-1]
+            audio_available = max(0.0, a2.out - last.audio_from.in_)
             wanted = last.duration + a2.duration
             clip_duration = float((clips.get(last.clip) or {}).get("duration") or 0.0)
             last_speed = last.speed if last.speed > 0 else 1.0
             new_out = last.in_ + wanted * last_speed
+            new_out = min(new_out, last.in_ + audio_available * last_speed)
             if clip_duration > 0:
                 new_out = min(new_out, clip_duration)
+            # Never shrink the picture the earlier cutaways in this run already
+            # got: a run whose cumulative coverage already overshot A2.out (a
+            # pre-existing inconsistency — usually a hand edit desyncing an
+            # already-overlaid chain) leaves nothing to extend into, but that
+            # is a reason to leave ``last`` exactly as it is, not to shorten it.
+            new_out = max(new_out, last.out)
             changes.append(
                 f"{last.id} out {_fmt(last.out)}→{_fmt(new_out)} and {a2.id} dropped "
                 f"({_fmt((a2.out - new_in) / speed)}s left of it is under the "
                 f"{min_shot:.2f}s minimum shot)"
             )
             last.out = round(new_out, 3)
-            last.audio_from.out = round(last.audio_from.in_ + last.duration, 3)
+            capped_audio_out = min(last.audio_from.in_ + last.duration, a2.out)
+            if capped_audio_out > last.audio_from.in_ + _EPS:
+                last.audio_from.out = round(capped_audio_out, 3)
+            # else: capping to A2.out would make the range invalid — the run's
+            # earlier cutaways already used more of the clip than the
+            # planner's sentence end allows. Leave ``audio_from.out`` at what
+            # the main loop above computed; ``ytedit.ai.ledger`` catches and
+            # resolves any resulting overlap as a last resort.
+            consumed[a.clip] = max(consumed.get(a.clip, 0.0), last.audio_from.out)
             dropped.add(id(a2))
             i = j + 1
         else:
@@ -182,18 +234,24 @@ def overlay_cutaways(
                 f"(resumes after {_fmt(covered)}s of overlay cutaway)"
             )
             a2.in_ = new_in
+            consumed[a.clip] = max(consumed.get(a.clip, 0.0), new_in)
             i = j
-        rewrites += 1
+        patterns += 1
+        mutations += 1
 
-    if rewrites:
+    if mutations:
         if dropped:
             timeline.tracks.video = [s for s in video if id(s) not in dropped]
         remap = _shift_map(before_positions, timeline.segment_positions())
         _retime_absolute_tracks(timeline, remap)
-        changes.append(
-            f"{rewrites} cutaway run(s) now carry the narration from underneath"
+        if patterns:
+            changes.append(
+                f"{patterns} cutaway run(s) now carry the narration from underneath"
+            )
+        log.info(
+            "overlaid %d cutaway run(s), %d stray-reappearance fix(es)",
+            patterns, mutations - patterns,
         )
-        log.info("overlaid %d cutaway run(s) with continuous narration", rewrites)
 
     return timeline, changes
 

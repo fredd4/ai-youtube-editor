@@ -52,6 +52,7 @@ STAGES: tuple[str, ...] = (
     "denoise",
     "transcribe",
     "analyze",
+    "sentences",
     "plan",
     "tidy",
     "music",

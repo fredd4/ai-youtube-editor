@@ -49,6 +49,7 @@ ai-youtube-editor/
 │   │   ├── fal.py            # upload, submit/status/result, seedance i2v, nano-banana thumbnails, topaz upscale
 │   │   ├── transcribe.py     # clip → transcripts/<clip>.json (+ .srt); fallback mlx-whisper
 │   │   ├── analyze.py        # transcript+frames → analysis/<clip>.json (takes, instructions, topics, locations, quality)
+│   │   ├── sentences.py      # transcripts+analysis → analysis/sentences.json (numbered sentence catalogue; script-first planning)
 │   │   ├── plan.py           # all analyses → plan/edit_plan.json (timeline draft, captions, music cues, narration asks, titles)
 │   │   ├── music.py          # style selection + generation → music/*.mp3 with sidecar json
 │   │   └── publish.py        # titles, description, chapters, thumbnail prompts/generation
@@ -70,7 +71,7 @@ ai-youtube-editor/
         │   ├── peaks/        # <clip>.peaks.json for wavesurfer
         │   ├── thumbs/       # <clip>.jpg poster + frames/<clip>/NNN.jpg samples
         ├── transcripts/      # <clip>.json (words[], events[], language), <clip>.srt
-        ├── analysis/         # <clip>.json per clip + footage_log.json (merged, chronological)
+        ├── analysis/         # <clip>.json per clip + footage_log.json (merged, chronological) + sentences.json/.md
         ├── plan/             # edit_plan.json (LLM draft), timeline.json (edited, source of truth for render)
         ├── music/            # generated tracks + sidecar json
         ├── voice/            # narration pickups (recorded or TTS)
@@ -90,7 +91,8 @@ ai-youtube-editor/
 | 1 | ingest | `ytedit ingest <slug>` | input/* → media/sources, proxies, audio, peaks, thumbs; state.json clips[] | ffprobe/ffmpeg |
 | 2 | transcribe | `ytedit transcribe <slug>` | audio/*.wav → transcripts/*.json + .srt | ElevenLabs scribe_v2 (fallback whisper) |
 | 3 | analyze | `ytedit analyze <slug>` | transcripts + frames → analysis/*.json + footage_log.json | OpenRouter (Claude/Gemini) |
-| 4 | plan | `ytedit plan <slug>` | footage_log → plan/edit_plan.json + plan/timeline.json (draft) + narration_requests.md | OpenRouter (Opus) |
+| 3b | sentences | `ytedit sentences <slug>` | transcripts + analysis → analysis/sentences.json + .md (numbered sentence catalogue); auto-runs at the start of `plan` | deterministic (`ytedit/ai/sentences.py`) |
+| 4 | plan | `ytedit plan <slug>` | footage_log (compacted with the sentence catalogue) → plan/edit_plan.json + plan/timeline.json (draft) + narration_requests.md | OpenRouter (Opus) |
 | 4b | tidy | `ytedit tidy <slug>` | timeline.json → padded cuts (~0.3 s before / 0.45 s after speech); auto at the end of plan | deterministic (`ytedit/ai/tidy.py`) |
 | 1b | denoise | `ytedit denoise <slug> --clip cNNN` | media/audio/<clip>.wav → <clip>.denoised.wav; render uses it when `clips[id].use_denoised` | ElevenLabs Audio Isolation or local afftdn |
 | 5 | music | `ytedit music <slug>` | plan music cues → music/*.mp3 | ElevenLabs Music |
@@ -147,6 +149,29 @@ Clip ids are `c` + zero-padded index in **recording order** (from `creation_time
  "hooks": ["the tram was so full we walked", ...], "numbers": ["3 EUR ticket"], "topics": ["tram 28", "Alfama"]}
 ```
 
+### analysis/sentences.json (deterministic, `ytedit/ai/sentences.py`) — script-first planning
+A pre-pass over every clip's transcript, run automatically at the start of `plan` (also `ytedit sentences <slug>` on its own): splits words into sentences — ending at a word whose text ends in `.?!…`, at a pause longer than 1.2 s, or at the clip's last word — and numbers them `<clip>#<n>` (1-based) so the planner can reference dialogue by id instead of picking raw seconds.
+```json
+{
+  "project": "the reference project", "language": "pl", "generated": "2026-09-06T12:00:00+00:00",
+  "clips_count": 218, "sentences_count": 803,
+  "clips": [
+    {"id": "c001", "sentences": [
+      {"id": "c001#1", "clip": "c001", "n": 1, "s": 5.0, "e": 8.4, "text": "To jest tramwaj numer 28.",
+       "words": 6, "lang": "pl",
+       "instruction": false,       // overlaps analysis.instructions[] — never usable
+       "retake_of": null,          // "<clip>#<m>" when this is a rejected take attempt; points at the kept one
+       "duplicate_of": null,       // "<clip>#<m>" when a LATER sentence (anywhere in the project) says
+                                   // near-the-same thing (Jaccard word-overlap >= 0.7) — last-take rule,
+                                   // generalized across clips; never set when that later match is itself
+                                   // an instruction
+       "keep_default": true}       // convenience only: true iff none of the three flags above are set
+    ]}
+  ]
+}
+```
+`build_timeline` validates every `segments[].sentences` id against this catalogue (unknown/already-used/instruction/retake/duplicate ids are dropped with a stat, never silently kept) and derives the segment's `in`/`out` from the sentence boundaries plus `pacing.speech_pad_*`. A clip with no transcribed speech gets `{"id": "<clip>", "sentences": []}`. Before it reaches the planner prompt, `ytedit.ai.sentences.compact_footage_log_for_planner` replaces each clip's footage-log `segments[]`/`takes[]` with this sentence list (instruction sentences omitted outright; retake/duplicate ones kept but marked `"skip": "retake, use ..."` / `"skip": "duplicate, use ..."`) — measured on the 218-clip `projects/the reference project` footage log, this shrinks the compact-JSON prompt payload by about 5% even though it adds structured per-sentence metadata, because it replaces the old free-text segment/take detail for every clip that has transcribed speech.
+
 ### plan/timeline.json — the EDL (single source of truth for render)
 ```json
 {
@@ -181,6 +206,8 @@ Rules: times in seconds (float). Timeline time for a video segment = cumulative 
 A video segment also accepts an optional `audio_from: {"clip", "in", "out"}` (an *overlay cutaway*): the picture stays `clip[in, out]` but the rendered audio is read from `audio_from.clip[audio_from.in, audio_from.out]` instead, trimmed or padded to the segment's own picture frame count, with the segment's own `speed`/`source_audio_gain_db` and the audio clip's mute ranges and denoised WAV. `mute_source: true` still wins and renders silence. `ytedit/ai/overlay.py` sets it so a cutaway dropped between two contiguous pieces of one take does not interrupt the narration underneath.
 
 `plan.py`'s planner-facing segment schema (before deterministic post-processing) also accepts an optional `voice_over: {"picture": [{"clip", "in", "out"}]}` on a segment: `build_timeline` extracts that segment's own clip audio as a `tracks.voice` item (a WAV cut from `media/audio/<clip>.wav`, or the denoised variant when active, written to `voice/vo_<clip>_<in>_<out>.wav`) and replaces the segment with the listed picture cuts (`mute_source: true`, `role: "b-roll"`) so the narrator is heard but not seen, except where those cuts fall short of the narration's length — then the clip's own picture fills the gap.
+
+**Script-first speech (`ytedit/ai/sentences.py` + `plan.py`):** a speech segment sets `sentences: ["c030#1", "c030#2"]` — contiguous ids of one clip's sentence catalogue, in transcript order — instead of `in`/`out`; `build_timeline` derives `in = first_sentence.s - pacing.speech_pad_before` and `out = last_sentence.e + pacing.speech_pad_after`. Optional `cutaways: [{"clip", "in", "out", "after_sentence": "c030#1"}]` split the run at that sentence: the piece before it ends exactly at the sentence boundary (no trailing air — the narration keeps going), the cutaway gets `audio_from` over the stretch of the a-roll clip it would otherwise skip, and the next piece resumes exactly where that borrowed audio ends — the same on-disk shape `ytedit/ai/overlay.py` produces for the legacy (raw-seconds) pattern, just constructed directly instead of pattern-matched after the fact. Every sentence id may appear at most once in the whole plan; an id `build_timeline` cannot resolve (unknown, already used, an instruction, or a `retake_of`/`duplicate_of`) is dropped with a stat rather than silently rendered, and a non-contiguous id list is split into separate segments. A plan with no `sentences` on any segment (a legacy `planner_response.json`, or `plan --from-response` on one) behaves exactly as before — this is additive, not a breaking schema change.
 
 ### plan/edit_plan.json (LLM reasoning, human-readable)
 Story outline (beats with target timecodes per playbook: 0:00 hook, 0:07 promise, 0:30 interrupt, 3:00/6:00 re-engagements, end payoff), which clips serve which beat, cold-open montage picks, subscribe-CTA placement, music cue sheet with mood per section, list of **narration requests** (what the user should record for intro/outro/bridges, with suggested scripts in the project language), risk flags (copyright music, missing footage), title candidates, thumbnail concepts. Written also as `plan/edit_plan.md`.

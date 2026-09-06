@@ -7,9 +7,14 @@
 which implements research rules 5-9), the structural marker template (rule 4),
 a clean final 20 s for the end screen, the Polish ending guard on the mapped
 transcript (rule 8), vertical-clip handling (rule 15), caption bounds and the
-safe-area font check (rule 21), and Content-ID pre-flight: every
+safe-area font check (rule 21), Content-ID pre-flight (every
 ``background_music`` flag the footage log raised must be answered by a
-``mute_range`` (rule 19).
+``mute_range``, rule 19), the audio ledger dedupe check (no audio range may
+play twice, rule 31) and a true-break sentence check (a cut where the audio
+actually stops landing mid-sentence, rule 32). Rules 31-32 are not in
+``docs/research/youtube-production-playbook.md`` (1-30) — they encode the
+"no audio may ever play twice" rule added afterwards; see
+:mod:`ytedit.ai.ledger`.
 
 **Rendered file** — container and codec conformance (rule 23: H.264 High,
 yuv420p, faststart with ``moov`` ahead of ``mdat``, bt709 tags, AAC-LC
@@ -374,6 +379,12 @@ def check_timeline(project: Project, timeline: Timeline, report: Report) -> None
     # --- rule 21: the caption font must carry Polish -------------------
     _check_font(project, timeline, report)
 
+    # --- rule 31: no audio range may play twice -------------------------
+    _check_duplicate_audio(project, timeline, report)
+
+    # --- rule 32: a true cut landing mid-sentence ------------------------
+    _check_sentence_breaks(project, timeline, report)
+
 
 def pacing_warnings(timeline: Timeline, settings: Any) -> list[str]:
     """Return :func:`ytedit.ai.plan.pacing_report` output, or ``[]``.
@@ -491,6 +502,100 @@ def _check_font(project: Project, timeline: Timeline, report: Report) -> None:
         report.checks["caption_font"] = str(font_file)
     except captions_mod.CaptionFontError as exc:
         report.error(f"rule 21: {exc}")
+
+
+def _check_duplicate_audio(project: Project, timeline: Timeline, report: Report) -> None:
+    """Rule 31 (not in the 1-30 research playbook — the audio ledger dedupe
+    pass added afterwards): no audio range may be heard more than once.
+
+    Speech playing twice is an ERROR — it is the exact defect
+    :mod:`ytedit.ai.ledger` exists to fix, so seeing one here means a
+    hand-edited ``timeline.json`` was never run back through ``ytedit tidy``.
+    A repeated *ambient* range (no transcript word in it) is only a WARNING:
+    the dedupe pass allows those by default since a repeated splash of crowd
+    noise or wind is harmless.
+    """
+    try:
+        from .ai.ledger import find_duplicate_audio
+    except ImportError:  # pragma: no cover - AI layer not installed
+        log.debug("ytedit.ai.ledger is unavailable; skipping the audio-dedupe rule")
+        return
+    try:
+        findings = find_duplicate_audio(timeline, project)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("find_duplicate_audio failed: %s", exc)
+        return
+    for finding in findings:
+        ids = " / ".join(finding.ids)
+        message = (
+            f"rule 31: {finding.clip} {_mmss(finding.start)}-{_mmss(finding.end)} "
+            f"({finding.duration:.2f}s) plays twice — {ids}"
+        )
+        if finding.speech:
+            report.error(message)
+        else:
+            report.warn(message + " (ambient — allowed by default, but re-run `ytedit tidy`)")
+
+
+def _check_sentence_breaks(project: Project, timeline: Timeline, report: Report) -> None:
+    """Rule 32 (not in the 1-30 research playbook): a true cut — the audio
+    actually stops there, see :func:`ytedit.ai.tidy._is_continuous_handoff` —
+    landing in the middle of a sentence.
+
+    ``ytedit tidy`` already tries to fix every one of these (extend, or
+    retract/advance to the nearest complete sentence when extension is
+    blocked); a finding here means either ``tidy`` was never re-run after a
+    hand edit, or the cap/guard left it capped mid-sentence on purpose.
+    """
+    try:
+        from .ai.tidy import (
+            _in_head,
+            _is_continuous_handoff,
+            _out_tail,
+            has_sentence_marks,
+            load_words,
+        )
+    except ImportError:  # pragma: no cover - AI layer not installed
+        log.debug("ytedit.ai.tidy is unavailable; skipping the sentence-break rule")
+        return
+
+    cfg = project.settings
+    gap_max = max(0.0, float(cfg.get("pacing.sentence_gap_max", 1.2)))
+    merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
+    words_cache: dict[str, list] = {}
+    video = timeline.tracks.video
+
+    def words_for(clip_id: str) -> list:
+        if clip_id not in words_cache:
+            words_cache[clip_id] = load_words(project, clip_id)
+        return words_cache[clip_id]
+
+    for index, seg in enumerate(video):
+        if seg.mute_source:
+            continue
+        words = words_for(seg.clip)
+        if not words or not has_sentence_marks(words):
+            continue
+
+        next_seg = video[index + 1] if index + 1 < len(video) else None
+        if next_seg is None or not _is_continuous_handoff(seg, next_seg, merge_gap):
+            found = _out_tail(seg, words, gap_max)
+            if found is not None:
+                _last, tail = found
+                report.warn(
+                    f"rule 32: {seg.id} out at {_mmss(seg.out)} cuts mid-sentence "
+                    f"— next word would be '{tail[0].text}'"
+                )
+
+        prev_seg = video[index - 1] if index > 0 else None
+        if prev_seg is None or not _is_continuous_handoff(prev_seg, seg, merge_gap):
+            found_in = _in_head(seg, words, gap_max)
+            if found_in is not None:
+                _first, head = found_in
+                report.warn(
+                    f"rule 32: {seg.id} in at {_mmss(seg.in_)} opens mid-sentence "
+                    f"— previous word was '{head[0].text}'"
+                )
 
 
 # ----------------------------------------------------------------------

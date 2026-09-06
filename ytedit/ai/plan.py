@@ -57,13 +57,20 @@ import json
 import re
 
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from ytedit.ai.openrouter import OpenRouter, OpenRouterError
 from ytedit.ai.prompts import render
+from ytedit.ai.ledger import dedupe_audio
 from ytedit.ai.overlay import overlay_cutaways
+from ytedit.ai.sentences import (
+    compact_footage_log_for_planner,
+    load_sentence_index,
+    load_sentences,
+    write_sentences,
+)
 from ytedit.ai.tidy import pad_segments_to_speech, sentence_snap_count
 from ytedit.config import Settings
 from ytedit.costs import charge
@@ -71,6 +78,7 @@ from ytedit.log import get_logger
 from ytedit.media.ffmpeg import FFmpegError, ff
 from ytedit.project import Project, utcnow
 from ytedit.timeline import (
+    AudioFrom,
     Caption,
     Chapter,
     Duck,
@@ -297,6 +305,37 @@ class VoiceOver(_Lenient):
     picture: list[VoiceOverPicture] = Field(default_factory=list)
 
 
+class PlanCutaway(_Lenient):
+    """A picture-only insert placed after one sentence of a speech segment.
+
+    The narration audio underneath keeps running (see
+    :func:`_build_sentence_run_segments`): the cutaway's own audio is
+    replaced by the stretch of the speech segment's clip that would
+    otherwise have been skipped, exactly the semantics
+    ``ytedit/ai/overlay.py`` produces for a planner that (in the legacy,
+    raw-seconds regime) split one take into two contiguous pieces around a
+    cutaway.
+    """
+
+    clip: str = ""
+    in_: float = Field(0.0, alias="in")
+    out: float = 0.0
+    after_sentence: str = ""
+
+
+class PlanAudioFrom(_Lenient):
+    """Internal: where a synthetic (sentence-expanded) segment's audio comes from.
+
+    Not part of the planner-facing schema — set only by
+    :func:`_build_sentence_run_segments` when it expands a ``cutaways`` entry
+    into its own :class:`PlanSegment`.
+    """
+
+    clip: str = ""
+    in_: float = Field(0.0, alias="in")
+    out: float = 0.0
+
+
 class PlanSegment(_Lenient):
     """A proposed video segment, before deterministic post-processing."""
 
@@ -314,6 +353,17 @@ class PlanSegment(_Lenient):
     speed: float = 1.0
     #: Post-trip narration routing (playbook §3); see :class:`VoiceOver`.
     voice_over: VoiceOver | None = None
+    #: Script-first speech routing: contiguous sentence ids of one clip: when
+    #: set, ``in``/``out`` above are ignored — :func:`build_timeline` derives
+    #: them from the sentence catalogue instead (see
+    #: :func:`_expand_sentence_segments`).
+    sentences: list[str] = Field(default_factory=list)
+    #: Optional picture-only inserts along ``sentences`` (see :class:`PlanCutaway`).
+    cutaways: list[PlanCutaway] = Field(default_factory=list)
+    #: Internal only (never planner-facing): set by sentence-cutaway expansion
+    #: so a synthetic cutaway segment carries its borrowed audio through the
+    #: normal per-segment pipeline in :func:`build_timeline`.
+    audio_from: PlanAudioFrom | None = None
     notes: str = ""
 
 
@@ -719,6 +769,207 @@ def _merge_consecutive_voice_over(
 
 
 # ----------------------------------------------------------------------
+# script-first speech: sentence-id segments (see ytedit/ai/sentences.py)
+# ----------------------------------------------------------------------
+def _sentence_n(sentence_id: str) -> int:
+    """Parse the ``n`` out of ``<clip>#<n>``; ``-1`` when unparseable."""
+    try:
+        return int(sentence_id.rsplit("#", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _contiguous_sentence_runs(
+    ids: Sequence[str], sentence_index: Mapping[str, dict[str, Any]]
+) -> list[list[str]]:
+    """Split ``ids`` (already known-valid) into maximal same-clip, ``n+1`` runs."""
+    runs: list[list[str]] = []
+    current: list[str] = []
+    prev_clip: str | None = None
+    prev_n: int | None = None
+    for sid in ids:
+        info = sentence_index[sid]
+        clip = str(info.get("clip", ""))
+        n = _sentence_n(sid)
+        if current and clip == prev_clip and prev_n is not None and n == prev_n + 1:
+            current.append(sid)
+        else:
+            if current:
+                runs.append(current)
+            current = [sid]
+        prev_clip, prev_n = clip, n
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _build_sentence_run_segments(
+    seg: PlanSegment,
+    run: list[str],
+    sentence_index: Mapping[str, dict[str, Any]],
+    cutaways: Sequence[PlanCutaway],
+    pad_before: float,
+    pad_after: float,
+    stats: dict[str, Any],
+) -> tuple[list[PlanSegment], set[str]]:
+    """Expand one contiguous sentence run (plus any cutaways inside it).
+
+    Splits ``run`` at every ``cutaway.after_sentence`` that falls inside it,
+    in run order, emitting: a speech piece ending exactly at the split
+    sentence (no trailing pad — the narration continues under the cutaway), a
+    synthetic cutaway :class:`PlanSegment` carrying ``audio_from`` over the
+    stretch of ``seg.clip`` the cutaway covers, then the next piece resuming
+    exactly where that borrowed audio ends. Only the very first piece gets a
+    leading pad; only the very last piece gets a trailing one.
+
+    Returns:
+        ``(segments, matched_after_sentence_ids)`` — the second lets the
+        caller report any of ``cutaways`` that named a sentence outside this
+        run (or this segment altogether) as dropped.
+    """
+    clip_id = str(sentence_index[run[0]].get("clip", seg.clip))
+    ordered_cutaways = sorted(
+        (c for c in cutaways if c.after_sentence in run),
+        key=lambda c: run.index(c.after_sentence),
+    )
+    matched = {c.after_sentence for c in ordered_cutaways}
+
+    result: list[PlanSegment] = []
+    remaining = list(run)
+    audio_cursor = 0.0
+    first_piece = True
+
+    def emit_piece(ids: list[str], is_last: bool) -> None:
+        nonlocal first_piece
+        first_s = float(sentence_index[ids[0]]["s"])
+        last_e = float(sentence_index[ids[-1]]["e"])
+        piece_in = round(max(0.0, first_s - pad_before), 3) if first_piece else round(audio_cursor, 3)
+        piece_out = round(last_e + pad_after, 3) if is_last else round(last_e, 3)
+        new_seg = seg.model_copy(deep=True)
+        new_seg.clip = clip_id
+        new_seg.in_ = piece_in
+        new_seg.out = piece_out
+        new_seg.sentences = list(ids)
+        new_seg.cutaways = []
+        new_seg.audio_from = None
+        result.append(new_seg)
+        first_piece = False
+
+    for cutaway in ordered_cutaways:
+        split_at = remaining.index(cutaway.after_sentence)
+        piece_ids, remaining = remaining[: split_at + 1], remaining[split_at + 1 :]
+        if not piece_ids:
+            continue
+        emit_piece(piece_ids, is_last=False)
+        audio_cursor = result[-1].out
+        cut_clip = str(cutaway.clip)
+        cut_in, cut_out = float(cutaway.in_), float(cutaway.out)
+        if not cut_clip or cut_out <= cut_in + _EPS:
+            stats["dropped_cutaways"].append(
+                f"after {cutaway.after_sentence}: bad cutaway ({cut_clip!r} "
+                f"{cut_in:.2f}-{cut_out:.2f})"
+            )
+            continue
+        duration = cut_out - cut_in
+        result.append(
+            PlanSegment(
+                clip=cut_clip,
+                **{"in": cut_in},
+                out=cut_out,
+                role="cutaway",
+                audio_from=PlanAudioFrom(
+                    clip=clip_id, **{"in": audio_cursor}, out=round(audio_cursor + duration, 3)
+                ),
+                notes=f"cutaway after {cutaway.after_sentence}",
+            )
+        )
+        audio_cursor = round(audio_cursor + duration, 3)
+
+    if remaining:
+        emit_piece(remaining, is_last=True)
+    return result, matched
+
+
+def _expand_sentence_segments(
+    segments: Sequence[PlanSegment],
+    sentence_index: Mapping[str, dict[str, Any]],
+    cfg: Settings,
+    stats: dict[str, Any],
+) -> list[PlanSegment]:
+    """Turn every ``sentences``-carrying segment into raw-seconds segments.
+
+    A segment without ``sentences`` passes through unchanged (the legacy,
+    raw-``in``/``out`` shape keeps working exactly as before). One with
+    ``sentences`` is validated against ``sentence_index`` (unknown, already
+    used, or excluded — instruction / retake / duplicate — ids are dropped
+    with a stat) and split into contiguous same-clip runs; each run becomes
+    one or more :class:`PlanSegment`\\ s via
+    :func:`_build_sentence_run_segments`.
+
+    ``used_sentence_ids`` is tracked across the *whole* call (not per
+    segment) so a sentence referenced twice anywhere in the plan is only kept
+    the first time — see ``stats["duplicate_sentence_refs"]``.
+    """
+    pad_before = max(0.0, float(cfg.get("pacing.speech_pad_before", 0.30)))
+    pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
+    used: set[str] = set()
+    out: list[PlanSegment] = []
+
+    for seg in segments:
+        if not seg.sentences:
+            out.append(seg)
+            continue
+
+        valid_ids: list[str] = []
+        for sid in seg.sentences:
+            info = sentence_index.get(sid)
+            if info is None:
+                stats["unknown_sentence_refs"].append(sid)
+                continue
+            if sid in used:
+                stats["duplicate_sentence_refs"].append(sid)
+                continue
+            if info.get("instruction"):
+                stats["excluded_sentence_refs"].append(f"{sid} (instruction)")
+                continue
+            if info.get("retake_of"):
+                stats["excluded_sentence_refs"].append(
+                    f"{sid} (retake_of {info['retake_of']})"
+                )
+                continue
+            if info.get("duplicate_of"):
+                stats["excluded_sentence_refs"].append(
+                    f"{sid} (duplicate_of {info['duplicate_of']})"
+                )
+                continue
+            used.add(sid)
+            valid_ids.append(sid)
+
+        if not valid_ids:
+            continue
+
+        runs = _contiguous_sentence_runs(valid_ids, sentence_index)
+        if len(runs) > 1:
+            stats["non_contiguous_splits"] += len(runs) - 1
+
+        matched_after: set[str] = set()
+        for run in runs:
+            built, matched = _build_sentence_run_segments(
+                seg, run, sentence_index, seg.cutaways, pad_before, pad_after, stats
+            )
+            out.extend(built)
+            matched_after |= matched
+        for cutaway in seg.cutaways:
+            if cutaway.after_sentence and cutaway.after_sentence not in matched_after:
+                stats["dropped_cutaways"].append(
+                    f"after {cutaway.after_sentence}: sentence not in this segment"
+                )
+        stats["sentence_segments"] += 1
+
+    return out
+
+
+# ----------------------------------------------------------------------
 # timeline construction
 # ----------------------------------------------------------------------
 def build_timeline(
@@ -763,6 +1014,13 @@ def build_timeline(
         "voice_over_merged": 0,
         "voice_over_dropped": [],
         "voice_over_dropped_picture": 0,
+        # -- script-first (sentence-referenced) speech, see ai/sentences.py --
+        "sentence_segments": 0,
+        "unknown_sentence_refs": [],
+        "duplicate_sentence_refs": [],
+        "excluded_sentence_refs": [],
+        "non_contiguous_splits": 0,
+        "dropped_cutaways": [],
     }
 
     #: One entry per ``voice_over`` segment: the extracted-audio metadata plus the
@@ -771,9 +1029,11 @@ def build_timeline(
     #: padding, because padding upstream can shift every later segment's start.
     voice_groups: list[dict[str, Any]] = []
 
+    sentence_index = load_sentence_index(project)
     segments, stats["voice_over_merged"] = _merge_consecutive_voice_over(
         plan_obj.segments, cfg
     )
+    segments = _expand_sentence_segments(segments, sentence_index, cfg, stats)
 
     video: list[VideoSegment] = []
     for index, seg in enumerate(segments):
@@ -819,15 +1079,21 @@ def build_timeline(
                 stats["voice_over_dropped"].append(f"{clip_id} {start:.2f}-{end:.2f}")
             continue
 
-        cuts = list(instruction_ranges(entry))
-        if cuts:
-            stats["instruction_cuts"] += 1
-        # Silent B-roll keeps rejected takes on purpose (playbook §3).
-        if not seg.mute_source:
-            take_cuts = rejected_take_ranges(entry)
-            if take_cuts:
-                stats["take_cuts"] += 1
-            cuts += take_cuts
+        cuts: list[tuple[float, float]] = []
+        if seg.audio_from is None:
+            # A synthetic cutaway carrying borrowed audio is already an exact,
+            # deterministically-computed range (see
+            # _build_sentence_run_segments) — excising instructions/rejected
+            # takes from it would risk splitting its audio_from mapping.
+            cuts = list(instruction_ranges(entry))
+            if cuts:
+                stats["instruction_cuts"] += 1
+            # Silent B-roll keeps rejected takes on purpose (playbook §3).
+            if not seg.mute_source:
+                take_cuts = rejected_take_ranges(entry)
+                if take_cuts:
+                    stats["take_cuts"] += 1
+                cuts += take_cuts
 
         pieces = subtract_ranges((start, end), cuts)
         if len(pieces) > 1:
@@ -843,6 +1109,18 @@ def build_timeline(
                 stats["vertical_fixed"].append(clip_id)
         if fit not in ("cover", "contain", "blur-fill", "crop-pan"):
             fit = "cover"
+
+        # A single piece (guaranteed when audio_from is set, since cuts is
+        # then empty) carries the whole borrowed-audio range unchanged; a
+        # segment excised into several pieces would otherwise need the range
+        # split proportionally, which never happens here in practice.
+        audio_from = None
+        if seg.audio_from is not None and len(pieces) == 1:
+            audio_from = AudioFrom(
+                clip=str(seg.audio_from.clip),
+                **{"in": float(seg.audio_from.in_)},
+                out=float(seg.audio_from.out),
+            )
 
         for piece_s, piece_e in pieces:
             if piece_e - piece_s < min_shot:
@@ -861,6 +1139,8 @@ def build_timeline(
                     speed=seg.speed if seg.speed and seg.speed > 0 else 1.0,
                     mute_source=bool(seg.mute_source),
                     source_audio_gain_db=_num(seg.source_audio_gain_db, 0.0),
+                    audio_from=audio_from,
+                    sentence_ids=list(seg.sentences) if seg.sentences else [],
                     notes=seg.notes or "",
                 )
             )
@@ -890,6 +1170,10 @@ def build_timeline(
     #     re-assigned again because the pass can drop the continuation segment.
     timeline, overlaid = overlay_cutaways(timeline, project, cfg)
     stats["overlaid"] = overlaid
+    # 7c. No audio twice: whatever the planner and the passes above produced,
+    #     a stretch of narration already heard is muted or advanced past.
+    timeline, dedupe_changes = dedupe_audio(timeline, project, cfg)
+    stats["deduped"] = len(dedupe_changes)
     for i, segment in enumerate(timeline.tracks.video):
         segment.id = f"s{i + 1:03d}"
     video = timeline.tracks.video
@@ -1576,8 +1860,17 @@ def render_edit_plan_md(
     project: Project,
     stats: dict[str, Any],
     warnings: Sequence[str],
+    sentence_index: Mapping[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Render the human-readable ``plan/edit_plan.md``."""
+    """Render the human-readable ``plan/edit_plan.md``.
+
+    Args:
+        sentence_index: The flat sentence catalogue (``<clip>#<n>`` -> sentence
+            dict, see ``ytedit/ai/sentences.py``) used to show the first words
+            of a speech segment's script next to its sentence ids. Omitted
+            (``None``) just skips that text — the ids alone still print.
+    """
+    sentence_index = sentence_index or {}
     total = timeline.duration()
     lines: list[str] = [
         f"# Edit plan — {project.slug}",
@@ -1645,6 +1938,15 @@ def render_edit_plan_md(
                 f"{seg.audio_from.in_:.2f}–{seg.audio_from.out:.2f}"
             )
             note = f"{note} · {borrowed}" if note else borrowed
+        if seg.sentence_ids:
+            first_sentence = sentence_index.get(seg.sentence_ids[0])
+            words = str((first_sentence or {}).get("text", "")).split()
+            preview = " ".join(words[:6]) + ("…" if len(words) > 6 else "")
+            script = f"`{seg.sentence_ids[0]}`" + (
+                f"–`{seg.sentence_ids[-1]}`" if len(seg.sentence_ids) > 1 else ""
+            )
+            script += f" “{preview}”" if preview else ""
+            note = f"{note} · {script}" if note else script
         lines.append(
             f"| {i} | {_mmss(pos.start)} | `{seg.clip}` | "
             f"{seg.in_:.1f}–{seg.out:.1f} | {seg.duration:.1f}s | "
@@ -1810,6 +2112,30 @@ def render_edit_plan_md(
         if values:
             lines.append(f"- {label}: {', '.join(str(v) for v in values)}")
     lines.append("")
+
+    # -- script check (script-first planning, ytedit/ai/sentences.py) --------
+    lines += ["## Script check", ""]
+    script_rows = (
+        ("sentence_segments", "segments referencing sentence ids"),
+        ("non_contiguous_splits", "non-contiguous sentence runs auto-split"),
+        ("unknown_sentence_refs", "unknown sentence ids dropped"),
+        ("duplicate_sentence_refs", "sentence ids reused elsewhere (kept first use only)"),
+        ("excluded_sentence_refs", "instruction/retake/duplicate ids dropped"),
+        ("dropped_cutaways", "cutaways dropped (bad clip/range or unmatched sentence)"),
+    )
+    any_script_row = False
+    for key, label in script_rows:
+        value = stats.get(key)
+        if isinstance(value, list):
+            if value:
+                any_script_row = True
+                lines.append(f"- {label}: {', '.join(str(v) for v in value)}")
+        elif value:
+            any_script_row = True
+            lines.append(f"- {label}: {value}")
+    if not any_script_row:
+        lines.append("_Clean: every sentence reference resolved cleanly._")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1902,6 +2228,7 @@ def plan(
             ``plan/planner_response.json`` to rebuild from.
     """
     settings = project.settings
+    write_sentences(project)  # script-first: refresh the sentence catalogue every plan run
     footage_log = load_footage_log(project)
     entries = footage_entries(footage_log)
     if not entries:
@@ -2014,7 +2341,10 @@ def plan(
         )
         md_path = project.plan_dir / "edit_plan.md"
         md_path.write_text(
-            render_edit_plan_md(plan_obj, timeline, project, stats, warnings), encoding="utf-8"
+            render_edit_plan_md(
+                plan_obj, timeline, project, stats, warnings, load_sentence_index(project)
+            ),
+            encoding="utf-8",
         )
         narration_path = project.plan_dir / "narration_requests.md"
         narration_path.write_text(render_narration_requests_md(plan_obj, project), encoding="utf-8")
@@ -2072,13 +2402,19 @@ def _ask_planner(
     """Render the plan prompts and call the planner model once."""
     model = settings.model("planner")
     system_prompt = render("plan.system", project_language=project.language)
+    catalogue = load_sentences(project)
+    prompt_footage_log = (
+        compact_footage_log_for_planner(footage_log, catalogue) if catalogue else footage_log
+    )
     user_prompt = render(
         "plan.user",
         project_slug=project.slug,
         project_language=project.language,
         clip_count=clip_count,
         total_footage_minutes=f"{total_minutes:.1f}",
-        footage_log_json=json.dumps(footage_log, ensure_ascii=False, separators=(",", ":")),
+        footage_log_json=json.dumps(
+            prompt_footage_log, ensure_ascii=False, separators=(",", ":")
+        ),
         existing_timeline_json_or_null=(
             json.dumps(existing.to_dict(), ensure_ascii=False, separators=(",", ":"))
             if existing is not None

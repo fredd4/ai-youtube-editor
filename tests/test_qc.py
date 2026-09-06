@@ -269,6 +269,65 @@ def test_a_font_without_polish_glyphs_is_a_hard_failure(
     assert any(e.startswith("rule 21") for e in report["errors"])
 
 
+def test_duplicate_speech_audio_is_an_error(project: Project) -> None:
+    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(json.dumps({
+        "clip": "c001", "language": "pl",
+        "words": [{"t": "Cześć", "s": 2.0, "e": 2.4}],
+    }), encoding="utf-8")
+    write_timeline(project, minimal(tracks={
+        "video": [
+            {"id": "s001", "clip": "c001", "in": 0.0, "out": 5.0, "role": "a-roll"},
+            {"id": "s002", "clip": "c001", "in": 1.0, "out": 6.0, "role": "a-roll"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert report["ok"] is False
+    assert any(
+        e.startswith("rule 31") and "s001" in e and "s002" in e for e in report["errors"]
+    )
+
+
+def test_duplicate_ambient_audio_is_only_a_warning(project: Project) -> None:
+    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
+    # No transcript at all: the overlap carries no speech, so it is allowed.
+    write_timeline(project, minimal(tracks={
+        "video": [
+            {"id": "s001", "clip": "c001", "in": 0.0, "out": 5.0, "role": "cutaway"},
+            {"id": "s002", "clip": "c001", "in": 1.0, "out": 6.0, "role": "cutaway"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert not any(e.startswith("rule 31") for e in report["errors"])
+    assert any(w.startswith("rule 31") and "ambient" in w for w in report["warnings"])
+
+
+def test_a_true_mid_sentence_cut_warns(project: Project) -> None:
+    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
+    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(json.dumps({
+        "clip": "c001", "language": "pl",
+        "words": [
+            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
+            {"t": "Gamma", "s": 4.0, "e": 4.4}, {"t": "Delta.", "s": 4.6, "e": 6.0},
+        ],
+    }), encoding="utf-8")
+    write_timeline(project, minimal(tracks={
+        "video": [
+            {"id": "s001", "clip": "c001", "in": 0.9, "out": 4.5, "role": "a-roll"},
+            {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0, "role": "cutaway"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert any(
+        w.startswith("rule 32") and "s001" in w and "mid-sentence" in w
+        for w in report["warnings"]
+    )
+
+
 # ----------------------------------------------------------------------
 # the rendered master
 # ----------------------------------------------------------------------

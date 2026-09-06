@@ -32,7 +32,7 @@ HOST    ?= 127.0.0.1
 PORT    ?= 8765
 
 .DEFAULT_GOAL := help
-.PHONY: help setup guard-name new ingest status validate transcribe analyze plan tidy denoise music preview master qc publish run list probe serve test fixtures clean-fixtures clean
+.PHONY: help setup guard-name new ingest status validate transcribe analyze sentences plan tidy denoise music preview master qc publish run list probe serve test fixtures clean-fixtures clean
 
 help:
 	@grep -E '^#   ' $(MAKEFILE_LIST) | sed 's/^#   //'
@@ -62,6 +62,9 @@ transcribe: guard-name
 
 analyze: guard-name
 	$(YTEDIT) analyze $(NAME) $(if $(FORCE),--force,)
+
+sentences: guard-name
+	$(YTEDIT) sentences $(NAME)
 
 plan: guard-name
 	$(YTEDIT) plan $(NAME) $(if $(FORCE),--force,) $(if $(NOTES),--notes "$(NOTES)",)

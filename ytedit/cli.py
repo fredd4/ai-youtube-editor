@@ -200,6 +200,18 @@ def analyze(
 
 
 @app.command()
+def sentences(slug: str = typer.Argument(..., help="Project slug.")) -> None:
+    """Build the sentence catalogue (script-first planning) from transcripts + analysis."""
+    from .ai.sentences import write_sentences
+
+    document = write_sentences(_load(slug))
+    console.print(
+        f"[green]wrote[/] analysis/sentences.json — {document['clips_count']} clip(s), "
+        f"{document['sentences_count']} sentence(s)"
+    )
+
+
+@app.command()
 def plan(
     slug: str = typer.Argument(..., help="Project slug."),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing draft."),
@@ -248,7 +260,9 @@ def tidy(
     console.print(
         f"[bold]{len(changes)}[/] change(s) · "
         f"{result['sentence_snapped']} sentence-snapped · "
-        f"{result['overlaid']} overlay change(s) · duration "
+        f"{result['overlaid']} overlay change(s) · "
+        f"{result['deduped']} dedupe change(s) "
+        f"({result['ambient_repeats']} ambient repeat(s) allowed) · duration "
         f"{result['duration_before']:.2f}s -> {result['duration_after']:.2f}s"
     )
     for issue in result["issues"]:

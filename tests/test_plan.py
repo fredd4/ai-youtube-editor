@@ -536,6 +536,198 @@ def test_consecutive_voice_over_segments_from_same_clip_are_merged(planned: Proj
 
 
 # ----------------------------------------------------------------------
+# script-first planning: sentence-id segments (ytedit/ai/sentences.py)
+# ----------------------------------------------------------------------
+def _write_sentence_catalogue(project: Project, sentences: list[dict[str, Any]]) -> None:
+    """Write a minimal ``analysis/sentences.json`` fixture, grouped by clip."""
+    by_clip: dict[str, list[dict[str, Any]]] = {}
+    for sent in sentences:
+        by_clip.setdefault(sent["clip"], []).append(sent)
+    doc = {"clips": [{"id": clip, "sentences": items} for clip, items in by_clip.items()]}
+    (project.analysis_dir / "sentences.json").write_text(
+        json.dumps(doc, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _sentence(sid: str, clip: str, s: float, e: float, text: str, **flags: Any) -> dict[str, Any]:
+    base = {
+        "id": sid, "clip": clip, "s": s, "e": e, "text": text,
+        "instruction": False, "retake_of": None, "duplicate_of": None,
+    }
+    base.update(flags)
+    return base
+
+
+def test_sentence_segment_derives_in_out_with_pads(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned,
+        [
+            _sentence("c001#1", "c001", 10.0, 12.0, "Cześć wszystkim."),
+            _sentence("c001#2", "c001", 12.5, 15.0, "Jedziemy dalej."),
+        ],
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {"clip": "c001", "sentences": ["c001#1", "c001#2"], "role": "a-roll", "notes": "intro"}
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+
+    assert len(timeline.tracks.video) == 1
+    segment = timeline.tracks.video[0]
+    assert segment.in_ == pytest.approx(10.0 - 0.30)
+    assert segment.out == pytest.approx(15.0 + 0.45)
+    assert segment.sentence_ids == ["c001#1", "c001#2"]
+    assert stats["sentence_segments"] == 1
+    assert not stats["unknown_sentence_refs"]
+    assert not stats["excluded_sentence_refs"]
+
+
+def test_unknown_sentence_ref_is_dropped_with_a_stat(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned, [_sentence("c001#1", "c001", 10.0, 12.0, "Cześć wszystkim.")]
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {"clip": "c001", "sentences": ["c001#1", "c001#99"], "role": "a-roll"}
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+    assert stats["unknown_sentence_refs"] == ["c001#99"]
+    assert len(timeline.tracks.video) == 1
+    assert timeline.tracks.video[0].sentence_ids == ["c001#1"]
+
+
+def test_instruction_and_retake_sentence_refs_are_excluded(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned,
+        [
+            _sentence("c001#1", "c001", 0.0, 2.0, "to na koniec", instruction=True),
+            _sentence("c001#2", "c001", 10.0, 12.0, "Cześć wszystkim.", retake_of="c001#3"),
+            _sentence("c001#3", "c001", 20.0, 22.0, "Cześć wszystkim, ostatnie podejście."),
+        ],
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {"clip": "c001", "sentences": ["c001#1"], "role": "a-roll", "notes": "instr"},
+        {"clip": "c001", "sentences": ["c001#2"], "role": "a-roll", "notes": "retake"},
+        {"clip": "c001", "sentences": ["c001#3"], "role": "a-roll", "notes": "kept"},
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+    kept_clips = [s.sentence_ids for s in timeline.tracks.video]
+    assert kept_clips == [["c001#3"]]
+    assert any("instruction" in r for r in stats["excluded_sentence_refs"])
+    assert any("retake_of" in r for r in stats["excluded_sentence_refs"])
+
+
+def test_a_sentence_id_referenced_twice_is_only_kept_the_first_time(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned,
+        [
+            _sentence("c001#1", "c001", 10.0, 12.0, "Cześć wszystkim."),
+            _sentence("c001#2", "c001", 12.5, 15.0, "Jedziemy dalej."),
+        ],
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {"clip": "c001", "sentences": ["c001#1"], "role": "a-roll", "notes": "first use"},
+        {"clip": "c001", "sentences": ["c001#1", "c001#2"], "role": "a-roll", "notes": "reuse"},
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+    assert stats["duplicate_sentence_refs"] == ["c001#1"]
+    ids = [s.sentence_ids for s in timeline.tracks.video]
+    assert ids == [["c001#1"], ["c001#2"]]
+
+
+def test_non_contiguous_sentence_ids_split_into_separate_segments(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned,
+        [
+            _sentence("c001#1", "c001", 10.0, 12.0, "Jeden."),
+            _sentence("c001#2", "c001", 12.5, 15.0, "Dwa.", instruction=True),
+            _sentence("c001#3", "c001", 15.5, 18.0, "Trzy."),
+        ],
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    # c001#2 is an instruction and gets dropped, leaving a gap between #1 and #3.
+    raw["segments"] = [
+        {"clip": "c001", "sentences": ["c001#1", "c001#2", "c001#3"], "role": "a-roll"}
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+    ids = [s.sentence_ids for s in timeline.tracks.video]
+    assert ids == [["c001#1"], ["c001#3"]]
+    assert stats["non_contiguous_splits"] == 1
+
+
+def test_cutaway_after_sentence_borrows_audio_and_resumes_the_a_roll(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned,
+        [
+            _sentence("c001#1", "c001", 10.0, 12.0, "Jedziemy tramwajem."),
+            # Long enough that the resumed piece clears pacing.min_shot_seconds
+            # (0.8 s) once it starts at the cutaway's audio_from.out (15.0).
+            _sentence("c001#2", "c001", 12.5, 17.0, "Bardzo zatłoczonym, prawie nie weszliśmy."),
+        ],
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c001",
+            "sentences": ["c001#1", "c001#2"],
+            "role": "a-roll",
+            "cutaways": [{"clip": "c003", "in": 8.0, "out": 11.0, "after_sentence": "c001#1"}],
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+    video = timeline.tracks.video
+    assert [s.clip for s in video] == ["c001", "c003", "c001"]
+
+    piece1, cutaway, piece2 = video
+    assert piece1.in_ == pytest.approx(10.0 - 0.30)
+    assert piece1.out == pytest.approx(12.0)  # no trailing pad: audio continues
+    assert piece1.sentence_ids == ["c001#1"]
+
+    assert cutaway.role == "cutaway"
+    assert cutaway.in_ == pytest.approx(8.0) and cutaway.out == pytest.approx(11.0)
+    assert cutaway.audio_from is not None
+    assert cutaway.audio_from.clip == "c001"
+    assert cutaway.audio_from.in_ == pytest.approx(12.0)
+    assert cutaway.audio_from.out == pytest.approx(15.0)  # 3 s cutaway duration
+
+    assert piece2.in_ == pytest.approx(15.0)  # resumes where the borrowed audio ends
+    assert piece2.out == pytest.approx(17.0 + 0.45)
+    assert piece2.sentence_ids == ["c001#2"]
+    assert not stats["dropped_cutaways"]
+
+
+def test_a_cutaway_with_an_unmatched_after_sentence_is_dropped(planned: Project) -> None:
+    _write_sentence_catalogue(
+        planned, [_sentence("c001#1", "c001", 10.0, 12.0, "Jedziemy tramwajem.")]
+    )
+    raw = json.loads(json.dumps(LLM_PLAN))
+    raw["segments"] = [
+        {
+            "clip": "c001",
+            "sentences": ["c001#1"],
+            "role": "a-roll",
+            "cutaways": [{"clip": "c003", "in": 8.0, "out": 11.0, "after_sentence": "c001#99"}],
+        }
+    ]
+    timeline, stats = build_timeline(EditPlan.from_llm(raw), planned, FOOTAGE_LOG)
+    assert [s.clip for s in timeline.tracks.video] == ["c001"]
+    assert stats["dropped_cutaways"]
+
+
+def test_legacy_raw_in_out_segments_still_work_without_a_sentence_catalogue(
+    planned: Project,
+) -> None:
+    """No ``analysis/sentences.json`` at all — ``plan --from-response`` on an
+    old planner answer must behave exactly as it did before this feature."""
+    assert not (planned.analysis_dir / "sentences.json").exists()
+    timeline, stats = build_timeline(EditPlan.from_llm(LLM_PLAN), planned, FOOTAGE_LOG)
+    assert timeline.tracks.video
+    assert stats["sentence_segments"] == 0
+
+
+# ----------------------------------------------------------------------
 # stage behaviour
 # ----------------------------------------------------------------------
 def test_plan_writes_all_artifacts(planned: Project) -> None:

@@ -138,6 +138,11 @@ class VideoSegment(_Model):
     #: Take the audio from another clip range instead of this segment's own
     #: (``mute_source`` still wins and renders silence).
     audio_from: AudioFrom | None = None
+    #: Script-first speech: the sentence ids (``<clip>#<n>``, see
+    #: ``ytedit/ai/sentences.py``) this segment's ``in``/``out`` were derived
+    #: from. Empty for B-roll/legacy raw-seconds segments and for the
+    #: picture-only side of an overlay cutaway.
+    sentence_ids: list[str] = Field(default_factory=list)
 
     @property
     def audio_source(self) -> tuple[str, float, float]:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from tests.test_tidy import C030, add_clip, seg, timeline_of
+from ytedit.ai.ledger import dedupe_audio, find_duplicate_audio
 from ytedit.ai.overlay import overlay_cutaways
 from ytedit.ai.tidy import pad_segments_to_speech
 from ytedit.project import Project
@@ -117,10 +118,14 @@ def test_a_continuation_shorter_than_min_shot_is_dropped(project: Project) -> No
     # 10.549 + 3.0 = 13.549 leaves 0.451 s of s003 — under min_shot_seconds.
     assert [s.id for s in tl.tracks.video] == ["s001", "s002"]
     cutaway = tl.tracks.video[1]
-    # 3.0 + 3.4 = 6.4 s of picture wanted, clamped to the 5.0 s clip
-    assert cutaway.out == pytest.approx(5.0)
+    # 3.0 + 3.4 = 6.4 s of picture would be wanted, but only 14.0 - 10.549 =
+    # 3.451 s of narration audio actually exists past where the cutaway's
+    # audio_from starts (a2.out is where the planner ended the sentence) — the
+    # picture is clamped there, not to the clip's own (longer) 5.0 s duration,
+    # so the render never plays audio past what was actually written.
+    assert cutaway.out == pytest.approx(3.451)
     assert cutaway.audio_from.in_ == pytest.approx(10.549)
-    assert cutaway.audio_from.out == pytest.approx(15.549)   # 10.549 + 5.0
+    assert cutaway.audio_from.out == pytest.approx(14.0)   # == a2.out, never past it
     assert any("dropped" in c for c in changes)
 
 
@@ -232,3 +237,79 @@ def test_nothing_moves_when_there_is_no_overlay_pattern(project: Project) -> Non
     tl, changes = overlay_cutaways(tl, project)
     assert changes == []
     assert tl.tracks.captions[0].at == 0.5
+
+
+# ----------------------------------------------------------------------
+# the per-clip "audio consumed up to" cursor (item 2 of the audio-dedupe fix)
+# ----------------------------------------------------------------------
+def test_a_stray_reappearance_is_advanced_past_audio_already_committed(
+    project: Project,
+) -> None:
+    """A clip resurfaces outside any cutaway run, independently overlapping
+    the stretch of its own audio an earlier, unrelated pattern in the same
+    pass already handed to a cutaway.
+
+    ``s004`` breaks the cutaway-run chain (its role is not a cutaway/b-roll
+    role), so ``s005`` is a fresh pattern start, not ``s003``'s continuation —
+    but its own ``[in, out)`` still reaches back into the ``c001`` stretch
+    ``s002`` (pattern 1's cutaway) already carries as narration. Without a
+    cursor spanning the whole pass, only immediately-adjacent continuations
+    get caught and this reappearance would play that stretch a second time;
+    what is left of it (0.15 s) is too short to stand as its own shot, so it
+    is dropped rather than merely trimmed.
+    """
+    add_clip(project, "c001", 60.0, THREE_SENTENCES)
+    add_clip(project, "c002", 20.0)
+    tl = timeline_of(
+        seg("s001", "c001", 0.7, 3.45, role="a-roll"),
+        seg("s002", "c002", 0.0, 1.0, role="cutaway"),
+        seg("s003", "c001", 3.7, 6.45, role="a-roll"),
+        seg("s004", "c002", 5.0, 6.0, role="transition"),  # not a cutaway role
+        seg("s005", "c001", 4.0, 4.6, role="a-roll"),
+        seg("s006", "c002", 0.0, 1.0, role="cutaway"),   # trailer: s005 must not be last
+    )
+    tl, changes = overlay_cutaways(tl, project)
+
+    by_id = {s.id: s for s in tl.tracks.video}
+    assert by_id["s003"].in_ == pytest.approx(4.45)   # the ordinary pattern-1 resume
+    assert "s005" not in by_id                        # 4.6 - 4.45 = 0.15s: below min_shot
+    assert any("s005 dropped" in c and "already carried" in c for c in changes)
+    assert [f for f in find_duplicate_audio(tl, project) if f.speech] == []
+
+
+def test_the_real_c075_chain_ends_with_no_duplicate_audio(project: Project) -> None:
+    """The exact shape audited in ``projects/the reference project/plan/timeline.json``: a
+    cutaway (``s021``) was hand-inserted into an already-overlaid
+    A -> cutaway -> A2 chain without re-running ``ytedit tidy`` first. The
+    original A2 (``s022``) now sits entirely inside audio the first cutaway
+    already carries, and the following cutaway's stale ``audio_from``
+    (``s023``) overlaps the second cutaway's freshly (re)computed one.
+
+    Running overlay — which repairs what it can and advances the picture cut
+    resuming afterwards (``s024``) via the cross-pattern cursor — and then the
+    audio ledger dedupe pass, which mops up what overlay cannot fix on its own
+    (a sibling cutaway's stale, untouched ``audio_from``), must leave no
+    speech range playing twice.
+    """
+    add_clip(project, "c075", 60.0, [
+        (2.0, 2.4, "Raz"), (9.0, 9.4, "Dwa"), (12.0, 12.4, "Trzy"),
+        (16.0, 16.4, "Cztery"), (19.5, 19.9, "Piec"), (24.0, 24.4, "Szesc"),
+    ])
+    add_clip(project, "c010", 20.0)
+    add_clip(project, "c104", 20.0)
+    add_clip(project, "c020", 20.0)
+
+    tl = timeline_of(
+        seg("s018", "c075", 0.9, 10.569, role="a-roll"),
+        seg("s019", "c010", 1.0, 10.7, role="cutaway",
+            audio_from={"clip": "c075", "in": 10.569, "out": 20.269}),
+        seg("s021", "c104", 0.5, 4.0, role="cutaway"),
+        seg("s022", "c075", 11.569, 18.889, role="a-roll"),
+        seg("s023", "c020", 0.0, 3.5, role="cutaway",
+            audio_from={"clip": "c075", "in": 18.889, "out": 22.389}),
+        seg("s024", "c075", 22.389, 27.6, role="a-roll"),
+    )
+    tl, _overlaid = overlay_cutaways(tl, project)
+    tl, _deduped = dedupe_audio(tl, project)
+
+    assert find_duplicate_audio(tl, project) == []

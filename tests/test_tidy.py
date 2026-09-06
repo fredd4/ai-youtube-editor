@@ -13,7 +13,7 @@ import pytest
 
 from ytedit.ai.tidy import TidyError, pad_segments_to_speech, tidy
 from ytedit.project import Project
-from ytedit.timeline import Caption, Timeline, VideoSegment, VoiceItem, new_timeline
+from ytedit.timeline import AudioFrom, Caption, Timeline, VideoSegment, VoiceItem, new_timeline
 
 
 # ----------------------------------------------------------------------
@@ -495,4 +495,93 @@ def test_an_unpunctuated_transcript_is_never_sentence_snapped(project: Project) 
     assert not any("sentence-snap" in c for c in changes)
     assert (tl.tracks.video[0].in_, tl.tracks.video[0].out) == (
         pytest.approx(2.8), pytest.approx(5.85),
+    )
+
+
+# ----------------------------------------------------------------------
+# true breaks: a boundary is only a cut if the audio actually stops there
+# ----------------------------------------------------------------------
+def test_a_continuous_audio_from_handoff_is_never_sentence_snapped(project: Project) -> None:
+    """``s001``'s ``out`` lands mid-sentence, but ``s002`` (a cutaway on a
+    different clip) picks up ``c001``'s audio with zero gap via ``audio_from``
+    — that hand-off is not a cut at all, so sentence snapping must leave it
+    alone even though, taken on its own, ``s001`` looks like it wants
+    extending all the way out to "Delta.".
+    """
+    add_clip(
+        project, "c001", 60.0,
+        [(1.0, 1.4, "Alfa"), (1.6, 3.0, "Beta."),
+         (4.0, 4.4, "Gamma"), (4.6, 6.0, "Delta.")],
+    )
+    add_clip(project, "c900", 20.0)
+    cutaway = VideoSegment(
+        id="s002", clip="c900", **{"in": 0.0}, out=2.5, role="cutaway",
+        audio_from=AudioFrom(clip="c001", **{"in": 4.5}, out=7.0),
+    )
+    tl = timeline_of(seg("s001", "c001", 0.9, 4.5, role="a-roll"), cutaway)
+    tl, changes = pad_segments_to_speech(tl, project)
+
+    moved = next(s for s in tl.tracks.video if s.id == "s001")
+    assert moved.out == pytest.approx(4.55)   # ordinary word-level pad only
+    assert not any(
+        c.startswith("s001 out") and ("sentence-snap" in c or "sentence-crop" in c)
+        for c in changes
+    )
+
+
+def test_a_true_mid_sentence_break_retracts_when_extension_is_blocked(
+    project: Project,
+) -> None:
+    """``s001``'s cut lands between two sentences but a later same-clip cut
+    starting exactly where it stops blocks any forward extension — retract to
+    the sentence already finished instead of leaving the cut mid-thought.
+    """
+    add_clip(
+        project, "c001", 60.0,
+        [(1.0, 1.4, "Alfa"), (1.6, 3.0, "Beta."),
+         (4.0, 4.4, "Gamma"), (4.6, 6.0, "Delta"),
+         (6.2, 7.0, "Epsilon.")],
+    )
+    add_clip(project, "c002", 20.0)
+    tl = timeline_of(
+        seg("s001", "c001", 0.9, 6.05, role="a-roll"),
+        seg("s002", "c002", 0.0, 1.0, role="cutaway"),   # not a continuation of s001
+        seg("s003", "c001", 6.05, 20.0, role="a-roll"),  # blocks extension past 6.05
+    )
+    tl, changes = pad_segments_to_speech(tl, project)
+
+    moved = next(s for s in tl.tracks.video if s.id == "s001")
+    assert moved.out == pytest.approx(3.45)   # retract to 'Beta.' (3.0) + pad_after (0.45)
+    assert any(
+        c.startswith("s001 out") and "sentence-crop" in c and "retract" in c
+        for c in changes
+    )
+
+
+def test_a_true_mid_sentence_open_advances_to_the_next_sentence_when_blocked(
+    project: Project,
+) -> None:
+    """``s001`` opens mid-sentence but an earlier same-clip cut ending exactly
+    at its ``in`` blocks any backward reach — crop the half-spoken leading
+    fragment and start clean at the next full sentence instead.
+    """
+    add_clip(
+        project, "c001", 60.0,
+        [(1.0, 1.4, "Alfa"), (1.6, 3.0, "Beta."),
+         (4.0, 4.4, "Gamma"), (4.6, 6.0, "Delta."),
+         (7.0, 7.4, "Epsilon"), (7.6, 9.0, "Zeta.")],
+    )
+    add_clip(project, "c002", 20.0)
+    tl = timeline_of(
+        seg("s000", "c001", 0.0, 4.2, role="a-roll"),    # blocks retreat past 4.2
+        seg("s00a", "c002", 0.0, 1.0, role="cutaway"),   # not a continuation of s001
+        seg("s001", "c001", 4.2, 9.5, role="a-roll"),
+    )
+    tl, changes = pad_segments_to_speech(tl, project)
+
+    moved = next(s for s in tl.tracks.video if s.id == "s001")
+    assert moved.in_ == pytest.approx(6.7)    # crops "Gamma Delta.", starts at 'Epsilon'
+    assert any(
+        c.startswith("s001 in") and "sentence-crop" in c and "advance" in c
+        for c in changes
     )

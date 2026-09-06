@@ -192,6 +192,8 @@ pacing:
   # end (or back to the start) of that sentence before the pad is applied.
   sentence_gap_max: 1.2        # words further apart than this end the sentence
   sentence_extend_max: 8.0     # most a sentence snap may add to one side of a cut
+  # Audio ledger dedupe (ytedit/ai/ledger.py): no audio may ever play twice.
+  audio_dupe_tolerance: 0.25   # overlap under this is not worth fixing
   # Structural beats (seconds). "end-20" = 20 s before the end.
   markers:
     - { at: 0.0, label: hook }

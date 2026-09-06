@@ -119,11 +119,24 @@ BE TERSE. This JSON is machine-read, not published. Every "description", "why",
 cta.script.
 
 FOOTAGE RULES
+- Each clip's dialogue is a numbered "sentences" inventory: {"id": "c001#3", "s", "e",
+  "text"}, id order == transcript order. This is the ONLY way to reference speech —
+  never invent seconds for a-roll/b-roll dialogue. A sentence already excised as an
+  instruction is not even listed. A sentence you must not pick (a rejected take
+  attempt, or a near-duplicate of a later one) is listed with "skip": "retake, use
+  c001#7" or "skip": "duplicate, use c003#2" — use the named target instead, never
+  the skipped id.
+- HARD RULES for segments[].sentences: (1) every sentence id appears at most once in
+  the WHOLE plan, across every segment; (2) never an id the footage log omitted
+  (instruction) or marked "skip" (retake/duplicate) — use its target; (3) the ids in
+  one segment must be contiguous in that clip's own numbering (c001#4, c001#5,
+  c001#6 — never a gap or a jump backward); a discontinuity means two segments, not
+  one.
 - instructions[]: spoken editor instructions ("use this as the outro", "cut this").
-  Obey the placement or exclusion, and never let the instruction's own words survive
-  into the cut — start the segment after it, or split around it.
-- takes[]: keep the attempt the analysis already chose (normally the last one).
-  Override only for a clear structural reason, and put that reason in risks[].
+  Already excised from sentences[] above; nothing further to do except honor any
+  requested placement (e.g. "use this as the outro").
+- takes[]: rejected attempts are already excluded from sentences[] ("skip": "retake,
+  use ..."); just pick the sentence ids the "skip" notes point you to.
 - background_music[] with suggest != "keep" must reappear in mute_ranges (clip time,
   gain_db -60 to mute, -14 to duck). Copyrighted bar/restaurant music gets muted.
 - "audio-only" and "silent-broll" clips are pairing material, never default picture.
@@ -135,16 +148,24 @@ FOOTAGE RULES
   audio as voice_over over trip B-roll picture rather than showing them on screen.
   Show the narrator on camera only where it earns it — typically a first on-camera
   appearance early on and the ending. Their opening sentence usually describes the
-  clip to the editor, not the audience — that is an instruction (instructions[]
-  already excises it), never voice_over.script or on-screen content.
+  clip to the editor, not the audience — that is an instruction (already excised
+  from sentences[]), never voice_over.script or on-screen content.
 
 SEGMENTS
 - Prefer FEW, LONG segments: one per continuous usable stretch of a clip, not one
-  per sentence. Split only for an excised instruction or rejected take, a real
-  cutaway, or a beat boundary. Budget roughly one segment per 3-5 s of planned
-  runtime (a 12-minute video is ~150-250 segments); never exceed 300.
-- "in"/"out" are clip-relative seconds inside that clip's real duration. Array order
-  is final screen order, which need not be chronological.
+  per sentence — group every contiguous run of kept sentence ids into one segment.
+  Split only for a genuinely rejected/duplicate id gap, a real cutaway, or a beat
+  boundary. Budget roughly one segment per 3-5 s of planned runtime (a 12-minute
+  video is ~150-250 segments); never exceed 300.
+- Speech (a-roll/b-roll dialogue): set "sentences" to the contiguous id run; omit
+  "in"/"out" — the pipeline derives them from the sentence boundaries plus air.
+- B-roll, silent-broll, audio-only, cold-open picks: no "sentences" — set "in"/"out"
+  as clip-relative seconds inside that clip's real duration, as before.
+- cutaways[] (optional, on a "sentences" segment only): a picture-only insert placed
+  "after_sentence" one of that segment's own ids — {"clip", "in", "out",
+  "after_sentence"}. The narration keeps playing underneath it; do not also try to
+  fake this with two separate segments and a gap.
+- Array order is final screen order, which need not be chronological.
 
 STRUCTURE TEMPLATE (target runtime 10-20 min; if the footage totals much less,
 scale these timecodes proportionally but keep every beat):
@@ -169,10 +190,11 @@ PACING
   that breaks this in risks[] instead of allowing it silently.
 - Never more than ~12 s without a visual change (cut, push-in, caption, scale).
 - An A-roll run longer than 10 s needs a cutaway; aim at roughly 60/40 B-roll/A-roll.
-- Leave air around speech: a segment's "in" ~0.3 s before its first word and its "out"
-  ~0.5 s after its last word, never exactly on them (a deterministic pass enforces
-  this afterwards, so do not fight it by cutting tight).
-- Cut narration only at sentence boundaries; when you want a cutaway in the middle of a take, place the cutaway between two contiguous pieces of the same take (second piece starts where the first ended) — the pipeline keeps the narration audio continuous under the cutaway.
+- Air around speech (~0.3 s before the first word, ~0.5 s after the last) is added
+  automatically from the sentence boundaries — never something you compute.
+- Cut narration only at sentence boundaries (guaranteed when you reference whole
+  sentence ids). Want a cutaway mid-take? Use cutaways[] with "after_sentence" —
+  never split one take into two segments with a manual seconds gap.
 
 ALSO PRODUCE
 - cold_open: 2-4 visually distinct picks from anywhere in the log, ~10 s total.
@@ -201,8 +223,15 @@ do not echo them. Include every top-level key, using [] or "" when you have noth
   },
   "cold_open": [{"clip": "", "in": 0.0, "out": 0.0, "why": ""}],   // 2-4 picks
   "segments": [{                                        // screen order, ~1 per 3-5 s of runtime, <= 300
-    "clip": "c001", "in": 0.0, "out": 0.0,              // clip-relative seconds
+    "clip": "c001",
+    "sentences": ["c001#3", "c001#4"],                  // SPEECH: contiguous ids from this
+                                                        // clip's sentences[] inventory; omit
+                                                        // in/out below when this is set
+    "in": 0.0, "out": 0.0,                              // B-ROLL/silent/cold-open ONLY:
+                                                        // clip-relative seconds
     "role": "cold-open|a-roll|b-roll|cutaway|outro",
+    "cutaways": [{"clip": "", "in": 0.0, "out": 0.0,    // optional, on a "sentences" segment:
+                  "after_sentence": "c001#3"}],         // picture insert; narration continues
     "transform": {"fit": "cover|contain|blur-fill|crop-pan"},   // vertical => blur-fill
     "transition_in": {"type": "cut|fade|xfade", "duration": 0.0},  // cut unless meant
     "mute_source": false,                               // true = deliberate silent B-roll
