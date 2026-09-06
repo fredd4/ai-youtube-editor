@@ -571,6 +571,12 @@ def _retime_absolute_tracks(timeline: Timeline, remap: Callable[[float], float])
         item.at = remap(item.at)
         if item.end is not None:
             item.end = remap(item.end)
+    # Structural markers and chapters are pinned to absolute time as well; a
+    # chapter list that lags the picture by a minute is worse than none.
+    for marker in timeline.markers:
+        marker.at = remap(marker.at)
+    for chapter in timeline.chapters:
+        chapter.at = remap(chapter.at)
 
 
 def _mergeable(prev: VideoSegment, seg: VideoSegment) -> bool:
