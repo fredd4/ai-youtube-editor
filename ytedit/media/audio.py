@@ -235,8 +235,21 @@ def normalize(
     # A true-peak limiter ahead of loudnorm: without it a mix whose peaks sit
     # near the TP ceiling cannot be raised to the integrated target at all, and
     # a two-pass master lands a whole LU quiet (YouTube never boosts it back).
-    pre = peak_limiter_filter(TP)
-    measured = measure_loudness(path, I=I, TP=TP, LRA=LRA, pre_chain=pre) if two_pass else None
+    if two_pass:
+        # Pass 1a: how much gain the programme needs. Raise it by that much
+        # BEFORE the limiter, so the limiter (just under the true-peak ceiling)
+        # catches the peaks that would otherwise make loudnorm's linear mode
+        # cap the gain and leave the master quiet. Pass 1b re-measures through
+        # the same chain so the linear correction matches pass 2.
+        raw = measure_loudness(path, I=I, TP=TP, LRA=LRA)
+        gain_needed = max(0.0, float(I) - float(raw.get("input_i", I)))
+        pre = peak_limiter_filter(TP)
+        if gain_needed > 0.05:
+            pre = f"volume={gain_needed:.2f}dB,{pre}"
+        measured = measure_loudness(path, I=I, TP=TP, LRA=LRA, pre_chain=pre)
+    else:
+        pre = peak_limiter_filter(TP)
+        measured = None
     chain = f"{pre},{loudnorm_filter(measured, I=I, TP=TP, LRA=LRA)}"
     codec = "pcm_s24le" if target.suffix.lower() == ".wav" else "aac"
     ff(
