@@ -112,6 +112,52 @@ def _merge_into(intervals: list[tuple[float, float]], s: float, e: float) -> Non
     intervals[:] = merged
 
 
+def committed_audio_ranges(
+    timeline: Timeline, video_slice: slice | None = None
+) -> dict[str, list[tuple[float, float]]]:
+    """Per-clip merged audio ranges the timeline already claims right now.
+
+    The same notion :func:`dedupe_audio` polices *after* the fact, exposed
+    here so :mod:`ytedit.ai.tidy` (sentence-boundary snapping) and
+    :mod:`ytedit.ai.overlay` (the cutaway rewrite) can consult it *before*
+    moving a cut, instead of only cleaning up once a move has already
+    created a duplicate: a segment's own ``[in, out)`` audio when it is not
+    muted, every ``audio_from`` range, and every
+    ``voice/vo_<clip>_<in>_<out>.wav`` pickup extracted straight from a
+    clip's own audio.
+
+    Unlike :func:`dedupe_audio`'s chronological walk, this is a plain
+    snapshot — "what does the timeline claim right now" — with no notion of
+    priority between overlapping claims. ``video_slice`` lets a caller scope
+    that snapshot to one side of the segment it is about to move: a cut
+    reaching *backward* should only be blocked by claims already staked
+    *earlier* in the video track (``slice(0, index)``) — exactly the ones
+    the ledger's chronological walk would have given priority to — and a cut
+    reaching *forward* only by claims staked *later* (``slice(index + 1,
+    None)``). Passing ``None`` (the default) uses the whole track. Voice
+    pickups are always included regardless of ``video_slice``, since they
+    carry no position in the video track to scope by.
+
+    Returns:
+        ``{clip: [(start, end), ...]}``, each list sorted and merged.
+    """
+    segments = timeline.tracks.video if video_slice is None else timeline.tracks.video[video_slice]
+    ranges: dict[str, list[tuple[float, float]]] = {}
+    for seg in segments:
+        if seg.mute_source:
+            continue
+        clip, s, e = seg.audio_source
+        _merge_into(ranges.setdefault(clip, []), s, e)
+    for item in timeline.tracks.voice:
+        m = VO_FILE_RE.search(item.file)
+        if not m:
+            continue
+        clip = m.group("clip")
+        s, e = float(m.group("in")), float(m.group("out"))
+        _merge_into(ranges.setdefault(clip, []), s, e)
+    return ranges
+
+
 def _consumed_overlap(intervals: Sequence[tuple[float, float]], s: float, e: float) -> float:
     """Total overlap of ``[s, e)`` against a merged interval list."""
     total = 0.0
@@ -408,6 +454,7 @@ __all__ = [
     "DuplicateFinding",
     "VO_FILE_RE",
     "ambient_repeat_count",
+    "committed_audio_ranges",
     "dedupe_audio",
     "find_duplicate_audio",
 ]

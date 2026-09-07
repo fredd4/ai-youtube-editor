@@ -33,11 +33,14 @@ encoding:
     crf: 16
     preset: fast
     pix_fmt: yuv420p
-  # Final YouTube master.
+  # Final YouTube master. `medium` (not `slow`) — YouTube re-encodes on
+  # ingest anyway, so `slow`'s extra ~2x encode time buys little visible
+  # quality in the delivered stream; `medium` roughly halves master time
+  # on a 17-minute programme while staying at the same CRF.
   master:
     vcodec: libx264
     crf: 18
-    preset: slow
+    preset: medium
     profile: high
     level: "4.2"
     pix_fmt: yuv420p
@@ -45,6 +48,23 @@ encoding:
     keyint_min: 15
     bf: 2
     sc_threshold: 0
+    movflags: "+faststart"
+    color_primaries: bt709
+    color_trc: bt709
+    colorspace: bt709
+  # `ytedit render --master --fast`: hardware-encoded master, several times
+  # faster than even the x264 `medium` tier at some quality cost the
+  # YouTube re-encode mostly absorbs. Falls back to the `master` tier when
+  # h264_videotoolbox is not available on this machine.
+  master_fast:
+    vcodec: h264_videotoolbox
+    bitrate: 24M
+    maxrate: 30M
+    bufsize: 60M
+    profile: high
+    pix_fmt: yuv420p
+    gop: 15
+    bf: 2
     movflags: "+faststart"
     color_primaries: bt709
     color_trc: bt709
@@ -83,6 +103,15 @@ audio:
   # Narration cleanup applied to the program voice bus before loudnorm
   # (playbook rule 17): none | light (highpass + compressor) | full (+ afftdn + deesser).
   voice_cleanup: light
+
+# `ytedit voice` (ytedit/ai/voice.py): cleanup of the user's own narration pickups
+# recorded at home (voice/incoming/*.wav -> voice/<label>.wav). Reuses
+# pacing.speech_pad_before/after (0.3s/0.45s) to trim to speech.
+voice:
+  # An internal pause longer than this is shortened, not removed outright —
+  # keeps the pickup sounding like natural speech instead of a splice.
+  max_pause: 0.8
+  pause_keep: 0.5
 
 ducking:
   amount_db: -12
@@ -194,6 +223,10 @@ pacing:
   sentence_extend_max: 8.0     # most a sentence snap may add to one side of a cut
   # Audio ledger dedupe (ytedit/ai/ledger.py): no audio may ever play twice.
   audio_dupe_tolerance: 0.25   # overlap under this is not worth fixing
+  # `ytedit tidy` (ytedit/ai/tidy.py) re-runs pad/snap -> overlay -> dedupe ->
+  # anchors until a full round changes nothing, up to this many rounds, then
+  # stops and reports whichever changes are still oscillating.
+  tidy_max_rounds: 4
   # Structural beats (seconds). "end-20" = 20 s before the end.
   markers:
     - { at: 0.0, label: hook }
@@ -202,6 +235,18 @@ pacing:
     - { at: 180.0, label: re-engagement-1 }
     - { at: 360.0, label: re-engagement-2 }
     - { at: -20.0, label: payoff-cta }   # negative = relative to the end
+
+render:
+  # Concurrent ffmpeg processes for the segment pass. Each ffmpeg already
+  # uses several threads internally, so on an 8-core machine 3 keeps the
+  # cores busy without thrashing; raise it on a bigger box.
+  workers: 3
+  # Disk-space guard before a render starts: refuse when free space is under
+  # disk_headroom_factor x (programme seconds x mb_per_second) — the segment
+  # cache, the joined intermediates and the final export all coexist on disk
+  # for a while during a render.
+  mb_per_second: 4
+  disk_headroom_factor: 2
 
 ingest:
   extensions: [".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".M4V"]

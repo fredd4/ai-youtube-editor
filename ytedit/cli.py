@@ -566,12 +566,61 @@ def render(
     slug: str = typer.Argument(..., help="Project slug."),
     preview: bool = typer.Option(False, "--preview", help="Fast 720p preview render."),
     master: bool = typer.Option(False, "--master", help="Full-quality master export."),
+    no_music: bool = typer.Option(
+        False, "--no-music", help="Ignore music cues for this render (timeline untouched)."
+    ),
+    no_voice: bool = typer.Option(
+        False, "--no-voice", help="Ignore voice pickups for this render, symmetrically."
+    ),
+    fast: bool = typer.Option(
+        False, "--fast",
+        help="Master only: hardware-encoded (h264_videotoolbox) tier, several times "
+        "faster than the default libx264 tier at some quality cost.",
+    ),
 ) -> None:
     """Render the timeline to a preview or a master file."""
     fn = _lazy("ytedit.media.render", "render")
     if fn is None:
         _not_implemented("render", "ytedit.media.render")
-    fn(_load(slug), preview=preview, master=master or not preview)
+    fn(
+        _load(slug), preview=preview, master=master or not preview,
+        no_music=no_music, no_voice=no_voice, fast=fast,
+    )
+
+
+@app.command()
+def clean(
+    slug: str = typer.Argument(..., help="Project slug."),
+    segments_only: bool = typer.Option(
+        False, "--segments", help="Remove unreferenced cached segments only."
+    ),
+    intermediates_only: bool = typer.Option(
+        False, "--intermediates", help="Remove renders/ intermediates only."
+    ),
+    all_: bool = typer.Option(
+        False, "--all", help="Remove both intermediates and unreferenced segments (default)."
+    ),
+) -> None:
+    """Free disk space: drop render intermediates and unreferenced cached segments.
+
+    With no flags (or ``--all``) both are removed. ``--segments``/
+    ``--intermediates`` restrict the sweep to just that one. Never touches
+    ``media/``, ``input/`` or ``exports/``.
+    """
+    from .media.render import clean as run_clean
+
+    project = _load(slug)
+    only_one = segments_only or intermediates_only
+    do_segments = segments_only or all_ or not only_one
+    do_intermediates = intermediates_only or all_ or not only_one
+
+    result = run_clean(project, segments=do_segments, intermediates=do_intermediates)
+    freed_mb = result["freed_bytes"] / 1_048_576
+    console.print(
+        f"[green]freed {freed_mb:.1f} MB[/] — "
+        f"{len(result['removed_intermediates'])} intermediate file(s), "
+        f"{len(result['removed_segments'])} segment file(s)"
+    )
 
 
 @app.command()
@@ -602,6 +651,58 @@ def serve(
     if fn is None:
         _not_implemented("serve", "server.app")
     fn(host=host, port=port)
+
+
+@app.command()
+def voice(
+    slug: str = typer.Argument(..., help="Project slug."),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Re-process every manifest entry (ignore the incoming-state cache) and "
+        "overwrite a human-edited timeline instead of writing a draft.",
+    ),
+) -> None:
+    """Clean up narration pickups from voice/incoming/ and place them on the timeline.
+
+    Reads voice/incoming/manifest.yaml (written as a draft on the first run if
+    missing), transcribes each WAV, cuts retakes/instructions/stutters/pauses,
+    trims to speech, and places the result at its narration request's beat or
+    an explicit anchor — growing the muted picture underneath (or pulling in
+    manifest broll_pool clips) when the pickup runs long. See
+    voice/incoming/report.md for what happened to each file.
+    """
+    from .ai.voice import VoiceError, run_voice
+
+    project = _load(slug)
+    try:
+        result = run_voice(project, force=force)
+    except VoiceError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+    for row in result["rows"]:
+        style = {
+            "ok": "green", "skipped (cached)": "dim", "unassigned": "yellow",
+            "unplaced": "yellow", "overlap_unresolved": "yellow", "error": "red",
+        }.get(row.get("status", ""), "white")
+        console.print(f"[{style}]{row.get('status', '?')}[/] {row['file']} ({row.get('label', '-')})")
+        if row.get("error"):
+            console.print(f"  [red]{row['error']}[/]")
+        if row.get("placement"):
+            console.print(f"  [dim]{row['placement']}[/]")
+        for change in row.get("overlap") or []:
+            console.print(f"  [dim]- {change}[/]")
+
+    console.print(f"[bold]report:[/] {result['report']}")
+    for issue in result.get("issues") or []:
+        console.print(f"[yellow]![/] {issue}")
+    if result["written"]:
+        console.print(f"[green]wrote[/] {result['written']} (backup: {result['backup']})")
+        if result["edited_by_human"] and not force:
+            console.print(
+                "[yellow]timeline.json is human-edited[/] — review the draft, "
+                "or re-run with --force"
+            )
 
 
 def main() -> None:

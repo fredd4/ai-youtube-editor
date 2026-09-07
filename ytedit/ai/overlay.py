@@ -18,6 +18,16 @@ threshold the sentence snapping uses), and the cutaways must be long enough to
 cover the gap between them. An ``A2`` that jumps somewhere else in the clip —
 the planner deliberately dropping a whole sentence — is left exactly as it is.
 
+Before committing to a rewrite, the stretch of ``A``'s clip the cutaways would
+carry is checked against :func:`ytedit.ai.ledger.committed_audio_ranges` for
+everything *earlier* in the track: if that stretch is already claimed there
+(typically an ``audio_from`` :mod:`ytedit.ai.ledger` muted in a previous
+``ytedit tidy`` round for being a duplicate), the whole run is left as it is
+rather than re-creating the exact hand-off the ledger will just remove again.
+Reassigning a cutaway's ``audio_from`` (or moving ``A2``) to the value it
+already has is a no-op — nothing is logged and nothing counts as a change —
+so a converged timeline stays quiet on a repeat run.
+
 Dropping or shortening a segment moves everything after it, so captions, music
 cues and voice pickups are re-timed with the same machinery the padding pass
 uses (:func:`ytedit.ai.tidy._shift_map`).
@@ -31,6 +41,7 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
+from ytedit.ai.ledger import _consumed_overlap, committed_audio_ranges
 from ytedit.ai.tidy import Word, _retime_absolute_tracks, _shift_map, load_words
 from ytedit.config import Settings
 from ytedit.log import get_logger
@@ -91,6 +102,7 @@ def overlay_cutaways(
     cfg = settings or project.settings
     gap_max = max(0.0, float(cfg.get("pacing.sentence_gap_max", 1.2)))
     min_shot = max(0.0, float(cfg.get("pacing.min_shot_seconds", 0.8)))
+    tolerance = max(0.0, float(cfg.get("pacing.audio_dupe_tolerance", 0.25)))
 
     clips = project.load_state().get("clips", {})
     words_cache: dict[str, list[Word]] = {}
@@ -178,14 +190,46 @@ def overlay_cutaways(
         # Never start the narration handoff behind what an earlier, unrelated
         # pattern already committed for this clip.
         cursor = max(a.out, consumed.get(a.clip, 0.0))
+
+        # Guard against re-creating an audio_from the ledger already removed
+        # (in an earlier ``ytedit tidy`` round) for being a duplicate: if the
+        # stretch this run would hand to the cutaways is already claimed by
+        # something earlier in the track (another segment's own audio,
+        # another audio_from, or a voice pickup), leave the run exactly as it
+        # is — muted stays muted — instead of flip-flopping with
+        # dedupe_audio every round. Only *earlier* claims count: a later
+        # segment reappearing over this same stretch is the "stray
+        # reappearance" case handled above, which yields to this pattern, not
+        # the other way round.
+        committed = committed_audio_ranges(timeline, video_slice=slice(0, i)).get(a.clip, [])
+        already_used = _consumed_overlap(committed, cursor, cursor + covered)
+        if already_used > tolerance + _EPS:
+            log.debug(
+                "%s → %s: %.2fs of the %.2fs %s stretch this run would carry is "
+                "already used earlier in the track — left as is",
+                a.id, a2.id, already_used, covered, a.clip,
+            )
+            i = j
+            continue
+
+        pattern_changed = False
         for cutaway in run:
             end = round(cursor + cutaway.duration, 3)
-            cutaway.audio_from = AudioFrom(clip=a.clip, **{"in": round(cursor, 3)}, out=end)
-            cutaway.mute_source = False
-            changes.append(
-                f"{cutaway.id} audio_from {a.clip} {_fmt(cutaway.audio_from.in_)}→"
-                f"{_fmt(end)} (narration continues under the cutaway)"
+            already_set = (
+                not cutaway.mute_source
+                and cutaway.audio_from is not None
+                and cutaway.audio_from.clip == a.clip
+                and abs(cutaway.audio_from.in_ - cursor) <= _EPS
+                and abs(cutaway.audio_from.out - end) <= _EPS
             )
+            if not already_set:
+                cutaway.audio_from = AudioFrom(clip=a.clip, **{"in": round(cursor, 3)}, out=end)
+                cutaway.mute_source = False
+                changes.append(
+                    f"{cutaway.id} audio_from {a.clip} {_fmt(cutaway.audio_from.in_)}→"
+                    f"{_fmt(end)} (narration continues under the cutaway)"
+                )
+                pattern_changed = True
             cursor = end
 
         new_in = round(cursor, 3)
@@ -211,33 +255,42 @@ def overlay_cutaways(
             # already-overlaid chain) leaves nothing to extend into, but that
             # is a reason to leave ``last`` exactly as it is, not to shorten it.
             new_out = max(new_out, last.out)
-            changes.append(
-                f"{last.id} out {_fmt(last.out)}→{_fmt(new_out)} and {a2.id} dropped "
-                f"({_fmt((a2.out - new_in) / speed)}s left of it is under the "
-                f"{min_shot:.2f}s minimum shot)"
-            )
-            last.out = round(new_out, 3)
+            if abs(new_out - last.out) > 1e-3:
+                changes.append(
+                    f"{last.id} out {_fmt(last.out)}→{_fmt(new_out)} and {a2.id} dropped "
+                    f"({_fmt((a2.out - new_in) / speed)}s left of it is under the "
+                    f"{min_shot:.2f}s minimum shot)"
+                )
+                last.out = round(new_out, 3)
+                pattern_changed = True
             capped_audio_out = min(last.audio_from.in_ + last.duration, a2.out)
             if capped_audio_out > last.audio_from.in_ + _EPS:
-                last.audio_from.out = round(capped_audio_out, 3)
+                if abs(capped_audio_out - last.audio_from.out) > 1e-3:
+                    last.audio_from.out = round(capped_audio_out, 3)
+                    pattern_changed = True
             # else: capping to A2.out would make the range invalid — the run's
             # earlier cutaways already used more of the clip than the
             # planner's sentence end allows. Leave ``audio_from.out`` at what
             # the main loop above computed; ``ytedit.ai.ledger`` catches and
             # resolves any resulting overlap as a last resort.
             consumed[a.clip] = max(consumed.get(a.clip, 0.0), last.audio_from.out)
-            dropped.add(id(a2))
+            if id(a2) not in dropped:
+                dropped.add(id(a2))
+                pattern_changed = True
             i = j + 1
         else:
-            changes.append(
-                f"{a2.id} in {_fmt(a2.in_)}→{_fmt(new_in)} "
-                f"(resumes after {_fmt(covered)}s of overlay cutaway)"
-            )
-            a2.in_ = new_in
+            if abs(a2.in_ - new_in) > 1e-3:
+                changes.append(
+                    f"{a2.id} in {_fmt(a2.in_)}→{_fmt(new_in)} "
+                    f"(resumes after {_fmt(covered)}s of overlay cutaway)"
+                )
+                a2.in_ = new_in
+                pattern_changed = True
             consumed[a.clip] = max(consumed.get(a.clip, 0.0), new_in)
             i = j
-        patterns += 1
-        mutations += 1
+        if pattern_changed:
+            patterns += 1
+            mutations += 1
 
     if mutations:
         if dropped:

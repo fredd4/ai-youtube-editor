@@ -137,6 +137,31 @@ Propozycja: "Trzy godziny pociągiem później byłem już w zupełnie innym mie
 
 the user records these himself (phone/mic, whatever he already uses for on-camera audio) and drops the files into `voice/`. **ElevenLabs voice clone is reserved for small pickups only** (a missed word, a re-recorded line that must match an existing take exactly) — never generate a synthetic version of a request the user hasn't recorded, and never substitute a full synthetic narration track for his own voice without asking first (see AI disclosure policy, §8, and the cost gate, §9).
 
+### 5.1 Turning a recorded pickup into a placed cut (`ytedit voice`)
+
+the user doesn't drop his recordings straight into `voice/` — he records narration requests and any extra "gap pickups" on his phone at home and drops the raw WAVs into **`voice/incoming/`**. `ytedit voice <slug>` transcribes each one, cuts it down to the usable take, and places it on the timeline; this replaces what used to be scratch-script work.
+
+**Manifest** (`voice/incoming/manifest.yaml`) maps each WAV to where it goes. If the file is missing, `ytedit voice` writes a draft listing every WAV in `voice/incoming/` with `request: null` and stops — fill it in, then re-run. One entry per file:
+
+```yaml
+- file: 20260906-081840.wav
+  request: n001                # a narration request id from plan/edit_plan.json
+- file: 20260906-081902.wav
+  anchor: s073                 # explicit video segment id instead of a request
+  offset: 0.0                  # seconds after that segment's start
+  label: chinchero-street party      # output basename -> voice/chinchero-street party.wav
+  cuts: [[2.98, 7.16]]         # manual extra cuts, source seconds (retakes the automatic pass missed)
+  keep_takes: last             # or `first`, when the better attempt was recorded first
+  broll_pool:                  # muted filler if the pickup outruns the picture under it
+    - [c022, 4.0, 7.5]         # [clip, in, out] triples, tried in order
+```
+
+**What it does**, per file: transcribes with ElevenLabs (word timestamps, cost logged under stage `voice`); splits into sentences and drops any that are editor instructions ("to wstaw...", "użyj...", "wytnij...") or a retake of a later attempt in the same recording (word-overlap match, same rule as the sentence catalogue but tuned looser for a home recording's phrasing); cuts stutters (a cut-off word, an immediate repeat) and shortens pauses over `voice.max_pause` (0.8 s default) to `voice.pause_keep` (0.5 s); trims to speech with the usual air (`pacing.speech_pad_before`/`_after`). The result is one wav (`voice/<label>.wav`) plus a sidecar `voice/<label>.json` (source, kept ranges, final text).
+
+**Placement:** a `request` id is resolved against its narration request's `place_after_segment` text best-effort (an exact segment id in the text, else the first segment of the clip it names, else the segment at the beat marker it names) and anchored right after that segment; an explicit `anchor`/`offset` is used as given. When the pickup runs longer than the muted/ambient picture underneath it, the stage grows the last such segment (never past its own clip's duration) and, if still short, inserts muted B-roll from `broll_pool` until covered — it never lets narration run into a segment that has its own audio.
+
+**You still review it** — `voice/incoming/report.md` lists every file's cuts (with reasons), final duration, and placement; anything `unplaced` (an unresolved request) or `overlap_unresolved` (ran out of `broll_pool`) needs a manual `ytedit voice-anchor` or a manifest fix, not a silent skip. Re-running is safe: an unchanged WAV is skipped (tracked by hash in `voice/incoming/state.json`), and a changed one replaces the same timeline item rather than duplicating it.
+
 ---
 
 ## 6. Music & audio rules

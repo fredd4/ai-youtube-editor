@@ -21,7 +21,7 @@ from fixtures.make_fixtures import build_all
 from ytedit.media import render as R
 from ytedit.media.ingest import ingest
 from ytedit.project import Project
-from ytedit.timeline import AudioFrom, Timeline
+from ytedit.timeline import AudioFrom, Timeline, VoiceItem
 
 #: Programme length of :func:`timeline_document` (3.0 + 3.0 − 0.5 xfade + 2.0).
 EXPECTED_DURATION: float = 7.5
@@ -750,3 +750,195 @@ def test_a_missing_audio_from_source_is_a_render_error(project: Project) -> None
     with pytest.raises(R.RenderError, match="audio_from clip 'c999'"):
         R.render_segment(project, timeline, timeline.tracks.video[0], R.Canvas(1920, 1080, 30),
                          "preview")
+
+
+# ----------------------------------------------------------------------
+# pre-flight: catch a bad range / missing file before any ffmpeg work
+# ----------------------------------------------------------------------
+def test_preflight_catches_an_out_of_range_segment_and_a_missing_music_file(
+    tmp_path: Path,
+) -> None:
+    project = build_render_project(tmp_path, slug="preflight-test")
+    timeline = Timeline.load(project.timeline_file)
+
+    # c003 (silent.mp4) is a 4 s fixture; push its cut well past that.
+    timeline.tracks.video[2] = timeline.tracks.video[2].model_copy(update={"out": 12.0})
+    timeline.tracks.music[0] = timeline.tracks.music[0].model_copy(
+        update={"file": "music/missing.wav"}
+    )
+
+    issues = R.preflight(project, timeline)
+    assert any("exceeds clip duration" in i for i in issues), issues
+    assert any("missing.wav" in i for i in issues), issues
+
+    timeline.save(project.timeline_file)
+    with pytest.raises(R.RenderError) as exc_info:
+        R.render(project, preview=True)
+    message = str(exc_info.value)
+    assert "exceeds clip duration" in message
+    assert "missing.wav" in message
+
+
+def test_preflight_catches_a_missing_normalized_source(project: Project) -> None:
+    # c001 is known to the registry but was never actually ingested.
+    project.add_clip({"id": "c001", "order": 1, "duration": 10.0})
+    timeline = Timeline.model_validate(
+        {"tracks": {"video": [{"id": "s001", "clip": "c001", "in": 0.0, "out": 2.0}]}}
+    )
+    issues = R.preflight(project, timeline)
+    assert any("no normalized source" in i for i in issues), issues
+
+
+def test_no_music_flag_renders_despite_a_missing_music_file(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="no-music-test")
+    timeline = Timeline.load(project.timeline_file)
+    timeline.tracks.music[0] = timeline.tracks.music[0].model_copy(
+        update={"file": "music/missing.wav"}
+    )
+    timeline.save(project.timeline_file)
+
+    with pytest.raises(R.RenderError, match="missing.wav"):
+        R.render(project, preview=True)
+
+    out = R.render(project, preview=True, no_music=True)
+    assert out.exists() and out.stat().st_size > 10_000
+    assert project.load_state()["stages"]["render"]["status"] == "done"
+
+
+def test_no_voice_flag_renders_despite_a_missing_voice_file(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="no-voice-test")
+    timeline = Timeline.load(project.timeline_file)
+    timeline.tracks.voice.append(
+        VoiceItem(id="v001", file="voice/missing.wav", at=0.0, gain_db=0.0)
+    )
+    timeline.save(project.timeline_file)
+
+    with pytest.raises(R.RenderError, match="missing.wav"):
+        R.render(project, preview=True)
+
+    out = R.render(project, preview=True, no_voice=True)
+    assert out.exists()
+
+
+# ----------------------------------------------------------------------
+# parallel segment pass
+# ----------------------------------------------------------------------
+def test_parallel_segment_pass_matches_sequential_output(tmp_path: Path) -> None:
+    """render.workers > 1 must produce the same segment files as workers=1."""
+    project = build_render_project(tmp_path, slug="workers-test")
+    timeline = Timeline.load(project.timeline_file)
+    canvas = R.canvas_for(timeline, preview=True)
+
+    sequential = R.render_segments(project, timeline, canvas, "preview", workers=1)
+    assert len(sequential) == 3
+    baseline = [(p, p.stat().st_size, float(probe(p)["format"]["duration"])) for p in sequential]
+
+    # Cache keys don't depend on worker count, so a second pass would just
+    # hit the cache; move the files aside so the parallel pass re-renders them.
+    for path, _size, _duration in baseline:
+        path.rename(path.with_name(path.stem + ".baseline" + path.suffix))
+
+    parallel = R.render_segments(project, timeline, canvas, "preview", workers=3)
+    assert [p.name for p, _s, _d in baseline] == [p.name for p in parallel]
+    for (path, size, duration), rendered_path in zip(baseline, parallel):
+        assert rendered_path.exists()
+        assert rendered_path.stat().st_size == size, path.name
+        assert float(probe(rendered_path)["format"]["duration"]) == pytest.approx(
+            duration, abs=1e-6
+        )
+
+
+def test_render_segments_reports_progress_in_completion_order(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="progress-test")
+    timeline = Timeline.load(project.timeline_file)
+    canvas = R.canvas_for(timeline, preview=True)
+
+    calls: list[tuple[int, int, str]] = []
+    R.render_segments(
+        project, timeline, canvas, "preview", workers=3,
+        on_done=lambda completed, total, seg: calls.append((completed, total, seg.id)),
+    )
+    assert len(calls) == 3
+    assert [c[0] for c in calls] == [1, 2, 3]
+    assert all(c[1] == 3 for c in calls)
+    assert {c[2] for c in calls} == {"s001", "s002", "s003"}
+
+
+def test_a_bad_segment_fails_precisely_with_multiple_workers(project: Project) -> None:
+    """Every segment here has no normalized source; the failure must still be precise."""
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "s001", "clip": "c001", "in": 0.0, "out": 2.0},
+        {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0},
+        {"id": "s003", "clip": "c003", "in": 0.0, "out": 2.0},
+    ]}})
+    with pytest.raises(R.RenderError, match=r"missing normalized source"):
+        R.render_segments(project, timeline, R.Canvas(640, 360, 30), "preview", workers=3)
+
+
+# ----------------------------------------------------------------------
+# cache hygiene: `ytedit clean`
+# ----------------------------------------------------------------------
+def test_clean_removes_only_unreferenced_segments_and_all_intermediates(
+    tmp_path: Path,
+) -> None:
+    project = build_render_project(tmp_path, slug="clean-test")
+    R.render(project, preview=True)
+
+    seg_dir = project.renders_dir / "segments"
+    referenced_before = sorted(seg_dir.glob("*.mp4"))
+    assert referenced_before, "expected the preview render to have cached segments"
+
+    stale = seg_dir / "deadbeefdeadbeef1234.mp4"
+    stale.write_bytes(b"stale segment from a since-changed timeline")
+
+    assert (project.renders_dir / "program_video.mp4").exists()
+    assert (project.renders_dir / "duck.cmd").exists()
+
+    result = R.clean(project)
+
+    assert not stale.exists()
+    assert all(p.exists() for p in referenced_before), "a still-referenced segment was removed"
+    assert not (project.renders_dir / "program_video.mp4").exists()
+    assert not (project.renders_dir / "duck.cmd").exists()
+    assert result["freed_bytes"] > 0
+    assert stale.name in result["removed_segments"]
+    assert "program_video.mp4" in result["removed_intermediates"]
+    assert "duck.cmd" in result["removed_intermediates"]
+
+
+def test_clean_segments_only_leaves_intermediates_untouched(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="clean-segments-test")
+    R.render(project, preview=True)
+    stale = project.renders_dir / "segments" / "deadbeefdeadbeef5678.mp4"
+    stale.write_bytes(b"stale")
+
+    result = R.clean(project, segments=True, intermediates=False)
+
+    assert not stale.exists()
+    assert (project.renders_dir / "program_video.mp4").exists()
+    assert result["removed_intermediates"] == []
+
+
+def test_clean_intermediates_only_leaves_segments_untouched(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="clean-intermediates-test")
+    R.render(project, preview=True)
+    stale = project.renders_dir / "segments" / "deadbeefdeadbeef9999.mp4"
+    stale.write_bytes(b"stale")
+
+    result = R.clean(project, segments=False, intermediates=True)
+
+    assert stale.exists()
+    assert not (project.renders_dir / "program_video.mp4").exists()
+    assert result["removed_segments"] == []
+
+
+def test_clean_never_touches_media_input_or_exports(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="clean-safety-test")
+    R.render(project, master=True)
+    master = next(project.exports_dir.glob("master_*.mp4"))
+    source = project.source_path("c001")
+
+    R.clean(project)
+
+    assert master.exists()
+    assert source.exists()

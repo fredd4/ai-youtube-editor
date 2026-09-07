@@ -60,8 +60,10 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -222,13 +224,20 @@ def build_time_map(timeline: Timeline) -> Callable[[float], float]:
 # ----------------------------------------------------------------------
 # encoder presets
 # ----------------------------------------------------------------------
-def video_encoder_args(settings: Settings, mode: str, fps: int) -> list[str]:
+def video_encoder_args(settings: Settings, mode: str, fps: int, fast: bool = False) -> list[str]:
     """Return the ``-c:v ...`` arguments for the final encode.
 
     Args:
         settings: Project settings (``encoding.master`` / ``encoding.preview``).
         mode: ``"master"`` or ``"preview"``.
         fps: Output frame rate (drives the GOP length).
+        fast: For ``mode == "master"``, use the ``encoding.master_fast``
+            hardware-encoder tier (``h264_videotoolbox``) instead of the
+            default ``libx264`` tier — a full-resolution export in a fraction
+            of the time, at some quality cost YouTube's own re-encode mostly
+            absorbs. Falls back to the default tier when the hardware encoder
+            is not available on this machine. Ignored for previews (already
+            hardware-encoded when possible).
 
     Returns:
         A flat argument list.
@@ -248,6 +257,29 @@ def video_encoder_args(settings: Settings, mode: str, fps: int) -> list[str]:
             "-preset", str(enc.get("fallback_preset", "veryfast")),
             "-pix_fmt", str(enc.get("pix_fmt", "yuv420p")),
         ]
+
+    if fast:
+        enc = settings.encoding("master_fast")
+        vcodec = str(enc.get("vcodec", "h264_videotoolbox"))
+        if has_encoder(vcodec):
+            gop = int(enc.get("gop", max(1, fps // 2)))
+            return [
+                "-c:v", vcodec,
+                "-b:v", str(enc.get("bitrate", "24M")),
+                "-maxrate", str(enc.get("maxrate", "30M")),
+                "-bufsize", str(enc.get("bufsize", "60M")),
+                "-profile:v", str(enc.get("profile", "high")),
+                "-pix_fmt", str(enc.get("pix_fmt", "yuv420p")),
+                "-g", str(gop),
+                "-bf", str(enc.get("bf", 2)),
+                "-color_primaries", str(enc.get("color_primaries", "bt709")),
+                "-color_trc", str(enc.get("color_trc", "bt709")),
+                "-colorspace", str(enc.get("colorspace", "bt709")),
+            ]
+        log.warning(
+            "master --fast requested but %s is not available on this machine; "
+            "falling back to the default x264 tier", vcodec,
+        )
 
     enc = settings.encoding("master")
     gop = int(enc.get("gop", max(1, fps // 2)))
@@ -702,6 +734,152 @@ def render_segment(
     return out
 
 
+def render_segments(
+    project: Project,
+    timeline: Timeline,
+    canvas: Canvas,
+    mode: str,
+    force: bool = False,
+    workers: int = 1,
+    on_done: Callable[[int, int, VideoSegment], None] | None = None,
+) -> list[Path]:
+    """Render every video segment, optionally in parallel.
+
+    A cache hit still costs nothing but a stat + probe (see
+    :func:`render_segment`/:func:`_segment_is_valid`) — it never spawns
+    ffmpeg — so pointing several workers at an already-cached timeline is
+    harmless. Each ffmpeg invocation already uses several threads internally,
+    so ``workers`` past 3-4 stops paying off on most machines even though the
+    OS has more cores; it defaults to the ``render.workers`` config key.
+
+    Args:
+        project: Owning project.
+        timeline: The timeline (for ``mute_ranges``).
+        canvas: Output geometry.
+        mode: ``"master"`` or ``"preview"``.
+        force: Ignore the segment cache.
+        workers: Max concurrent ffmpeg processes (1 = sequential, in order).
+        on_done: Called as ``(completed, total, segment)`` after each segment
+            finishes, in completion order (not necessarily timeline order)
+            when ``workers > 1``.
+
+    Returns:
+        Rendered segment paths, in timeline order.
+
+    Raises:
+        RenderError: From whichever segment fails first; the error names the
+            segment id, so a failure deep into a long programme is precise
+            about which cut is the problem.
+    """
+    segs = list(timeline.tracks.video)
+    total = len(segs)
+    results: list[Path | None] = [None] * total
+
+    if workers <= 1 or total <= 1:
+        for index, seg in enumerate(segs):
+            log.info("segment %s (%s %.2f-%.2f)", seg.id, seg.clip, seg.in_, seg.out)
+            results[index] = render_segment(project, timeline, seg, canvas, mode, force=force)
+            if on_done is not None:
+                on_done(index + 1, total, seg)
+        return results  # type: ignore[return-value]
+
+    log.info("rendering %d segment(s) with %d worker(s)", total, workers)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(render_segment, project, timeline, seg, canvas, mode, force): index
+            for index, seg in enumerate(segs)
+        }
+        try:
+            for future in as_completed(futures):
+                index = futures[future]
+                results[index] = future.result()
+                completed += 1
+                if on_done is not None:
+                    on_done(completed, total, segs[index])
+        except BaseException:
+            for pending in futures:
+                pending.cancel()
+            raise
+    return results  # type: ignore[return-value]
+
+
+def preflight(
+    project: Project,
+    timeline: Timeline,
+    no_music: bool = False,
+    no_voice: bool = False,
+) -> list[str]:
+    """Collect every problem that would make this render fail, before ffmpeg runs.
+
+    A long programme rendered segment by segment can otherwise fail 20 minutes
+    in on segment 179 of 190 because one ``out`` ran past its clip's duration.
+    This runs :meth:`Timeline.validate` (structural problems, plus every
+    segment's and ``audio_from``'s range checked against its clip's known
+    duration) and additionally confirms every referenced clip actually has a
+    normalized source on disk — the one thing a JSON-only check cannot see.
+
+    Args:
+        project: Owning project.
+        timeline: Timeline to check.
+        no_music: This render will ignore music cues (``--no-music``), so a
+            problem confined to the music track is not a reason to refuse.
+        no_voice: Symmetric for the voice track (``--no-voice``).
+
+    Returns:
+        Every issue found, in no particular order; empty means go ahead.
+    """
+    issues = timeline.validate(project, skip_music=no_music, skip_voice=no_voice)
+
+    checked: set[str] = set()
+    for seg in timeline.tracks.video:
+        clips = [("clip", seg.clip)]
+        if seg.audio_from is not None:
+            clips.append(("audio_from clip", seg.audio_from.clip))
+        for kind, clip in clips:
+            if clip in checked:
+                continue
+            checked.add(clip)
+            if not project.source_path(clip).exists():
+                issues.append(
+                    f"{seg.id}: {kind} {clip!r} has no normalized source at "
+                    f"{project.rel(project.source_path(clip))}"
+                )
+    return issues
+
+
+def _check_disk_space(project: Project, duration: float, settings: Settings) -> None:
+    """Refuse to start a render likely to fill the disk partway through.
+
+    Rough sizing: ``render.mb_per_second`` (default 20, generous enough for a
+    1080p master) times the programme length, times a
+    ``render.disk_headroom_factor`` (default 3) safety margin over that — the
+    segment cache, the joined intermediates and the final export all exist on
+    disk at once for a while during a render.
+
+    Raises:
+        RenderError: When free space on the renders volume is under the
+            computed threshold.
+    """
+    cfg = settings.section("render")
+    mb_per_second = float(cfg.get("mb_per_second", 20))
+    factor = float(cfg.get("disk_headroom_factor", 3))
+    expected = max(0.0, duration) * mb_per_second * 1_048_576
+    required = expected * factor
+    usage = shutil.disk_usage(project.renders_dir)
+    log.info(
+        "disk: %.2f GB free (render needs ~%.2f GB: %.0fs programme x %.0f MB/s x %.0fx headroom)",
+        usage.free / 1_073_741_824, required / 1_073_741_824, duration, mb_per_second, factor,
+    )
+    if usage.free < required:
+        raise RenderError(
+            f"only {usage.free / 1_073_741_824:.2f} GB free on disk but this render needs "
+            f"roughly {required / 1_073_741_824:.2f} GB ({factor:.0f}x headroom over the "
+            f"~{expected / 1_073_741_824:.2f} GB expected programme size); free up space "
+            f"(e.g. 'ytedit clean {project.slug}') or move the project, then retry"
+        )
+
+
 # ----------------------------------------------------------------------
 # pass 2: join
 # ----------------------------------------------------------------------
@@ -895,6 +1073,8 @@ def build_audio_bus(
     duration: float,
     to_render: Callable[[float], float],
     two_pass: bool,
+    skip_music: bool = False,
+    skip_voice: bool = False,
 ) -> Path:
     """Mix voice, music and sfx over the source bus and normalize the result.
 
@@ -905,6 +1085,10 @@ def build_audio_bus(
         duration: Programme length in render seconds.
         to_render: Timeline-to-render time map.
         two_pass: Use two-pass loudnorm (masters) instead of one (previews).
+        skip_music: Ignore every music cue (``--no-music``) — the timeline is
+            not modified, the cues simply do not reach the mix this run.
+        skip_voice: Ignore every voice pickup (``--no-voice``), symmetrically;
+            it also stops extending the automatic-duck speech ranges.
 
     Returns:
         ``renders/final_audio.wav``.
@@ -922,12 +1106,17 @@ def build_audio_bus(
         log.info("voice cleanup (%s)", cleanup)
         ff("-i", str(program_audio), "-af", chain, "-c:a", "pcm_s24le", str(bus))
 
+    if skip_voice and timeline.tracks.voice:
+        log.info("--no-voice: ignoring %d voice pickup(s)", len(timeline.tracks.voice))
+    if skip_music and timeline.tracks.music:
+        log.info("--no-music: ignoring %d music cue(s)", len(timeline.tracks.music))
+
     # Voice pickups and sfx ride the mix un-ducked; music is ducked under
     # speech. Narration pickups also *create* speech, so they extend the
     # speech ranges that drive automatic ducking.
     voice_items: list[dict[str, Any]] = []
     voice_spans: list[tuple[float, float]] = []
-    for item in timeline.tracks.voice:
+    for item in ([] if skip_voice else timeline.tracks.voice):
         path = project.path / item.file
         length = audio_mod.audio_duration(path)
         at = to_render(item.at)
@@ -946,9 +1135,8 @@ def build_audio_bus(
             {"file": str(path), "at": at, "end": end, "gain_db": float(item.gain_db)}
         )
 
-    needs_speech = any(
-        cue.duck.mode == "auto" for cue in timeline.tracks.music
-    )
+    music_cues = [] if skip_music else timeline.tracks.music
+    needs_speech = any(cue.duck.mode == "auto" for cue in music_cues)
     speech: list[tuple[float, float]] = []
     if needs_speech:
         raw = speech_ranges_from_transcripts(
@@ -962,7 +1150,7 @@ def build_audio_bus(
         log.info("speech ranges for ducking: %d", len(speech))
 
     music_items: list[dict[str, Any]] = []
-    for cue in timeline.tracks.music:
+    for cue in music_cues:
         duck = cue.duck
         ranges: list[tuple[float, float]] = []
         if duck.mode == "auto":
@@ -1131,6 +1319,9 @@ def render(
     out: Path | str | None = None,
     progress_cb: Callable[[Progress], None] | None = None,
     force_segments: bool = False,
+    no_music: bool = False,
+    no_voice: bool = False,
+    fast: bool = False,
 ) -> Path:
     """Render ``plan/timeline.json`` to a preview or a YouTube master.
 
@@ -1138,7 +1329,7 @@ def render(
         project: Project to render.
         preview: Fast 720p render with the hardware encoder and single-pass
             loudness normalization.
-        master: Full-quality ``libx264 -crf 18 -preset slow`` export with
+        master: Full-quality ``libx264 -crf 18 -preset medium`` export with
             two-pass loudness normalization. Ignored when ``preview`` is set;
             when neither flag is given a preview is rendered.
         timeline_path: Timeline to render (default ``plan/timeline.json``).
@@ -1146,12 +1337,20 @@ def render(
         progress_cb: Receives :class:`~ytedit.media.ffmpeg.Progress` blocks from
             the final encode. When omitted a rich progress bar is drawn.
         force_segments: Ignore the segment cache.
+        no_music: Ignore every music cue for this render (the timeline file is
+            not modified). Useful for a quick cut review before music beds
+            exist — a missing cue file no longer blocks the render.
+        no_voice: Ignore every voice pickup for this render, symmetrically.
+        fast: For a master, use the ``encoding.master_fast`` hardware-encoder
+            tier instead of the default ``libx264`` tier. Ignored for previews.
 
     Returns:
         The rendered file.
 
     Raises:
-        RenderError: When the timeline is missing, invalid or empty.
+        RenderError: When the timeline is missing, invalid or empty, or a
+            pre-flight check finds a segment/range/file problem (see
+            :func:`preflight`) — every problem is reported at once.
     """
     mode = "preview" if preview or not master else "master"
     source_timeline = Path(timeline_path) if timeline_path else project.timeline_file
@@ -1159,11 +1358,15 @@ def render(
         raise RenderError(f"no timeline at {source_timeline} — run the plan stage first")
 
     timeline = Timeline.load(source_timeline)
-    issues = timeline.validate(project)
+
+    issues = preflight(project, timeline, no_music=no_music, no_voice=no_voice)
     if issues:
-        for issue in issues:
-            log.error("timeline: %s", issue)
-        raise RenderError(f"timeline has {len(issues)} issue(s); refusing to render")
+        for i, issue in enumerate(issues, 1):
+            log.error("timeline issue %d/%d: %s", i, len(issues), issue)
+        numbered = "\n".join(f"{i}. {issue}" for i, issue in enumerate(issues, 1))
+        raise RenderError(
+            f"timeline has {len(issues)} issue(s); refusing to render:\n{numbered}"
+        )
     if not timeline.tracks.video:
         raise RenderError("timeline has no video segments")
 
@@ -1179,23 +1382,32 @@ def render(
         )
 
     project.ensure_dirs()
+    _check_disk_space(project, duration, project.settings)
     project.set_stage("render", "running")
     job = _Job(project, mode, duration)
+    workers = max(1, int(project.settings.get("render.workers", 3)))
     log.info(
-        "render [stage]%s[/] · %s @ %d fps · %.2fs · %d segment(s)",
+        "render [stage]%s[/] · %s @ %d fps · %.2fs · %d segment(s)%s",
         mode, canvas.size, canvas.fps, duration, len(timeline.tracks.video),
+        " · fast (hardware) tier" if mode == "master" and fast else "",
     )
+    if no_music:
+        log.info("--no-music: music cues ignored for this render")
+    if no_voice:
+        log.info("--no-voice: voice pickups ignored for this render")
 
     try:
-        # -- pass 1: segments -----------------------------------------
+        # -- pass 1: segments (parallel across render.workers) --------
         job.step("segments", 0.0)
-        segments: list[Path] = []
-        for index, seg in enumerate(timeline.tracks.video):
-            log.info("segment %s (%s %.2f-%.2f)", seg.id, seg.clip, seg.in_, seg.out)
-            segments.append(
-                render_segment(project, timeline, seg, canvas, mode, force=force_segments)
-            )
-            job.step("segments", 40.0 * (index + 1) / len(timeline.tracks.video))
+
+        def _segment_done(completed: int, total: int, seg: VideoSegment) -> None:
+            log.info("segment %d/%d done (%s)", completed, total, seg.id)
+            job.step("segments", 40.0 * completed / total)
+
+        segments = render_segments(
+            project, timeline, canvas, mode,
+            force=force_segments, workers=workers, on_done=_segment_done,
+        )
 
         # -- pass 2: join ---------------------------------------------
         job.step("join", 40.0)
@@ -1206,7 +1418,8 @@ def render(
         # -- pass 3: audio bus ----------------------------------------
         job.step("audio", 55.0)
         final_audio = build_audio_bus(
-            project, timeline, program_audio, duration, to_render, two_pass=(mode == "master")
+            project, timeline, program_audio, duration, to_render,
+            two_pass=(mode == "master"), skip_music=no_music, skip_voice=no_voice,
         )
 
         # -- pass 4: captions -----------------------------------------
@@ -1236,7 +1449,7 @@ def render(
         args += [
             "-map", "0:v:0",
             "-map", "1:a:0",
-            *video_encoder_args(project.settings, mode, canvas.fps),
+            *video_encoder_args(project.settings, mode, canvas.fps, fast=fast),
             *audio_encoder_args(project.settings),
             "-movflags", "+faststart",
             "-t", f"{duration:.6f}",
@@ -1300,3 +1513,99 @@ def _progress_sink(
         job.step("encode", 75.0 + 0.25 * percent)
 
     return sink, bar.stop
+
+
+# ----------------------------------------------------------------------
+# cache hygiene
+# ----------------------------------------------------------------------
+#: ``renders/`` intermediates a render regenerates every time (never a cache).
+_INTERMEDIATE_GLOBS: tuple[str, ...] = (
+    "program_video.mp4",
+    "program_audio*.wav",
+    "mix.wav",
+    "final_audio*.wav",
+    "concat.txt",
+    "duck.cmd",
+)
+
+
+def referenced_segment_keys(project: Project, timeline: Timeline) -> set[str]:
+    """Segment cache keys the current timeline could reuse, preview and master.
+
+    Computed the same way :func:`render_segment` names its cache file, for
+    both canvases the timeline can be rendered at, so ``clean`` never deletes
+    a segment the next preview *or* master render would otherwise hit.
+    """
+    referenced: set[str] = set()
+    for is_preview in (True, False):
+        canvas = canvas_for(timeline, is_preview)
+        mode = "preview" if is_preview else "master"
+        for seg in timeline.tracks.video:
+            try:
+                referenced.add(segment_key(project, timeline, seg, canvas, mode))
+            except Exception:  # pragma: no cover - a broken segment shouldn't block clean
+                log.warning("clean: could not compute cache key for segment %s", seg.id)
+    return referenced
+
+
+def clean(
+    project: Project,
+    *,
+    segments: bool = True,
+    intermediates: bool = True,
+) -> dict[str, Any]:
+    """Remove disposable render output. Never touches ``media/``, ``input/`` or ``exports/``.
+
+    Args:
+        project: Project to clean.
+        segments: Remove cached segment files under ``renders/segments/`` that
+            are not referenced by ``plan/timeline.json`` at its current
+            preview or master cache key (a segment cache accumulates every
+            variant ever rendered — a long programme re-edited a few times
+            easily leaves hundreds of stale files behind).
+        intermediates: Remove the per-render intermediates that always get
+            regenerated (``program_video.mp4``, ``program_audio*.wav``,
+            ``mix.wav``, ``final_audio*.wav``, ``concat.txt``, ``duck.cmd``).
+
+    Returns:
+        ``{"freed_bytes": int, "removed_intermediates": [...], "removed_segments": [...]}``.
+    """
+    renders = project.renders_dir
+    freed = 0
+    removed_intermediates: list[str] = []
+    removed_segments: list[str] = []
+
+    if intermediates and renders.is_dir():
+        for pattern in _INTERMEDIATE_GLOBS:
+            for path in renders.glob(pattern):
+                if not path.is_file():
+                    continue
+                freed += path.stat().st_size
+                path.unlink()
+                removed_intermediates.append(path.name)
+
+    if segments:
+        seg_dir = renders / "segments"
+        referenced: set[str] = set()
+        if project.timeline_file.exists():
+            referenced = referenced_segment_keys(project, Timeline.load(project.timeline_file))
+        if seg_dir.is_dir():
+            for path in sorted(seg_dir.iterdir()):
+                if not path.is_file():
+                    continue
+                key = path.name.split(".", 1)[0]
+                if key in referenced:
+                    continue
+                freed += path.stat().st_size
+                path.unlink()
+                removed_segments.append(path.name)
+
+    log.info(
+        "clean: freed %.1f MB — %d intermediate file(s), %d segment file(s)",
+        freed / 1_048_576, len(removed_intermediates), len(removed_segments),
+    )
+    return {
+        "freed_bytes": freed,
+        "removed_intermediates": removed_intermediates,
+        "removed_segments": removed_segments,
+    }

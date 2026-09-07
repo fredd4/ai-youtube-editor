@@ -293,6 +293,67 @@ def test_validate_catches_duplicate_segment_ids_and_chapters() -> None:
     assert any("first chapter at 0:00" in i for i in issues)
 
 
+def test_validate_catches_a_segment_range_past_its_clip_duration(project: Project) -> None:
+    project.add_clip({"id": "c022", "order": 1, "duration": 9.8})
+    tl = _timeline(_segment("s001", "c022", 12.0, 15.0))
+    issues = tl.validate(project)
+    assert any(
+        "clip 'c022' range 12.00-15.00s exceeds clip duration 9.80s" in i for i in issues
+    ), issues
+
+
+def test_validate_allows_a_range_within_the_rounding_tolerance(project: Project) -> None:
+    project.add_clip({"id": "c001", "order": 1, "duration": 5.0})
+    tl = _timeline(_segment("s001", "c001", 0.0, 5.04))
+    assert tl.validate(project) == []
+
+
+def test_validate_ignores_duration_when_the_clip_has_none_recorded(project: Project) -> None:
+    project.add_clip({"id": "c001", "order": 1})
+    tl = _timeline(_segment("s001", "c001", 0.0, 999.0))
+    assert not any("exceeds clip duration" in i for i in tl.validate(project))
+
+
+def test_validate_catches_an_audio_from_range_past_its_clip_duration(project: Project) -> None:
+    project.add_clip({"id": "c033", "order": 1, "duration": 10.0})
+    project.add_clip({"id": "c030", "order": 2, "duration": 8.0})
+    tl = _timeline(
+        _segment("s001", "c033", 0.0, 3.0,
+                 audio_from=AudioFrom(clip="c030", **{"in": 6.0}, out=13.0)),
+    )
+    issues = tl.validate(project)
+    assert any(
+        "audio_from clip 'c030' range 6.00-13.00s exceeds clip duration 8.00s" in i
+        for i in issues
+    ), issues
+
+
+def test_validate_catches_a_backwards_audio_from_range(project: Project) -> None:
+    project.add_clip({"id": "c033", "order": 1, "duration": 10.0})
+    tl = _timeline(
+        _segment("s001", "c033", 0.0, 3.0,
+                 audio_from=AudioFrom(clip="c033", **{"in": 5.0}, out=2.0)),
+    )
+    issues = tl.validate(project)
+    assert any("audio_from in (5.0) >= out (2.0)" in i for i in issues)
+
+
+def test_validate_skip_music_and_skip_voice_ignore_those_tracks(project: Project) -> None:
+    tl = _timeline(_segment("s001", "c001", 0.0, 10.0))
+    tl.tracks.music.append(
+        MusicCue(id="m001", file="music/missing.wav", at=0.0, end=1.0)
+    )
+    tl.tracks.voice.append(VoiceItem(id="v001", file="voice/missing.wav", at=0.0))
+
+    issues = tl.validate(project)
+    assert any("music" in i and "missing.wav" in i for i in issues)
+    assert any("voice" in i and "missing.wav" in i for i in issues)
+
+    filtered = tl.validate(project, skip_music=True, skip_voice=True)
+    assert not any("music" in i for i in filtered)
+    assert not any("voice" in i for i in filtered)
+
+
 # ----------------------------------------------------------------------
 # speech ranges
 # ----------------------------------------------------------------------

@@ -29,6 +29,7 @@ ytedit plan <slug> --from-response     # rebuild the timeline from the last plan
 ytedit tidy <slug> [--dry-run]         # pad cuts ~0.3 s before / 0.45 s after speech, merge tiny gaps (auto in plan; use after manual edits)
 ytedit denoise <slug> --clip c004 [--engine elevenlabs|local] [--preview] [--off]  # voice isolation for windy clips ($0.12/min ElevenLabs, local free); render uses it automatically
 ytedit noise <slug> [--used-only|--all] [--denoise] [--engine elevenlabs|local] [--yes]  # scan clip audio for wind/noise -> analysis/noise_report.{json,md}; --denoise cleans up the windy list
+ytedit voice <slug> [--force]          # voice/incoming/*.wav (manifest-mapped narration pickups) -> transcribe, cut retakes/instructions/stutters/pauses, place on the timeline
 ytedit music <slug>                    # generate music beds from the plan's cue sheet
 ytedit render <slug> --preview         # fast 720p render
 ytedit render <slug> --master          # full master render (two-pass loudnorm, slow x264)
@@ -75,8 +76,9 @@ make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 4. `ytedit plan <slug>` (or `ytedit run <slug>` for steps 2–4). Review `plan/edit_plan.md` against the structure template and pacing rules (playbook §2.3, §4) — never forward the LLM's output to the user unreviewed. Speech padding (`tidy`) is applied automatically.
 5. Windy or noisy narration clips (footage log `visual.issues` / your own listen): `ytedit denoise <slug> --clip cNNN --preview`, send the user the A/B wav, keep ElevenLabs on if it helps.
 6. Summarize for the user in Polish: proposed structure, footage gaps, narration requests (`plan/narration_requests.md`), open editorial questions. Point him at `make serve` → Program view for the cut review; anything he saves there is human-edited (see Safety rules).
-7. Only after his review: `music` (one or two beds are fine, more → ask), `render --preview`, `qc`, `render --master`, `publish` — each gated per the playbook and the cost rules above. Send him the preview with SendUserFile (masters are usually too big).
-8. After manual edits in the editor: `ytedit tidy <slug>` then re-render. Commit only when the user asks.
+7. When the user drops recorded pickups into `voice/incoming/` (narration requests or extra gap fill), fill in `voice/incoming/manifest.yaml` (a draft is written automatically on the first `ytedit voice <slug>` run if it's missing) mapping each file to its `request: nNNN` or an explicit `anchor:` segment, then run `ytedit voice <slug>`. Review `voice/incoming/report.md` — what got cut (retake/instruction/stutter/pause) and where each pickup landed — before trusting it; anything left `unplaced` or `overlap_unresolved` needs your judgment (playbook §5).
+8. Only after his review: `music` (one or two beds are fine, more → ask), `render --preview`, `qc`, `render --master`, `publish` — each gated per the playbook and the cost rules above. Send him the preview with SendUserFile (masters are usually too big).
+9. After manual edits in the editor: `ytedit tidy <slug>` then re-render. Commit only when the user asks.
 
 ## Starting a new video
 

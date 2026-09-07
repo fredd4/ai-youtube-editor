@@ -634,3 +634,127 @@ def test_a_true_mid_sentence_open_advances_to_the_next_sentence_when_blocked(
         c.startswith("s001 in") and "sentence-crop" in c and "advance" in c
         for c in changes
     )
+
+
+# ----------------------------------------------------------------------
+# a sentence snap must never reach into audio another segment already
+# claims — even when the direct neighbour showing that no longer says so
+# ----------------------------------------------------------------------
+def test_a_sentence_snap_never_reaches_into_audio_a_cutaway_already_carries(
+    project: Project,
+) -> None:
+    """The exact failure mode ``ytedit tidy`` used to churn on: a cutaway
+    right before this segment carries ``c060`` audio nobody can see from the
+    word-level ``_clip_bounds`` check (it lives on a *different* clip), and
+    the ledger has since muted that particular hand-off (``s002``) for
+    reasons of its own — but the stretch is still spoken for by another,
+    still-intact cutaway (``s001b``) earlier in the track. Sentence-snapping
+    ``s003.in`` back into "Mozna czasem tam..." would resurrect a duplicate
+    even though the *immediate* neighbour no longer shows any continuity.
+    """
+    add_clip(
+        project, "c060", 60.0,
+        [
+            (0.0, 0.4, "Alfa"), (0.6, 1.0, "Beta."),
+            (1.5, 1.9, "Mozna"), (2.1, 2.5, "czasem"), (2.7, 3.1, "tam"),
+            (3.3, 3.7, "chodzic"), (3.9, 4.3, "a"), (4.5, 4.9, "potem"),
+            (5.1, 5.5, "wracac."),
+        ],
+    )
+    add_clip(project, "c070", 20.0)   # the ledger-muted cutaway's own clip
+    add_clip(project, "c071", 20.0)   # the still-intact cutaway's own clip
+    tl = timeline_of(
+        seg("s001", "c060", 0.0, 1.0, role="a-roll"),
+        seg("s001b", "c071", 0.0, 3.95, role="cutaway",
+            audio_from=AudioFrom(clip="c060", **{"in": 1.0}, out=4.95)),
+        seg("s002", "c070", 0.0, 1.0, role="cutaway", mute_source=True),
+        seg("s003", "c060", 4.95, 8.0, role="a-roll"),
+    )
+    tl, changes = pad_segments_to_speech(tl, project)
+
+    moved = next(s for s in tl.tracks.video if s.id == "s003")
+    assert moved.in_ == pytest.approx(4.95)   # never snapped back into 1.0-4.95
+    assert not any(c.startswith("s003 in") for c in changes)
+
+
+# ----------------------------------------------------------------------
+# the ``ytedit tidy`` convergence loop
+# ----------------------------------------------------------------------
+#: A-roll, cutaway, a-roll resuming mid-sentence earlier than the first
+#: piece's out — the exact shape reported as non-idempotent in
+#: ``projects/the reference project``: the sentence snap reaches ``s042`` back across the
+#: cutaway, then the overlay pass hands that same stretch to the cutaway and
+#: pushes the cut back out again.
+_CHURN_WORDS = [
+    (0.0, 0.4, "Jeden"), (0.6, 1.0, "dwa."),
+    (1.5, 1.9, "Mozna"), (2.1, 2.5, "tam"), (2.7, 3.1, "isc."),
+]
+
+
+def test_tidy_converges_on_the_reported_churn_pattern(project: Project) -> None:
+    """``s042`` opens mid-sentence, well before ``s041``'s own out; a cutaway
+    sits between them. One round used to leave this oscillating forever (see
+    ``ytedit/ai/tidy.py`` module docstring history): pad's sentence snap pulls
+    ``s042.in`` back to "Mozna", then overlay hands that stretch to the
+    cutaway and pushes ``s042.in`` forward again — right back to a value that,
+    on the *next* run, looked mid-sentence all over again. ``tidy()`` must
+    settle this within its own call and a second, independent call must be a
+    complete no-op.
+    """
+    add_clip(project, "c050", 60.0, _CHURN_WORDS)
+    add_clip(project, "c090", 20.0)
+    timeline_of(
+        seg("s041", "c050", 0.0, 1.0, role="a-roll"),
+        seg("s050", "c090", 0.0, 3.5, role="cutaway"),
+        seg("s042", "c050", 2.0, 7.0, role="a-roll"),
+    ).save(project.timeline_file)
+
+    result = tidy(project)
+    assert result["converged"] is True
+    assert result["changes"][-1] == f"converged in {result['rounds']} round(s)"
+    assert result["rounds"] >= 2   # at least one round of churn, then a quiet one
+    assert result["issues"] == []
+    first_bytes = project.timeline_file.read_bytes()
+
+    # A second, independent ``ytedit tidy`` run (a fresh load from disk, the
+    # same as a second CLI invocation) must find nothing left to do.
+    result2 = tidy(project)
+    assert result2["changes"] == []
+    assert result2["written"] is None
+    assert result2["rounds"] == 1
+    assert project.timeline_file.read_bytes() == first_bytes
+
+    saved = Timeline.load(project.timeline_file)
+    from ytedit.ai.ledger import find_duplicate_audio
+
+    assert find_duplicate_audio(saved, project) == []
+    s042 = next(s for s in saved.tracks.video if s.id == "s042")
+    s050 = next(s for s in saved.tracks.video if s.id == "s050")
+    # s042 resumed exactly where the cutaway's carried narration ends — not
+    # back at the sentence start the first round snapped it to.
+    assert s050.audio_from is not None
+    assert s042.in_ == pytest.approx(s050.audio_from.out, abs=1e-3)
+
+
+def test_tidy_stops_at_max_rounds_and_says_so(project: Project) -> None:
+    """``pacing.tidy_max_rounds`` caps the loop; hitting it is reported
+    honestly (``converged: False``) rather than silently returning a
+    half-settled timeline.
+    """
+    from ytedit.config import load_settings
+
+    add_clip(project, "c050", 60.0, _CHURN_WORDS)
+    add_clip(project, "c090", 20.0)
+    timeline_of(
+        seg("s041", "c050", 0.0, 1.0, role="a-roll"),
+        seg("s050", "c090", 0.0, 3.5, role="cutaway"),
+        seg("s042", "c050", 2.0, 7.0, role="a-roll"),
+    ).save(project.timeline_file)
+    project._settings = load_settings(project.path, overrides={"pacing": {"tidy_max_rounds": 1}})
+
+    result = tidy(project)
+    assert result["converged"] is False
+    assert result["rounds"] == 1
+    assert result["changes"][-1].startswith(
+        "stopped: pacing.tidy_max_rounds (1) reached without convergence"
+    )

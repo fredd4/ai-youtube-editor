@@ -313,3 +313,53 @@ def test_the_real_c075_chain_ends_with_no_duplicate_audio(project: Project) -> N
     tl, _deduped = dedupe_audio(tl, project)
 
     assert find_duplicate_audio(tl, project) == []
+
+
+# ----------------------------------------------------------------------
+# never re-create a hand-off the ledger would just remove again
+# ----------------------------------------------------------------------
+def test_overlay_never_claims_audio_a_pickup_already_extracted(project: Project) -> None:
+    """A voice pickup already extracted exactly the stretch a fresh cutaway
+    run would want to carry: creating the ``audio_from`` anyway would make
+    the narration play twice, and the ledger dedupe pass would only mute it
+    again on the very next ``ytedit tidy`` round — churning forever. Left
+    alone here, before any duplicate is ever written.
+    """
+    add_clip(project, "c001", 60.0, THREE_SENTENCES)
+    add_clip(project, "c033", 20.0)
+    tl = timeline_of(
+        seg("s001", "c001", 0.7, 3.45, role="a-roll"),
+        seg("s002", "c033", 0.0, 1.0, role="cutaway"),
+        seg("s003", "c001", 4.0, 6.45, role="a-roll"),
+    )
+    # Extracted earlier from c001's own audio — exactly the 3.45-4.00 stretch
+    # this run's single cutaway (1.0s long) would otherwise be handed.
+    tl.tracks.voice = [VoiceItem(id="v001", file="voice/vo_c001_003.45_004.00.wav", at=0.0)]
+
+    tl, changes = overlay_cutaways(tl, project)
+
+    cutaway = next(s for s in tl.tracks.video if s.id == "s002")
+    a2 = next(s for s in tl.tracks.video if s.id == "s003")
+    assert cutaway.audio_from is None
+    assert a2.in_ == pytest.approx(4.0)   # untouched — the run was left alone
+    assert changes == []
+    assert find_duplicate_audio(tl, project) == []
+
+
+def test_overlay_reassigning_the_same_audio_from_is_a_silent_no_op(project: Project) -> None:
+    """Re-running overlay on an already-overlaid pattern must not re-log (or
+    re-mutate) a hand-off that already has exactly the right value — the
+    convergence loop in ``ytedit.ai.tidy.tidy`` relies on a round that
+    changes nothing actually reporting no changes.
+    """
+    add_clip(project, "c030", 60.0, C030)
+    add_clip(project, "c033", 20.0)
+    tl = timeline_of(
+        seg("s001", "c030", 1.8, 7.989, role="a-roll"),
+        seg("s002", "c033", 0.0, 3.0, role="cutaway"),
+        seg("s003", "c030", 10.6, 15.9, role="a-roll"),
+    )
+    tl, _first_changes = tidy_then_overlay(tl, project)
+
+    tl, second_changes = overlay_cutaways(tl, project)
+    assert second_changes == []

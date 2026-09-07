@@ -40,6 +40,7 @@ SUBDIRS: tuple[str, ...] = (
     "plan",
     "music",
     "voice",
+    "voice/incoming",
     "renders",
     "exports",
     "jobs",
@@ -55,6 +56,7 @@ STAGES: tuple[str, ...] = (
     "sentences",
     "plan",
     "tidy",
+    "voice",
     "music",
     "render",
     "qc",
@@ -276,6 +278,11 @@ class Project:
     def voice_dir(self) -> Path:
         """Narration pickups (recorded or TTS)."""
         return self.path / "voice"
+
+    @property
+    def voice_incoming_dir(self) -> Path:
+        """Raw narration WAVs the user drops for the ``voice`` stage, plus its manifest/state."""
+        return self.voice_dir / "incoming"
 
     @property
     def renders_dir(self) -> Path:

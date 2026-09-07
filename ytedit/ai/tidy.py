@@ -197,8 +197,19 @@ def _pad_in(
     low: float,
     pad_before: float,
     window: float,
+    committed: Sequence[tuple[float, float]] = (),
 ) -> tuple[float, Word, bool] | None:
     """Compute the new ``in`` for one segment, or ``None`` to leave it alone.
+
+    Args:
+        committed: Audio ranges already claimed by earlier segments (see
+            :func:`ytedit.ai.ledger.committed_audio_ranges`) — a reach
+            backward must never run into one of these. Without this, the
+            ordinary word-level pad can still creep a few frames into audio
+            an overlay cutaway carries (its own snap-to-word-boundary logic
+            has no notion of a *different* clip's claim), which is enough to
+            make the segment look like it opens mid-sentence again on the
+            very next round even though the real boundary never moved.
 
     Returns:
         ``(new_in, anchor_word, snapped)`` where ``snapped`` says the old ``in``
@@ -223,6 +234,9 @@ def _pad_in(
     for cut_s, cut_e in cuts:
         if cut_e <= anchor.s + _EPS:
             limit = max(limit, cut_e)
+    for _cr_s, cr_e in committed:
+        if cr_e <= seg.in_ + _EPS:
+            limit = max(limit, cr_e)
     new_in = max(desired, limit)
     if new_in >= seg.in_ - 1e-3:
         return None
@@ -238,7 +252,22 @@ def _pad_out(
     pad_after: float,
     window: float,
 ) -> tuple[float, Word, bool] | None:
-    """Compute the new ``out`` for one segment, or ``None`` to leave it alone."""
+    """Compute the new ``out`` for one segment, or ``None`` to leave it alone.
+
+    Unlike :func:`_pad_in`, this takes no ``committed`` ranges: when this
+    segment is the ``A`` of an overlay pattern, the very next cutaway's
+    ``audio_from.in`` is *derived from* this segment's own ``out`` (see
+    :func:`ytedit.ai.overlay.overlay_cutaways` — ``cursor = max(a.out, ...)``,
+    recomputed fresh every round) rather than the other way around, so it is
+    never a fixed obstacle to growing ``out`` further: it simply gets
+    recomputed to follow on the next round. Blocking growth against it here
+    would refuse a legitimate pad and, worse, freeze the boundary exactly
+    where the churn this module exists to fix used to leave it. Any genuine
+    forward duplicate — a later segment's own audio, or a voice pickup,
+    unrelated to this segment's own pattern — is caught by
+    :func:`ytedit.ai.ledger.dedupe_audio` right after this round's overlay
+    pass runs, not pre-empted here.
+    """
     snapped = False
     anchor = _straddling(words, seg.out)
     if anchor is not None:
@@ -309,9 +338,16 @@ def _snap_out_to_sentence(
 ) -> tuple[float, Word] | None:
     """Extend ``out`` to the end of the sentence the cut lands inside.
 
-    Returns ``(new_out, last_word_of_the_sentence)``, or ``None`` when the cut
-    already sits on a sentence boundary, the next word is further than
-    ``gap_max`` away, or nothing can be gained without crossing a guard.
+    Takes no ``committed`` ranges — see the note on that in :func:`_pad_out`:
+    when this segment is the ``A`` of an overlay pattern, the cutaway right
+    after it is the *dependent* side of the hand-off (its ``audio_from.in``
+    is derived from this segment's own ``out``, recomputed fresh every
+    round), never a fixed obstacle to extending ``out`` further.
+
+    Returns:
+        ``(new_out, last_word_of_the_sentence)``, or ``None`` when the cut
+        already sits on a sentence boundary, the next word is further than
+        ``gap_max`` away, or nothing can be gained without crossing a guard.
     """
     found = _out_tail(seg, words, gap_max)
     if found is None:
@@ -343,8 +379,20 @@ def _snap_in_to_sentence(
     pad_before: float,
     gap_max: float,
     extend_max: float,
+    committed: Sequence[tuple[float, float]] = (),
 ) -> tuple[float, Word] | None:
-    """Move ``in`` back to the start of the sentence the cut opens inside."""
+    """Move ``in`` back to the start of the sentence the cut opens inside.
+
+    Args:
+        committed: Audio ranges already claimed by *earlier* segments (see
+            :func:`ytedit.ai.ledger.committed_audio_ranges` and the note on
+            ``committed`` in :func:`_snap_out_to_sentence`) — a reach
+            backward must never run into one of these either, whether it is
+            an overlay cutaway's ``audio_from`` still standing or one the
+            ledger already muted for being a duplicate: if the stretch is
+            genuinely spoken for, muting the hand-off that carried it does
+            not free it back up.
+    """
     found = _in_head(seg, words, gap_max)
     if found is None:
         return None
@@ -359,6 +407,9 @@ def _snap_in_to_sentence(
     for _cut_s, cut_e in cuts:
         if cut_e <= words[first].s + _EPS:
             limit = max(limit, cut_e)
+    for _cr_s, cr_e in committed:
+        if cr_e <= seg.in_ + _EPS:
+            limit = max(limit, cr_e)
     new_in = max(desired, limit)
     if new_in >= seg.in_ - 1e-3:
         return None
@@ -517,6 +568,11 @@ def pad_segments_to_speech(
         ``(timeline, changes)`` — ``changes`` is a human-readable list such as
         ``["s004 in 3.10→2.82 (pad before 'Yo')"]``, empty when nothing moved.
     """
+    # Imported lazily: ytedit.ai.ledger imports this module at load time for
+    # its own re-timing helpers, so a module-level import here would be
+    # circular.
+    from ytedit.ai.ledger import committed_audio_ranges
+
     cfg = settings or project.settings
     pad_before = max(0.0, float(cfg.get("pacing.speech_pad_before", 0.30)))
     pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
@@ -553,8 +609,27 @@ def pad_segments_to_speech(
         cuts = cuts_for(seg.clip)
         low, high = _clip_bounds(video, index)
         duration = float((clips.get(seg.clip) or {}).get("duration") or 0.0)
+        # What everyone *earlier* on this clip already claims for audio right
+        # now — an overlay cutaway's audio_from, another segment's own
+        # audio, a voice pickup. ``_clip_bounds`` above only sees other cuts
+        # of the *same* clip; a cutaway on a *different* clip carrying this
+        # clip's audio via audio_from is invisible to it, which is exactly
+        # the case that used to make padding and the overlay/ledger passes
+        # fight each other every round (see ytedit.ai.overlay,
+        # ytedit.ai.ledger.committed_audio_ranges). Only the backward
+        # (``in``) direction consults this: a segment reaching *forward*
+        # never needs to, because anything immediately downstream of it in a
+        # genuine overlay pattern is the *dependent* side of the hand-off
+        # and simply follows this segment's own ``out`` on the next round —
+        # see the notes on ``_pad_out``/``_snap_out_to_sentence``. Computed
+        # once per segment: neither pad nor the sentence snap below mutates
+        # anything other than ``seg`` itself, which the slice already
+        # excludes.
+        committed_before = committed_audio_ranges(
+            timeline, video_slice=slice(0, index)
+        ).get(seg.clip, [])
 
-        moved_in = _pad_in(seg, words, cuts, low, pad_before, window)
+        moved_in = _pad_in(seg, words, cuts, low, pad_before, window, committed_before)
         if moved_in is not None:
             new_in, anchor, snapped = moved_in
             changes.append(
@@ -582,6 +657,10 @@ def pad_segments_to_speech(
             continue
         low, high = _clip_bounds(video, index)
         speed = seg.speed if seg.speed > 0 else 1.0
+        # ``committed_before`` (computed above, before the word-level pad) is
+        # still valid here: neither ``_pad_in`` nor ``_pad_out`` mutates
+        # anything but ``seg`` itself, which the slice already excludes
+        # regardless of index.
 
         next_seg = video[index + 1] if index + 1 < len(video) else None
         if next_seg is None or not _is_continuous_handoff(seg, next_seg, merge_gap):
@@ -618,7 +697,8 @@ def pad_segments_to_speech(
         prev_seg = video[index - 1] if index > 0 else None
         if prev_seg is None or not _is_continuous_handoff(prev_seg, seg, merge_gap):
             snap_in = _snap_in_to_sentence(
-                seg, words, cuts, low, pad_before, gap_max, extend_max
+                seg, words, cuts, low, pad_before, gap_max, extend_max,
+                committed_before,
             )
             if snap_in is not None:
                 new_in, anchor = snap_in
@@ -794,10 +874,128 @@ def backup_timeline(project: Project) -> str | None:
     return target.name
 
 
+def _canonical_state(timeline: Timeline) -> str:
+    """A canonical JSON snapshot of everything one ``tidy`` round can change.
+
+    Padding/snapping (``tracks.video``) and the overlay/ledger passes
+    (``tracks.video`` and ``tracks.voice``, via ``audio_from``, ``in``/``out``
+    and anchored-pickup resolution) are the only things a round touches — see
+    :func:`pad_segments_to_speech`, :func:`ytedit.ai.overlay.overlay_cutaways`
+    and :func:`ytedit.ai.ledger.dedupe_audio`. Two rounds that land on the
+    same snapshot are, for every purpose ``tidy`` cares about, the same
+    timeline, even if the change log in between is not empty (padding can
+    move a cut one way and overlay move it straight back — see
+    ``docs/playbook`` history on ``ytedit tidy`` idempotency).
+    """
+    payload = {
+        "video": [seg.model_dump(by_alias=True, mode="json") for seg in timeline.tracks.video],
+        "voice": [item.model_dump(by_alias=True, mode="json") for item in timeline.tracks.voice],
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _tidy_invariant_issues(timeline: Timeline, project: Project) -> list[str]:
+    """Invariants a finished (converged, capped, or oscillation-stopped) tidy
+    run must still hold, beyond what :meth:`Timeline.validate` already checks
+    (duplicate ids, ``in >= out``, negative timings, missing clips...).
+
+    * No range of **speech** audio may play twice — the exact defect
+      :mod:`ytedit.ai.ledger` exists to fix. A hit here means the
+      convergence loop gave up (round cap or an oscillation) with a real
+      duplicate still standing.
+    * Every ``audio_from`` range must stay inside its source clip's own
+      duration (and be non-empty) — a range reaching past the clip's edges
+      would ask the render for audio that clip does not have.
+    * Every true break — the audio actually stops (see
+      :func:`_is_continuous_handoff`) and the boundary is not on a sentence
+      mark — that :func:`pad_segments_to_speech`'s crop/retract fallback
+      could not fix is reported here with the word it broke on, the same way
+      ``ytedit qc`` rule 32 does; a break the fallback *could* fix is already
+      handled and never reaches this point.
+    """
+    # Imported lazily: ytedit.ai.ledger imports this module at load time.
+    from ytedit.ai.ledger import find_duplicate_audio
+
+    issues: list[str] = []
+
+    for dup in find_duplicate_audio(timeline, project):
+        if dup.speech:
+            issues.append(
+                f"duplicate speech audio: {dup.clip} {_fmt(dup.start)}-{_fmt(dup.end)}s "
+                f"({dup.duration:.2f}s) plays twice — {' / '.join(dup.ids)}"
+            )
+
+    clips = project.load_state().get("clips", {})
+    for seg in timeline.tracks.video:
+        af = seg.audio_from
+        if af is None:
+            continue
+        clip_duration = float((clips.get(af.clip) or {}).get("duration") or 0.0)
+        if af.out <= af.in_ + _EPS:
+            issues.append(
+                f"{seg.id}: audio_from {af.clip} range is empty or inverted "
+                f"({_fmt(af.in_)}-{_fmt(af.out)}s)"
+            )
+        elif af.in_ < -_EPS or (clip_duration > 0 and af.out > clip_duration + _EPS):
+            issues.append(
+                f"{seg.id}: audio_from {af.clip} {_fmt(af.in_)}-{_fmt(af.out)}s "
+                f"outside its {clip_duration:.2f}s duration"
+            )
+
+    cfg = project.settings
+    merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
+    gap_max = max(0.0, float(cfg.get("pacing.sentence_gap_max", 1.2)))
+    words_cache: dict[str, list[Word]] = {}
+    video = timeline.tracks.video
+    for index, seg in enumerate(video):
+        if seg.mute_source:
+            continue
+        words = words_cache.get(seg.clip)
+        if words is None:
+            words = load_words(project, seg.clip)
+            words_cache[seg.clip] = words
+        if not words or not has_sentence_marks(words):
+            continue
+
+        next_seg = video[index + 1] if index + 1 < len(video) else None
+        if next_seg is None or not _is_continuous_handoff(seg, next_seg, merge_gap):
+            found = _out_tail(seg, words, gap_max)
+            if found is not None:
+                _last, tail = found
+                issues.append(
+                    f"{seg.id}: out at {_fmt(seg.out)}s cuts mid-sentence and could not "
+                    f"be fixed — next word would be '{tail[0].text}'"
+                )
+
+        prev_seg = video[index - 1] if index > 0 else None
+        if prev_seg is None or not _is_continuous_handoff(prev_seg, seg, merge_gap):
+            found_in = _in_head(seg, words, gap_max)
+            if found_in is not None:
+                _first, head = found_in
+                issues.append(
+                    f"{seg.id}: in at {_fmt(seg.in_)}s opens mid-sentence and could not "
+                    f"be fixed — previous word was '{head[0].text}'"
+                )
+
+    return issues
+
+
 def tidy(
     project: Project, dry_run: bool = False, force: bool = False
 ) -> dict[str, Any]:
-    """Run :func:`pad_segments_to_speech` over ``plan/timeline.json``.
+    """Run pad/snap → overlay → dedupe → anchors to a fixed point.
+
+    The four passes can each undo a little of what another just did — padding
+    reaches a cut back to a sentence boundary, overlay hands that same
+    stretch to a cutaway and moves the cut forward again, the ledger then
+    finds the stretch already used and mutes the hand-off, which makes the
+    next round's padding think the boundary is a break again — so one round
+    is not enough to call the result *tidy*. This runs the whole chain
+    repeatedly, comparing a canonical snapshot of ``tracks.video`` and
+    ``tracks.voice`` (:func:`_canonical_state`) after each round, until a
+    round changes nothing (converged), the same snapshot recurs (an
+    oscillation — logged and stopped rather than looped forever), or
+    ``pacing.tidy_max_rounds`` (default 4) is reached.
 
     Args:
         project: Project whose timeline is tidied.
@@ -808,7 +1006,15 @@ def tidy(
     Returns:
         ``{"changes", "written", "backup", "dry_run", "edited_by_human",
         "duration_before", "duration_after", "issues", "sentence_snapped",
-        "overlaid", "deduped", "ambient_repeats"}``.
+        "overlaid", "deduped", "ambient_repeats", "rounds", "converged"}``.
+        ``changes`` carries every round's change lines in order, plus one
+        final summary line (``"converged in N round(s)"`` or
+        ``"stopped: oscillation between …"`` / ``"stopped: pacing.tidy_max_rounds
+        (...) reached without convergence"``) when there was anything to
+        report at all — never added to an already-empty list, so a clean
+        timeline still reports no changes. ``rounds``/``converged`` expose
+        the same outcome as plain data for a caller that would rather not
+        parse the summary line.
 
     Raises:
         TidyError: When the project has no timeline yet.
@@ -824,22 +1030,73 @@ def tidy(
     timeline = Timeline.load(project.timeline_file)
     human_edited = bool(timeline.meta.edited_by_human)
     before = timeline.duration()
+    max_rounds = max(1, int(project.settings.get("pacing.tidy_max_rounds", 4)))
 
-    timeline, changes = pad_segments_to_speech(timeline, project)
-    snapped = sentence_snap_count(changes)
-    timeline, overlaid = overlay_cutaways(timeline, project)
-    changes = changes + overlaid
-    # The audio ledger dedupe pass runs last: padding and overlay can both
-    # move segments around, so only once the cuts have settled can "does this
-    # overlap audio already used" be checked without chasing a moving target.
-    timeline, deduped = dedupe_audio(timeline, project)
-    changes = changes + deduped
-    # Anchored voice pickups are skipped by every _retime_absolute_tracks()
-    # call above; resolve them now that padding/overlay/dedupe have all
-    # settled the segments they follow.
-    timeline.resolve_voice_anchors()
+    all_changes: list[str] = []
+    changes_by_round: list[list[str]] = []
+    total_snapped = 0
+    total_overlaid = 0
+    total_deduped = 0
+
+    states = [_canonical_state(timeline)]
+    converged = False
+    oscillation_from: int | None = None
+
+    for _round in range(max_rounds):
+        timeline, padded = pad_segments_to_speech(timeline, project)
+        snapped = sentence_snap_count(padded)
+        timeline, overlaid = overlay_cutaways(timeline, project)
+        # The audio ledger dedupe pass runs last: padding and overlay can both
+        # move segments around, so only once the cuts have settled can "does
+        # this overlap audio already used" be checked without chasing a
+        # moving target.
+        timeline, deduped = dedupe_audio(timeline, project)
+        # Anchored voice pickups are skipped by every _retime_absolute_tracks()
+        # call above; resolve them now that this round's padding/overlay/dedupe
+        # have all settled the segments they follow — part of the state the
+        # fixed point below is measured on.
+        timeline.resolve_voice_anchors()
+
+        round_changes = padded + overlaid + deduped
+        changes_by_round.append(round_changes)
+        all_changes.extend(round_changes)
+        total_snapped += snapped
+        total_overlaid += len(overlaid)
+        total_deduped += len(deduped)
+
+        new_state = _canonical_state(timeline)
+        if new_state == states[-1]:
+            converged = True
+            break
+        if new_state in states:
+            oscillation_from = states.index(new_state)
+            break
+        states.append(new_state)
+
+    rounds_run = len(changes_by_round)
+
+    if oscillation_from is not None:
+        cyclic = changes_by_round[oscillation_from:]
+        oscillating_lines = sorted({line for rc in cyclic for line in rc})
+        preview = "; ".join(oscillating_lines[:6])
+        if len(oscillating_lines) > 6:
+            preview += "; …"
+        summary = (
+            f"stopped: oscillation between {preview}"
+            if preview
+            else "stopped: oscillation detected (rounds repeat with no logged change)"
+        )
+        log.warning("tidy %s: %s (after %d round(s))", project.slug, summary, rounds_run)
+        all_changes.append(summary)
+    elif not converged:
+        summary = f"stopped: pacing.tidy_max_rounds ({max_rounds}) reached without convergence"
+        log.warning("tidy %s: %s", project.slug, summary)
+        all_changes.append(summary)
+    elif all_changes:
+        all_changes.append(f"converged in {rounds_run} round(s)")
+
     result: dict[str, Any] = {
-        "changes": changes,
+        "changes": all_changes,
         "written": None,
         "backup": None,
         "dry_run": dry_run,
@@ -847,15 +1104,22 @@ def tidy(
         "duration_before": before,
         "duration_after": timeline.duration(),
         "issues": [],
-        "sentence_snapped": snapped,
-        "overlaid": len(overlaid),
-        "deduped": len(deduped),
-        "ambient_repeats": ambient_repeat_count(deduped),
+        "sentence_snapped": total_snapped,
+        "overlaid": total_overlaid,
+        "deduped": total_deduped,
+        "ambient_repeats": ambient_repeat_count(all_changes),
+        "rounds": rounds_run,
+        "converged": converged,
     }
-    if not changes or dry_run:
+    # Checked at the end regardless of dry-run: whatever the loop produced —
+    # converged, hit the round cap, or gave up on an oscillation — must never
+    # leave a real defect unreported just because nothing was written to disk.
+    result["issues"] = timeline.validate(project) + _tidy_invariant_issues(timeline, project)
+
+    has_real_changes = any(changes_by_round)
+    if not has_real_changes or dry_run:
         return result
 
-    result["issues"] = timeline.validate(project)
     result["backup"] = backup_timeline(project)
     write_to_draft = human_edited and not force
     target = project.plan_dir / ("timeline.draft.json" if write_to_draft else "timeline.json")
@@ -868,7 +1132,7 @@ def tidy(
             project.slug,
             target.name,
         )
-    project.set_stage(STAGE, "done", changes=len(changes))
+    project.set_stage(STAGE, "done", changes=len(all_changes))
     return result
 
 

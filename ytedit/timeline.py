@@ -465,20 +465,58 @@ class Timeline(_Model):
     # ------------------------------------------------------------------
     # validation
     # ------------------------------------------------------------------
-    def validate(self, project: "Project | None" = None) -> list[str]:
+    def validate(
+        self,
+        project: "Project | None" = None,
+        *,
+        skip_music: bool = False,
+        skip_voice: bool = False,
+    ) -> list[str]:
         """Check the timeline for structural problems.
 
         Args:
             project: When given, segment ``clip`` ids and referenced media files
-                are checked against the project's registry and disk.
+                are checked against the project's registry and disk, and every
+                segment's (and ``audio_from``'s) range is checked against that
+                clip's known duration (``0 <= in < out <= duration + 0.05``).
+            skip_music: Skip every music-track check (a ``--no-music`` render
+                ignores the cues entirely, so a missing music file or bad cue
+                is not a reason to refuse).
+            skip_voice: Skip every voice-track check, symmetrically.
 
         Returns:
             A list of human-readable issues; empty means the timeline is sane.
         """
         issues: list[str] = []
         known_clips: set[str] = set()
+        clip_records: dict[str, Any] = {}
         if project is not None:
-            known_clips = set(project.load_state().get("clips", {}))
+            clip_records = project.load_state().get("clips", {})
+            known_clips = set(clip_records)
+
+        def _range_issues(seg_id: str, label: str, clip: str, in_: float, out: float) -> None:
+            """Check one ``[in, out)`` range against ``clip``'s known duration.
+
+            Whether the clip has an on-disk normalized source is a render-time
+            concern checked separately (see
+            :func:`ytedit.media.render.preflight`) — this only looks at the
+            duration recorded in the project's clip registry.
+
+            Args:
+                label: ``"clip"`` or ``"audio_from clip"`` — how the range is
+                    described in the issue text.
+            """
+            if project is None or not known_clips or clip not in known_clips:
+                return
+            duration = clip_records.get(clip, {}).get("duration")
+            if duration is None:
+                return
+            dur = float(duration)
+            if out > dur + 0.05:
+                issues.append(
+                    f"{seg_id}: {label} {clip!r} range {in_:.2f}-{out:.2f}s exceeds "
+                    f"clip duration {dur:.2f}s"
+                )
 
         # --- video track ------------------------------------------------
         seen_ids: set[str] = set()
@@ -494,16 +532,30 @@ class Timeline(_Model):
                 issues.append(f"{seg.id}: speed must be > 0 (got {seg.speed})")
             if project is not None and known_clips and seg.clip not in known_clips:
                 issues.append(f"{seg.id}: missing clip {seg.clip!r} in project registry")
-            if (
-                seg.audio_from is not None
-                and project is not None
-                and known_clips
-                and seg.audio_from.clip not in known_clips
-            ):
-                issues.append(
-                    f"{seg.id}: missing audio_from clip {seg.audio_from.clip!r} "
-                    "in project registry"
-                )
+            elif seg.out > seg.in_:
+                _range_issues(seg.id, "clip", seg.clip, seg.in_, seg.out)
+            if seg.audio_from is not None:
+                if (
+                    project is not None
+                    and known_clips
+                    and seg.audio_from.clip not in known_clips
+                ):
+                    issues.append(
+                        f"{seg.id}: missing audio_from clip {seg.audio_from.clip!r} "
+                        "in project registry"
+                    )
+                elif seg.audio_from.out <= seg.audio_from.in_:
+                    issues.append(
+                        f"{seg.id}: audio_from in ({seg.audio_from.in_}) >= "
+                        f"out ({seg.audio_from.out})"
+                    )
+                elif seg.audio_from.in_ < 0:
+                    issues.append(f"{seg.id}: negative audio_from in ({seg.audio_from.in_})")
+                else:
+                    _range_issues(
+                        seg.id, "audio_from clip", seg.audio_from.clip,
+                        seg.audio_from.in_, seg.audio_from.out,
+                    )
             if seg.transition_in.duration < 0:
                 issues.append(f"{seg.id}: negative transition duration")
             if seg.transition_in.duration > seg.duration + 1e-6:
@@ -530,9 +582,10 @@ class Timeline(_Model):
             [(c.id, c.at, c.end) for c in self.tracks.captions if c.style != "subtitle"],
             "caption",
         )
-        issues += _check_overlaps(
-            [(m.id, m.at, m.end) for m in self.tracks.music], "music cue"
-        )
+        if not skip_music:
+            issues += _check_overlaps(
+                [(m.id, m.at, m.end) for m in self.tracks.music], "music cue"
+            )
 
         for cap in self.tracks.captions:
             if cap.end <= cap.at:
@@ -545,19 +598,21 @@ class Timeline(_Model):
             if not cap.text.strip():
                 issues.append(f"caption {cap.id}: empty text")
 
-        for cue in self.tracks.music:
-            if cue.end <= cue.at:
-                issues.append(f"music {cue.id}: at ({cue.at}) >= end ({cue.end})")
-            if cue.at > total + 1e-6:
-                issues.append(f"music {cue.id}: starts after the programme ends")
-            if project is not None and not (project.path / cue.file).exists():
-                issues.append(f"music {cue.id}: missing file {cue.file}")
+        if not skip_music:
+            for cue in self.tracks.music:
+                if cue.end <= cue.at:
+                    issues.append(f"music {cue.id}: at ({cue.at}) >= end ({cue.end})")
+                if cue.at > total + 1e-6:
+                    issues.append(f"music {cue.id}: starts after the programme ends")
+                if project is not None and not (project.path / cue.file).exists():
+                    issues.append(f"music {cue.id}: missing file {cue.file}")
 
-        for voice in self.tracks.voice:
-            if voice.at < -1e-6:
-                issues.append(f"voice {voice.id}: negative position")
-            if project is not None and not (project.path / voice.file).exists():
-                issues.append(f"voice {voice.id}: missing file {voice.file}")
+        if not skip_voice:
+            for voice in self.tracks.voice:
+                if voice.at < -1e-6:
+                    issues.append(f"voice {voice.id}: negative position")
+                if project is not None and not (project.path / voice.file).exists():
+                    issues.append(f"voice {voice.id}: missing file {voice.file}")
 
         for item in self.tracks.sfx:
             if item.at < -1e-6:
