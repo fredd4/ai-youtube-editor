@@ -374,6 +374,17 @@ def test_voice_over_extracts_audio_and_places_a_voice_item(planned: Project) -> 
     total_picture = sum(p.duration for p in picture)
     assert total_picture == pytest.approx(voice.end - voice.at, abs=1e-2)
 
+    # The pickup is anchored to its first picture segment, offset 0 — so it
+    # keeps following that segment through any later padding/overlay/dedupe
+    # pass instead of staying pinned to the absolute time computed here.
+    assert voice.anchor is not None
+    assert voice.anchor.segment == picture[0].id
+    assert voice.anchor.offset == pytest.approx(0.0)
+    anchor_start = next(
+        p.start for p in timeline.segment_positions() if p.segment.id == picture[0].id
+    )
+    assert voice.at == pytest.approx(anchor_start, abs=1e-6)
+
 
 def test_voice_over_picture_cuts_alone_are_trimmed_when_they_overshoot(planned: Project) -> None:
     footage_log = _add_narration_clip(planned)

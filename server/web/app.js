@@ -1407,9 +1407,16 @@ function renderProgStrip() {
     lane('voice', width, (S.timeline.tracks?.voice || []).map((v) => {
       const end = v.end != null ? +v.end : +v.at || 0;
       const name = (v.file || '').split('/').pop() || v.id;
+      // Anchored items are pinned to a video segment (see
+      // Timeline.resolve_voice_anchors) rather than absolute time — shown
+      // read-only so the user can see why a pickup follows its picture.
+      const anchorTag = v.anchor ? ` ⚓${v.anchor.segment}` : '';
+      const anchorNote = v.anchor
+        ? `\nanchored to ${v.anchor.segment} +${(+v.anchor.offset || 0).toFixed(2)}s`
+        : '';
       return {
-        start: +v.at || 0, end, label: `🎙 ${name}`, cls: 'voi',
-        title: `${v.file || ''}\n${tc(v.at)}–${tc(end)} · ${v.gain_db ?? 0} dB`,
+        start: +v.at || 0, end, label: `🎙 ${name}${anchorTag}`, cls: 'voi',
+        title: `${v.file || ''}\n${tc(v.at)}–${tc(end)} · ${v.gain_db ?? 0} dB${anchorNote}`,
       };
     }), pps),
     lane('muted src', width, progMutes(positions).map((m) => ({

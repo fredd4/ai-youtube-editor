@@ -16,6 +16,8 @@ from ytedit.timeline import (
     Timeline,
     Tracks,
     VideoSegment,
+    VoiceAnchor,
+    VoiceItem,
     merge_ranges,
     speech_ranges_from_transcripts,
 )
@@ -145,6 +147,81 @@ def test_segment_at_and_clip_ids() -> None:
     assert tl.segment_at(5.0).segment.id == "s002"
     assert tl.segment_at(99.0) is None
     assert tl.clip_ids() == ["c001", "c002"]
+
+
+# ----------------------------------------------------------------------
+# voice anchors
+# ----------------------------------------------------------------------
+def test_resolve_voice_anchors_moves_at_and_end() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[
+                _segment("s001", "c001", 0.0, 4.0),
+                _segment("s002", "c002", 0.0, 3.0),
+            ],
+            voice=[
+                VoiceItem(
+                    id="v001", file="voice/n001.wav", at=0.0, end=2.0,
+                    anchor=VoiceAnchor(segment="s002", offset=0.5),
+                )
+            ],
+        )
+    )
+    moved = tl.resolve_voice_anchors()
+    assert moved == 1
+    item = tl.tracks.voice[0]
+    # s002 starts at 4.0s; offset 0.5s -> at 4.5, length (2.0 - 0.0) kept.
+    assert item.at == pytest.approx(4.5)
+    assert item.end == pytest.approx(6.5)
+
+
+def test_resolve_voice_anchors_keeps_length_when_end_is_none() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[_segment("s001", "c001", 0.0, 4.0)],
+            voice=[
+                VoiceItem(
+                    id="v001", file="voice/n001.wav", at=99.0, end=None,
+                    anchor=VoiceAnchor(segment="s001", offset=1.0),
+                )
+            ],
+        )
+    )
+    tl.resolve_voice_anchors()
+    item = tl.tracks.voice[0]
+    assert item.at == pytest.approx(1.0)
+    assert item.end is None
+
+
+def test_resolve_voice_anchors_dangling_segment_keeps_absolute_time() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[_segment("s001", "c001", 0.0, 4.0)],
+            voice=[
+                VoiceItem(
+                    id="v001", file="voice/n001.wav", at=7.5, end=9.0,
+                    anchor=VoiceAnchor(segment="s999", offset=0.0),
+                )
+            ],
+        )
+    )
+    moved = tl.resolve_voice_anchors()
+    assert moved == 0
+    item = tl.tracks.voice[0]
+    assert item.at == pytest.approx(7.5)
+    assert item.end == pytest.approx(9.0)
+
+
+def test_resolve_voice_anchors_ignores_unanchored_items() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[_segment("s001", "c001", 0.0, 4.0)],
+            voice=[VoiceItem(id="v001", file="voice/n001.wav", at=2.0, end=3.0)],
+        )
+    )
+    moved = tl.resolve_voice_anchors()
+    assert moved == 0
+    assert tl.tracks.voice[0].at == pytest.approx(2.0)
 
 
 # ----------------------------------------------------------------------

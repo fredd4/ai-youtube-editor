@@ -707,6 +707,11 @@ def _retime_absolute_tracks(timeline: Timeline, remap: Callable[[float], float])
         cue.at = remap(cue.at)
         cue.end = remap(cue.end)
     for item in timeline.tracks.voice:
+        if item.anchor is not None:
+            # Anchored items are pinned to a segment id, not absolute time;
+            # Timeline.resolve_voice_anchors() re-derives their position from
+            # wherever that segment ends up once every pass has settled.
+            continue
         # A pickup is a fixed-length file: move it, never stretch it. Remapping
         # ``end`` separately would grow it by every pad inserted underneath.
         length = None if item.end is None else item.end - item.at
@@ -829,6 +834,10 @@ def tidy(
     # overlap audio already used" be checked without chasing a moving target.
     timeline, deduped = dedupe_audio(timeline, project)
     changes = changes + deduped
+    # Anchored voice pickups are skipped by every _retime_absolute_tracks()
+    # call above; resolve them now that padding/overlay/dedupe have all
+    # settled the segments they follow.
+    timeline.resolve_voice_anchors()
     result: dict[str, Any] = {
         "changes": changes,
         "written": None,

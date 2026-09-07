@@ -278,6 +278,61 @@ def tidy(
         )
 
 
+@app.command("voice-anchor")
+def voice_anchor(
+    slug: str = typer.Argument(..., help="Project slug."),
+    voice_id: str = typer.Argument(..., help="Voice item id (tracks.voice), e.g. v002."),
+    segment_id: str = typer.Argument(..., help="Video segment id to pin it to, e.g. s014."),
+    offset: float = typer.Option(
+        0.0, "--offset", help="Seconds after the segment's start where the pickup begins."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite a human-edited timeline instead of writing a draft."
+    ),
+) -> None:
+    """Pin a voice pickup to a video segment instead of an absolute time.
+
+    The pickup then follows that segment through every later pass (speech
+    padding, sentence snapping, overlay cutaways, audio dedupe, another
+    ``ytedit tidy``) instead of drifting at a fixed timestamp.
+    """
+    from .ai.tidy import backup_timeline
+    from .timeline import Timeline, VoiceAnchor
+
+    project = _load(slug)
+    if not project.timeline_file.exists():
+        console.print(f"[bold red]no timeline at {project.timeline_file}[/]")
+        raise typer.Exit(code=1)
+
+    timeline = Timeline.load(project.timeline_file)
+    human_edited = bool(timeline.meta.edited_by_human)
+
+    item = next((v for v in timeline.tracks.voice if v.id == voice_id), None)
+    if item is None:
+        console.print(f"[bold red]no voice item {voice_id!r} in tracks.voice[/]")
+        raise typer.Exit(code=1)
+    if not any(s.id == segment_id for s in timeline.tracks.video):
+        console.print(f"[bold red]no video segment {segment_id!r} in tracks.video[/]")
+        raise typer.Exit(code=1)
+
+    item.anchor = VoiceAnchor(segment=segment_id, offset=offset)
+    timeline.resolve_voice_anchors()
+
+    backup = backup_timeline(project)
+    write_to_draft = human_edited and not force
+    target = project.plan_dir / ("timeline.draft.json" if write_to_draft else "timeline.json")
+    timeline.save(target)
+    console.print(
+        f"[green]{voice_id}[/] anchored to {segment_id} +{offset:.2f}s "
+        f"-> at {item.at:.2f}s · wrote {project.rel(target)} (backup: {backup})"
+    )
+    if write_to_draft:
+        console.print(
+            "[yellow]timeline.json is human-edited[/] — review the draft, "
+            "or re-run with --force"
+        )
+
+
 @app.command()
 def denoise(
     slug: str = typer.Argument(..., help="Project slug."),

@@ -89,6 +89,7 @@ from ytedit.timeline import (
     Transform,
     Transition,
     VideoSegment,
+    VoiceAnchor,
     VoiceItem,
     new_timeline,
 )
@@ -1186,6 +1187,10 @@ def build_timeline(
     # picture-cut segments (tracked by object identity) landed after padding, not
     # where they were provisionally laid out before earlier segments could grow.
     timeline.tracks.voice, stats["voice_over_items"] = _build_voice_items(timeline, voice_groups)
+    # The items above are already placed at their anchor segment's current
+    # position, but resolving here too means a plan that later gets loaded and
+    # re-tidied is bootstrapped in the same anchored state (harmless no-op now).
+    timeline.resolve_voice_anchors()
 
     timeline.mute_ranges = _build_mute_ranges(plan_obj, footage_log, clips)
     timeline.markers = _build_markers(cfg, total, plan_obj)
@@ -1508,10 +1513,12 @@ def _build_voice_items(
     report: list[dict[str, Any]] = []
     for i, group in enumerate(voice_groups):
         start: float | None = None
+        anchor_segment: VideoSegment | None = None
         for segment in group["segments"]:
             candidate = starts.get(id(segment))
             if candidate is not None and (start is None or candidate < start):
                 start = candidate
+                anchor_segment = segment
         if start is None:
             log.warning(
                 "voice-over pickup %s lost all its picture segments during tidy — dropped",
@@ -1520,7 +1527,13 @@ def _build_voice_items(
             continue
         end = round(start + group["duration"], 3)
         item_id = f"v{i + 1:03d}"
-        items.append(VoiceItem(id=item_id, file=group["file"], at=round(start, 3), end=end))
+        # Anchor to the first picture segment of the group, offset 0, so the
+        # pickup follows it through any later pass instead of staying pinned
+        # to the absolute time computed here.
+        anchor = VoiceAnchor(segment=anchor_segment.id, offset=0.0) if anchor_segment else None
+        items.append(
+            VoiceItem(id=item_id, file=group["file"], at=round(start, 3), end=end, anchor=anchor)
+        )
         report.append(
             {
                 "id": item_id,

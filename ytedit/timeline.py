@@ -176,8 +176,28 @@ class VideoSegment(_Model):
         return frames_to_seconds(self.frames(fps), fps)
 
 
+class VoiceAnchor(_Model):
+    """Pins a :class:`VoiceItem` to a video segment instead of absolute time.
+
+    ``offset`` seconds after the start of video segment ``segment`` (its
+    :attr:`SegmentPosition.start`, see :meth:`Timeline.segment_positions`).
+    Re-resolved by :meth:`Timeline.resolve_voice_anchors` whenever the segment
+    may have moved — speech padding, sentence snapping, overlay cutaways,
+    audio dedupe, or a hand edit in the web editor all shift absolute time,
+    but a pickup anchored this way follows its picture instead of drifting.
+    """
+
+    segment: str
+    offset: float = 0.0
+
+
 class VoiceItem(_Model):
-    """A narration pickup placed at an absolute timeline position."""
+    """A narration pickup placed at an absolute timeline position.
+
+    ``at``/``end`` are always the resolved absolute values render and the
+    editor read. When :attr:`anchor` is set, they are recomputed from it by
+    :meth:`Timeline.resolve_voice_anchors` rather than edited directly.
+    """
 
     id: str
     file: str
@@ -185,6 +205,8 @@ class VoiceItem(_Model):
     gain_db: float = 0.0
     #: Optional explicit end; when absent the file length is used at render time.
     end: float | None = None
+    #: When set, this item is pinned to a video segment instead of absolute time.
+    anchor: VoiceAnchor | None = None
 
 
 class MusicCue(_Model):
@@ -393,6 +415,44 @@ class Timeline(_Model):
             if pos.start <= t < pos.end:
                 return pos
         return None
+
+    def resolve_voice_anchors(self) -> int:
+        """Recompute ``at``/``end`` for every anchored voice item.
+
+        For each :class:`VoiceItem` carrying an :class:`VoiceAnchor`, ``at`` is
+        set to ``offset`` seconds after the current start of video segment
+        ``anchor.segment`` (from :meth:`segment_positions`), and ``end`` is
+        moved along with it so the item's length never changes (``length =
+        old end - old at``, or left ``None`` when it already was).
+
+        An item whose anchor segment is no longer in the timeline (dropped by
+        padding, overlay, dedupe or a hand edit) keeps its current absolute
+        time untouched and is logged — better a stale but sane position than
+        a crash or a silent teleport to time zero.
+
+        Returns:
+            The number of items successfully resolved against their anchor
+            (items with no anchor, or a dangling one, are not counted).
+        """
+        starts = {pos.segment.id: pos.start for pos in self.segment_positions()}
+        resolved = 0
+        for item in self.tracks.voice:
+            if item.anchor is None:
+                continue
+            seg_start = starts.get(item.anchor.segment)
+            if seg_start is None:
+                log.warning(
+                    "voice %s: anchor segment %r no longer exists — "
+                    "keeping absolute time %.3fs",
+                    item.id, item.anchor.segment, item.at,
+                )
+                continue
+            length = None if item.end is None else item.end - item.at
+            item.at = round(seg_start + item.anchor.offset, 3)
+            if length is not None:
+                item.end = round(item.at + length, 3)
+            resolved += 1
+        return resolved
 
     def clip_ids(self) -> list[str]:
         """Distinct source clip ids referenced by the video track, in order."""

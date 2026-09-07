@@ -13,7 +13,15 @@ import pytest
 
 from ytedit.ai.tidy import TidyError, pad_segments_to_speech, tidy
 from ytedit.project import Project
-from ytedit.timeline import AudioFrom, Caption, Timeline, VideoSegment, VoiceItem, new_timeline
+from ytedit.timeline import (
+    AudioFrom,
+    Caption,
+    Timeline,
+    VideoSegment,
+    VoiceAnchor,
+    VoiceItem,
+    new_timeline,
+)
 
 
 # ----------------------------------------------------------------------
@@ -297,6 +305,47 @@ def test_voice_items_shift_with_padding(project: Project) -> None:
     caption = tl2.tracks.captions[0]
     assert caption.at == pytest.approx(expected_start, abs=1e-3)
     assert caption.end == pytest.approx(expected_start + 0.7, abs=1e-3)  # duration preserved
+
+
+def test_anchored_voice_item_follows_its_segment_through_padding_and_a_merge(
+    project: Project,
+) -> None:
+    """An anchored pickup tracks its segment through the whole ``tidy`` stage.
+
+    ``s001`` grows from padding (shifting everything after it), and ``s003``
+    is merged away entirely (a tiny same-clip jump cut) — the item stays
+    pinned to ``s004`` throughout, never at the absolute time it started at.
+    """
+    add_clip(project, "c001", 60.0, SPACED)
+    add_clip(project, "c002", 30.0)
+    add_clip(project, "c003", 30.0)
+    tl = timeline_of(
+        seg("s001", "c001", 3.1, 5.4),  # pads to (2.8, 5.85): grows the timeline
+        seg("s002", "c002", 1.0, 2.5),  # merges with s003 (0.05s gap): s003 dropped
+        seg("s003", "c002", 2.55, 4.0),
+        seg("s004", "c003", 5.0, 8.0),  # the anchor target
+    )
+    tl.tracks.voice = [
+        VoiceItem(
+            id="v001", file="voice/n001.wav", at=999.0, end=1000.0,
+            anchor=VoiceAnchor(segment="s004", offset=0.25),
+        )
+    ]
+    tl.save(project.timeline_file)
+
+    result = tidy(project)
+    assert result["written"] == "plan/timeline.json"
+
+    saved = Timeline.load(project.timeline_file)
+    assert "s003" not in [s.id for s in saved.tracks.video]  # earlier segment dropped
+
+    target_start = next(
+        p.start for p in saved.segment_positions() if p.segment.id == "s004"
+    )
+    item = saved.tracks.voice[0]
+    assert item.anchor is not None and item.anchor.segment == "s004"
+    assert item.at == pytest.approx(target_start + 0.25, abs=1e-3)
+    assert item.end == pytest.approx(item.at + 1.0, abs=1e-3)  # length (1000-999) kept
 
 
 def test_voice_items_are_untouched_when_nothing_moves(project: Project) -> None:
