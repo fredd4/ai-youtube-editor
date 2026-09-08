@@ -187,7 +187,11 @@ def test_resolve_anchor_explicit() -> None:
     tl.tracks.video = [seg("s001", "c001", 0.0, 5.0)]
     entry = V.ManifestEntry(file="a.wav", anchor="s001", offset=1.5)
     anchor, reason = V.resolve_anchor(tl, {}, entry)
-    assert anchor == VoiceAnchor(segment="s001", offset=1.5)
+    # anchors now carry the segment's stable uid and a clip/in signature
+    assert anchor is not None
+    assert (anchor.segment, anchor.offset) == ("s001", 1.5)
+    assert anchor.uid == tl.tracks.video[0].uid
+    assert anchor.signature is not None and anchor.signature.clip == "c001"
     assert "explicit anchor" in reason
 
 
@@ -205,7 +209,7 @@ def test_resolve_anchor_by_request_via_clip_reference() -> None:
     }
     entry = V.ManifestEntry(file="a.wav", request="n001")
     anchor, reason = V.resolve_anchor(tl, edit_plan, entry)
-    assert anchor == VoiceAnchor(segment="s002", offset=0.0)
+    assert anchor is not None and (anchor.segment, anchor.offset) == ("s002", 0.0)
     assert "n001" in reason
 
 
@@ -246,9 +250,9 @@ def test_overlong_pickup_grows_picture_then_uses_broll_pool(project: Project) ->
     assert inserted.clip == "c003"
     assert inserted.mute_source is True
     assert inserted.out - inserted.in_ == pytest.approx(3.0)
-    assert record["extended_segment"] == "s001"
+    assert record["extended_segment"] in ("s001", tl.tracks.video[0].uid)
     assert record["extended_by"] == pytest.approx(1.0)
-    assert record["inserted_segments"] == [inserted.id]
+    assert record["inserted_segments"] == [inserted.uid]
     # the original s002 shifted right by the amount inserted+grown ahead of it
     positions = {p.segment.id: p.start for p in tl.segment_positions()}
     assert positions["s002"] == pytest.approx(6.0)
@@ -308,7 +312,9 @@ def test_full_pipeline_places_a_clean_pickup(project: Project, tmp_path: Path, m
     timeline = Timeline.load(project.timeline_file)
     assert len(timeline.tracks.voice) == 1
     assert timeline.tracks.voice[0].file == "voice/intro.wav"
-    assert timeline.tracks.voice[0].anchor == VoiceAnchor(segment="s001", offset=0.0)
+    placed = timeline.tracks.voice[0].anchor
+    assert placed is not None and (placed.segment, placed.offset) == ("s001", 0.0)
+    assert placed.uid == timeline.tracks.video[0].uid
 
     report = project.voice_incoming_dir / "report.md"
     assert report.exists()
