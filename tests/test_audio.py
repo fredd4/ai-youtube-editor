@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import subprocess
@@ -210,6 +211,90 @@ def test_mute_ranges_expr_groups_by_gain() -> None:
 
 def test_mute_ranges_expr_ignores_empty_ranges() -> None:
     assert A.mute_ranges_expr([(2.0, 2.0, -60.0)]) == ""
+
+
+# ----------------------------------------------------------------------
+# speech leveling
+# ----------------------------------------------------------------------
+def test_speech_gate_expr_mutes_the_complement() -> None:
+    expr = A.speech_gate_expr([(1.0, 2.0), (3.0, 3.5)], duration=4.0)
+    # gaps are [0, 1), [2, 3), [3.5, 4)
+    assert "between(t,0,1)" in expr
+    assert "between(t,2,3)" in expr
+    assert "between(t,3.5,4)" in expr
+    assert "volume=0" in expr  # SILENCE_DB rounds to ~0
+
+
+def test_speech_gate_expr_is_empty_when_speech_covers_everything() -> None:
+    assert A.speech_gate_expr([(0.0, 4.0)], duration=4.0) == ""
+
+
+def test_measure_speech_gain_levels_a_quiet_cut_toward_the_target(tmp_path: Path) -> None:
+    # A quiet 4 s tone; only the middle half (coverage 50% < the default 60%
+    # threshold) is "speech", so the measurement gates to it.
+    quiet = sine(tmp_path / "quiet.wav", seconds=4.0, volume=0.05)
+    gain, measured = A.measure_speech_gain(
+        quiet, start=0.0, raw_duration=4.0,
+        speech_ranges=[(1.0, 3.0)], span=4.0,
+        target_lufs=-16.0, max_gain_db=10.0,
+    )
+    assert math.isfinite(measured) and measured < -16.0  # confirms it really is quiet
+    assert gain > 0  # needs boosting toward the target
+    assert gain <= 10.0 + 1e-6
+
+
+def test_measure_speech_gain_clamps_to_max_gain_db(tmp_path: Path) -> None:
+    very_quiet = sine(tmp_path / "very_quiet.wav", seconds=2.0, volume=0.01)
+    gain, _measured = A.measure_speech_gain(
+        very_quiet, start=0.0, raw_duration=2.0,
+        speech_ranges=[(0.0, 2.0)], span=2.0,
+        target_lufs=-14.0, max_gain_db=3.0,
+    )
+    assert gain == pytest.approx(3.0)
+
+
+def test_measure_speech_gain_without_speech_is_a_no_op() -> None:
+    gain, measured = A.measure_speech_gain(
+        "/does/not/matter.wav", start=0.0, raw_duration=2.0,
+        speech_ranges=[], span=2.0,
+    )
+    assert gain == 0.0
+    assert math.isnan(measured)
+
+
+def test_level_voice_file_gain_moves_toward_the_target_and_is_cached(tmp_path: Path) -> None:
+    pickup = sine(tmp_path / "pickup.wav", seconds=3.0, volume=0.05)  # quiet
+    gain, measured = A.level_voice_file_gain(pickup, target_lufs=-16.0, max_gain_db=10.0)
+    assert math.isfinite(measured)
+    assert gain > 0
+
+    cache = tmp_path / "pickup.wav.loudness.json"
+    assert cache.exists()
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    assert data["gain_db"] == pytest.approx(gain)
+    assert data["measured_lufs"] == pytest.approx(measured)
+
+    # Re-measuring the same (unchanged) file must not touch ffmpeg again.
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("measure_loudness should not run again for a cached file")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(A, "measure_loudness", _boom)
+    try:
+        gain2, measured2 = A.level_voice_file_gain(pickup, target_lufs=-16.0, max_gain_db=10.0)
+    finally:
+        monkeypatch.undo()
+    assert gain2 == pytest.approx(gain)
+    assert measured2 == pytest.approx(measured)
+
+
+def test_level_voice_file_gain_remeasures_when_the_target_changes(tmp_path: Path) -> None:
+    # A generous clamp so neither target below is actually clamped — this
+    # test is about the cache keying on the target, not about clamping.
+    pickup = sine(tmp_path / "pickup2.wav", seconds=2.0, volume=0.05)
+    gain_a, _ = A.level_voice_file_gain(pickup, target_lufs=-16.0, max_gain_db=40.0)
+    gain_b, _ = A.level_voice_file_gain(pickup, target_lufs=-20.0, max_gain_db=40.0)
+    assert gain_b == pytest.approx(gain_a - 4.0, abs=0.05)
 
 
 # ----------------------------------------------------------------------

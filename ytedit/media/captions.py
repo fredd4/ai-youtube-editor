@@ -309,16 +309,35 @@ def build_ass(
         lines.append(_style_line(name, style or {}, scale, font_name, margins))
     lines += ["", "[Events]", f"Format: {_ASS_EVENT_FORMAT}"]
 
-    for cue in sorted(captions, key=lambda c: (float(c.at), str(c.id))):
-        style_name = cue.style if cue.style in style_table else next(iter(style_table))
-        style = style_table.get(style_name) or {}
+    # Two burned-in cards must never overlap on screen: a location card and a
+    # hook line anchored to nearby segments can land a few frames apart once
+    # anchors are resolved, and the timeline's own overlap check
+    # (Timeline.validate) already treats "subtitle"-style cues as exempt (they
+    # are dense, transcript-driven, and never actually burned in — see the
+    # module docstring), so the same exemption applies here: only cards
+    # (location/hook/...) are pushed apart, never subtitle cues.
+    ordered = sorted(captions, key=lambda c: (float(c.at), str(c.id)))
+    resolved: list[tuple["Caption", float, float]] = []
+    last_card_end = 0.0
+    for cue in ordered:
         start = max(0.0, float(cue.at))
         end = float(cue.end)
         if duration:
             end = min(end, float(duration))
+        if cue.style != "subtitle" and start < last_card_end - 1e-6:
+            shift = last_card_end - start
+            start += shift
+            end += shift
+        if cue.style != "subtitle":
+            last_card_end = max(last_card_end, end)
         if end <= start:
             log.warning("caption %s has no length after clamping; skipped", cue.id)
             continue
+        resolved.append((cue, start, end))
+
+    for cue, start, end in resolved:
+        style_name = cue.style if cue.style in style_table else next(iter(style_table))
+        style = style_table.get(style_name) or {}
 
         text = cue.text.upper() if style.get("uppercase") else cue.text
         fade_in = int(style.get("fade_in_ms", DEFAULT_FADE_MS))

@@ -316,7 +316,7 @@ def voice_anchor(
         raise typer.Exit(code=1)
 
     item.anchor = VoiceAnchor(segment=segment_id, offset=offset)
-    timeline.resolve_voice_anchors()
+    timeline.resolve_anchors()
 
     backup = backup_timeline(project)
     write_to_draft = human_edited and not force
@@ -327,6 +327,57 @@ def voice_anchor(
         f"-> at {item.at:.2f}s · wrote {project.rel(target)} (backup: {backup})"
     )
     if write_to_draft:
+        console.print(
+            "[yellow]timeline.json is human-edited[/] — review the draft, "
+            "or re-run with --force"
+        )
+
+
+@app.command()
+def captions(
+    slug: str = typer.Argument(..., help="Project slug."),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Re-ask the writer for places and overwrite a human-edited timeline.",
+    ),
+    include_cold_open: bool = typer.Option(
+        False, "--include-cold-open", help="Also allow a location card during the cold open."
+    ),
+    keep_existing: bool = typer.Option(
+        False, "--keep-existing",
+        help="Keep the planner's own location captions instead of replacing them.",
+    ),
+) -> None:
+    """Place a location card at every new place, anchored to its segment."""
+    from .ai.locations import LocationsError
+    from .ai.locations import run_captions_stage as _run_captions
+    from .ai.publish import format_timecode
+
+    project = _load(slug)
+    try:
+        result = _run_captions(
+            project, force=force, include_cold_open=include_cold_open,
+            keep_existing=keep_existing,
+        )
+    except LocationsError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title=f"captions — {slug}")
+    for col in ("time", "segment", "style", "text"):
+        table.add_column(col)
+    for row in result["report"]:
+        table.add_row(format_timecode(row["at"]), row["segment"] or "—", row["style"], row["text"])
+    console.print(table)
+    console.print(
+        f"[bold]{result['cards_added']}[/] location card(s) · "
+        f"places cost ${result['places_cost_usd']:.4f} ({result['places_path']}) · "
+        f"wrote {result['written']} (backup: {result['backup']}) · "
+        f"report: {result['report_path']}"
+    )
+    for issue in result["issues"]:
+        console.print(f"[yellow]![/] {issue}")
+    if result["edited_by_human"] and not force:
         console.print(
             "[yellow]timeline.json is human-edited[/] — review the draft, "
             "or re-run with --force"

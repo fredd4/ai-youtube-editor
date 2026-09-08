@@ -1190,7 +1190,7 @@ def build_timeline(
     # The items above are already placed at their anchor segment's current
     # position, but resolving here too means a plan that later gets loaded and
     # re-tidied is bootstrapped in the same anchored state (harmless no-op now).
-    timeline.resolve_voice_anchors()
+    timeline.resolve_anchors()
 
     timeline.mute_ranges = _build_mute_ranges(plan_obj, footage_log, clips)
     timeline.markers = _build_markers(cfg, total, plan_obj)

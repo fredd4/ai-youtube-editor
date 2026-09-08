@@ -58,6 +58,7 @@ import functools
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -75,6 +76,7 @@ from ..timeline import (
     Caption,
     Timeline,
     VideoSegment,
+    _word_span,
     frames_to_seconds,
     speech_ranges_from_transcripts,
 )
@@ -419,6 +421,71 @@ def segment_mute_ranges(
     return sorted(out)
 
 
+@functools.lru_cache(maxsize=256)
+def _clip_word_spans(path: Path) -> tuple[tuple[float, float], ...]:
+    """Word ``(start, end)`` spans from a transcript file, cached per path.
+
+    Args:
+        path: ``transcripts/<clip>.json``.
+
+    Returns:
+        Sorted-by-appearance word spans; empty when the transcript is missing
+        or unreadable.
+    """
+    if not path.exists():
+        return ()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):  # pragma: no cover - bad transcript
+        log.warning("unreadable transcript %s", path)
+        return ()
+    spans: list[tuple[float, float]] = []
+    for word in data.get("words", []):
+        span = _word_span(word)
+        if span:
+            spans.append(span)
+    return tuple(spans)
+
+
+def segment_speech_ranges(project: Project, seg: VideoSegment) -> list[tuple[float, float]]:
+    """Speech word ranges inside ``seg``'s audio, in post-speed segment-local time.
+
+    Mirrors :func:`segment_mute_ranges`: words come from the transcript of
+    whichever clip the segment's audio is actually read from
+    (:attr:`VideoSegment.audio_source` — the ``audio_from`` clip for an overlay
+    cutaway), intersected with the borrowed range and divided by ``speed`` so
+    the ranges land in the *post-``atempo``* time base the segment's mute and
+    speech-leveling filters run in (see :func:`render_segment`).
+
+    Args:
+        project: Owning project (for the transcript file).
+        seg: Segment being rendered.
+
+    Returns:
+        Sorted ``(start, end)`` pairs from the segment's own audio start;
+        empty when the source clip has no transcript or no words in range.
+    """
+    speed = seg.speed if seg.speed > 0 else 1.0
+    clip_id, src_in, src_out = seg.audio_source
+    out: list[tuple[float, float]] = []
+    for w_start, w_end in _clip_word_spans(project.transcript_path(clip_id)):
+        start = max(w_start, src_in)
+        end = min(w_end, src_out)
+        if end <= start:
+            continue
+        out.append((round((start - src_in) / speed, 4), round((end - src_in) / speed, 4)))
+    return sorted(out)
+
+
+def _transcript_stamp(project: Project, clip_id: str) -> list[Any] | None:
+    """``[name, mtime]`` of a clip's transcript, for the segment cache key."""
+    path = project.transcript_path(clip_id)
+    try:
+        return [path.name, path.stat().st_mtime_ns]
+    except OSError:
+        return None
+
+
 def denoised_audio(
     project: Project, clip_id: str, state: dict[str, Any] | None = None
 ) -> Path | None:
@@ -493,6 +560,11 @@ def segment_key(
         except OSError:
             audio_stamp = [audio_source.name, 0, 0]
         audio_denoise_stamp = _denoise_stamp(project, seg.audio_from.clip)
+    # Speech leveling reads the transcript of whichever clip the segment's
+    # audio actually comes from, and its target/clamp are config — a
+    # re-transcribed clip or a changed audio.speech_target_lufs/
+    # speech_gain_max_db must invalidate the segment just like a re-denoise.
+    transcript_stamp = _transcript_stamp(project, seg.audio_source[0])
     payload = {
         "segment": seg.model_dump(by_alias=True, mode="json"),
         "canvas": [canvas.width, canvas.height, canvas.fps],
@@ -507,9 +579,12 @@ def segment_key(
         ),
         "audio_source": audio_stamp,
         "audio_denoised": audio_denoise_stamp,
+        "transcript": transcript_stamp,
+        "speech_target_lufs": float(project.settings.get("audio.speech_target_lufs", -16.0)),
+        "speech_gain_max_db": float(project.settings.get("audio.speech_gain_max_db", 10.0)),
         "grade": project.settings.get(f"grade.presets.{seg.grade}", []),
         "frames": seg.frames(canvas.fps),
-        "version": 4,
+        "version": 5,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
@@ -640,7 +715,7 @@ def render_segment(
 
     # An overlay cutaway keeps this picture but borrows its sound (and its
     # denoise state, and the time base of its mute ranges) from another clip.
-    audio_clip, audio_in, _audio_out = seg.audio_source
+    audio_clip, audio_in, audio_out = seg.audio_source
     if seg.audio_from is not None:
         audio_source = project.source_path(audio_clip)
         if not audio_source.exists():
@@ -678,7 +753,7 @@ def render_segment(
         audio_index = 1
     elif seg.audio_from is not None:
         log.debug(
-            "segment %s: audio from %s %.3f-%.3f", seg.id, audio_clip, audio_in, _audio_out
+            "segment %s: audio from %s %.3f-%.3f", seg.id, audio_clip, audio_in, audio_out
         )
         inputs += ["-ss", f"{audio_in:.6f}", "-i", str(audio_source)]
         audio_index = 1
@@ -686,6 +761,9 @@ def render_segment(
         audio_index = 0
 
     achain = [aformat]
+    speech_gain_db = 0.0
+    measured_lufs = float("nan")
+    speech_ranges: list[tuple[float, float]] = []
     if not silent:
         achain.append(_atempo(speed))
         if abs(seg.source_audio_gain_db) > 1e-6:
@@ -693,6 +771,30 @@ def render_segment(
         mutes = segment_mute_ranges(timeline, seg)
         if mutes:
             achain.append(audio_mod.mute_ranges_expr(mutes))
+
+        # Speech leveling: bring THIS cut's narration to a common loudness
+        # before it ever reaches the mix, so a fixed-depth music duck (see
+        # ducking.amount_db) sits under a consistent voice instead of one
+        # whose level still swings clip to clip. Only cuts whose audio
+        # carries transcript words are touched — ambient/B-roll audio and
+        # muted cuts keep their recorded level.
+        speech_ranges = segment_speech_ranges(project, seg)
+        if speech_ranges:
+            raw_duration = max(0.0, audio_out - audio_in)
+            span = raw_duration / speed if speed else raw_duration
+            measure_path = cleaned if cleaned is not None else audio_source
+            speech_gain_db, measured_lufs = audio_mod.measure_speech_gain(
+                measure_path,
+                start=audio_in,
+                raw_duration=raw_duration,
+                speech_ranges=speech_ranges,
+                span=span,
+                target_lufs=float(audio_cfg.get("speech_target_lufs", -16.0)),
+                max_gain_db=float(audio_cfg.get("speech_gain_max_db", 10.0)),
+                pre_chain=_join(achain),
+            )
+            if abs(speech_gain_db) > 1e-3:
+                achain.append(f"volume={audio_mod.db_to_linear(speech_gain_db):.6f}")
     achain.append("asetpts=N/SR/TB")
     # Exactly as many samples as the video has frames: trim a long take, pad a
     # short one (a source that ends early, or the infinite anullsrc).
@@ -731,7 +833,76 @@ def render_segment(
             f"(expected {frames} frames = {length:.6f}s)"
         )
     tmp.replace(out)
+    if speech_ranges and math.isfinite(measured_lufs):
+        _write_gain_sidecar(out, speech_gain_db, measured_lufs)
     return out
+
+
+def _gain_sidecar_path(segment_path: Path) -> Path:
+    """Sidecar next to a cached segment recording its applied speech gain."""
+    return segment_path.with_suffix(".gain.json")
+
+
+def _write_gain_sidecar(segment_path: Path, gain_db: float, measured_lufs: float) -> None:
+    """Persist the speech-leveling gain applied to a cached segment.
+
+    Read back by :func:`_collect_speech_gains` for the render log/job info —
+    including on a cache hit, so a re-run still reports what an earlier
+    render actually applied.
+    """
+    payload = {"gain_db": round(float(gain_db), 3), "measured_lufs": round(float(measured_lufs), 3)}
+    try:
+        _gain_sidecar_path(segment_path).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:  # pragma: no cover - best-effort logging aid
+        pass
+
+
+def _collect_speech_gains(
+    project: Project, timeline: Timeline, canvas: Canvas, mode: str
+) -> list[dict[str, Any]]:
+    """Read back the speech-leveling gain sidecars for a rendered timeline."""
+    records: list[dict[str, Any]] = []
+    for seg in timeline.tracks.video:
+        try:
+            key = segment_key(project, timeline, seg, canvas, mode)
+        except Exception:  # pragma: no cover - defensive, mirrors clean()
+            continue
+        sidecar = project.renders_dir / "segments" / f"{key}.gain.json"
+        if not sidecar.exists():
+            continue
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):  # pragma: no cover - corrupt sidecar
+            continue
+        records.append({
+            "segment": seg.id,
+            "measured_lufs": data.get("measured_lufs"),
+            "gain_db": data.get("gain_db"),
+        })
+    return records
+
+
+def _log_speech_gain_table(records: list[dict[str, Any]]) -> None:
+    """Print a compact segment / measured-LUFS / gain table for the render log."""
+    if not records:
+        return
+    from rich.table import Table
+
+    table = Table(title="speech leveling", header_style="bold cyan")
+    table.add_column("segment")
+    table.add_column("measured LUFS", justify="right")
+    table.add_column("gain dB", justify="right")
+    for r in records:
+        measured = r.get("measured_lufs")
+        gain = r.get("gain_db")
+        table.add_row(
+            str(r["segment"]),
+            f"{measured:.1f}" if isinstance(measured, (int, float)) else "n/a",
+            f"{gain:+.1f}" if isinstance(gain, (int, float)) else "n/a",
+        )
+    console.print(table)
 
 
 def render_segments(
@@ -1116,13 +1287,22 @@ def build_audio_bus(
     # speech ranges that drive automatic ducking.
     voice_items: list[dict[str, Any]] = []
     voice_spans: list[tuple[float, float]] = []
+    speech_target = float(settings.get("audio.speech_target_lufs", -16.0))
+    speech_max_gain = float(settings.get("audio.speech_gain_max_db", 10.0))
     for item in ([] if skip_voice else timeline.tracks.voice):
         path = project.path / item.file
         length = audio_mod.audio_duration(path)
         at = to_render(item.at)
         end = to_render(item.end) if item.end is not None else at + length
+        # Level this pickup to the same target as every segment's speech
+        # (cached alongside the file as <file>.loudness.json), then apply the
+        # timeline's own gain_db on top as a manual creative adjustment.
+        level_gain, _measured = audio_mod.level_voice_file_gain(
+            path, target_lufs=speech_target, max_gain_db=speech_max_gain
+        )
         voice_items.append(
-            {"file": str(path), "at": at, "end": end, "gain_db": float(item.gain_db)}
+            {"file": str(path), "at": at, "end": end,
+             "gain_db": float(item.gain_db) + level_gain}
         )
         voice_spans.append((at, end))
 
@@ -1408,6 +1588,12 @@ def render(
             project, timeline, canvas, mode,
             force=force_segments, workers=workers, on_done=_segment_done,
         )
+
+        speech_gains = _collect_speech_gains(project, timeline, canvas, mode)
+        if speech_gains:
+            job.data["speech_gains"] = speech_gains
+            job.write()
+            _log_speech_gain_table(speech_gains)
 
         # -- pass 2: join ---------------------------------------------
         job.step("join", 40.0)

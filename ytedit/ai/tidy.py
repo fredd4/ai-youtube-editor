@@ -781,6 +781,13 @@ def _shift_map(
 def _retime_absolute_tracks(timeline: Timeline, remap: Callable[[float], float]) -> None:
     """Shift every absolute-time item downstream of a padding-induced move."""
     for cap in timeline.tracks.captions:
+        if cap.anchor is not None:
+            # Anchored captions (location cards, anchored hook lines) are
+            # pinned to a segment id, not absolute time; Timeline.resolve_anchors()
+            # re-derives their position from wherever that segment ends up
+            # once every pass has settled — the same treatment as anchored
+            # voice items just below.
+            continue
         cap.at = remap(cap.at)
         cap.end = remap(cap.end)
     for cue in timeline.tracks.music:
@@ -789,7 +796,7 @@ def _retime_absolute_tracks(timeline: Timeline, remap: Callable[[float], float])
     for item in timeline.tracks.voice:
         if item.anchor is not None:
             # Anchored items are pinned to a segment id, not absolute time;
-            # Timeline.resolve_voice_anchors() re-derives their position from
+            # Timeline.resolve_anchors() re-derives their position from
             # wherever that segment ends up once every pass has settled.
             continue
         # A pickup is a fixed-length file: move it, never stretch it. Remapping
@@ -1051,11 +1058,11 @@ def tidy(
         # this overlap audio already used" be checked without chasing a
         # moving target.
         timeline, deduped = dedupe_audio(timeline, project)
-        # Anchored voice pickups are skipped by every _retime_absolute_tracks()
-        # call above; resolve them now that this round's padding/overlay/dedupe
-        # have all settled the segments they follow — part of the state the
-        # fixed point below is measured on.
-        timeline.resolve_voice_anchors()
+        # Anchored voice pickups and captions are skipped by every
+        # _retime_absolute_tracks() call above; resolve them now that this
+        # round's padding/overlay/dedupe have all settled the segments they
+        # follow — part of the state the fixed point below is measured on.
+        timeline.resolve_anchors()
 
         round_changes = padded + overlaid + deduped
         changes_by_round.append(round_changes)

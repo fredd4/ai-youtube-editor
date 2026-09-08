@@ -27,6 +27,7 @@ ytedit sentences <slug>                # transcripts+analysis -> analysis/senten
 ytedit plan <slug>                     # footage_log (script-first: sentence ids, not seconds) -> plan/edit_plan.json + timeline draft
 ytedit plan <slug> --from-response     # rebuild the timeline from the last plan/planner_response.json, no LLM call, no cost
 ytedit tidy <slug> [--dry-run]         # pad cuts ~0.3 s before / 0.45 s after speech, merge tiny gaps (auto in plan; use after manual edits)
+ytedit captions <slug> [--force] [--include-cold-open] [--keep-existing]  # location card at every new place, anchored to its segment (run after plan/tidy, and again after re-editing)
 ytedit denoise <slug> --clip c004 [--engine elevenlabs|local] [--preview] [--off]  # voice isolation for windy clips ($0.12/min ElevenLabs, local free); render uses it automatically
 ytedit noise <slug> [--used-only|--all] [--denoise] [--engine elevenlabs|local] [--yes]  # scan clip audio for wind/noise -> analysis/noise_report.{json,md}; --denoise cleans up the windy list
 ytedit voice <slug> [--force]          # voice/incoming/*.wav (manifest-mapped narration pickups) -> transcribe, cut retakes/instructions/stutters/pauses, place on the timeline
@@ -77,8 +78,9 @@ make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 5. Windy or noisy narration clips (footage log `visual.issues` / your own listen): `ytedit denoise <slug> --clip cNNN --preview`, send the user the A/B wav, keep ElevenLabs on if it helps.
 6. Summarize for the user in Polish: proposed structure, footage gaps, narration requests (`plan/narration_requests.md`), open editorial questions. Point him at `make serve` → Program view for the cut review; anything he saves there is human-edited (see Safety rules).
 7. When the user drops recorded pickups into `voice/incoming/` (narration requests or extra gap fill), fill in `voice/incoming/manifest.yaml` (a draft is written automatically on the first `ytedit voice <slug>` run if it's missing) mapping each file to its `request: nNNN` or an explicit `anchor:` segment, then run `ytedit voice <slug>`. Review `voice/incoming/report.md` — what got cut (retake/instruction/stutter/pause) and where each pickup landed — before trusting it; anything left `unplaced` or `overlap_unresolved` needs your judgment (playbook §5).
-8. Only after his review: `music` (one or two beds are fine, more → ask), `render --preview`, `qc`, `render --master`, `publish` — each gated per the playbook and the cost rules above. Send him the preview with SendUserFile (masters are usually too big).
-9. After manual edits in the editor: `ytedit tidy <slug>` then re-render. Commit only when the user asks.
+8. `ytedit captions <slug>` once the cut is settled — places a location card at every new place (not only the planner's beats), anchored to its segment so it survives later edits. Skim `analysis/captions_report.md`; re-run after any further re-cut (`--force` only if you need to re-ask the writer for places or overwrite a human-edited timeline).
+9. Only after his review: `music` (one or two beds are fine, more → ask), `render --preview`, `qc`, `render --master`, `publish` — each gated per the playbook and the cost rules above. Send him the preview with SendUserFile (masters are usually too big).
+10. After manual edits in the editor: `ytedit tidy <slug>` then `ytedit captions <slug>` (cards re-anchor automatically, but a manual re-cut can introduce or remove a place change) then re-render. Commit only when the user asks.
 
 ## Starting a new video
 

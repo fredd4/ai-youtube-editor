@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from fixtures.make_fixtures import build_all
+from ytedit.config import load_settings
+from ytedit.media import audio as A
 from ytedit.media import render as R
 from ytedit.media.ingest import ingest
 from ytedit.project import Project
@@ -750,6 +752,194 @@ def test_a_missing_audio_from_source_is_a_render_error(project: Project) -> None
     with pytest.raises(R.RenderError, match="audio_from clip 'c999'"):
         R.render_segment(project, timeline, timeline.tracks.video[0], R.Canvas(1920, 1080, 30),
                          "preview")
+
+
+# ----------------------------------------------------------------------
+# speech leveling (segments and voice pickups) before the mix
+# ----------------------------------------------------------------------
+def test_speech_leveling_evens_out_differing_segment_gains(tmp_path: Path) -> None:
+    """Three cuts of the same clip at simulated mic levels 12 dB apart
+
+    (source_audio_gain_db 0/12/6) must render to within 1.5 LU of each other
+    once leveled, and each must leave behind a gain sidecar.
+    """
+    project = build_render_project(tmp_path, slug="level-test")
+    # Custom transcript spanning the whole clip so all three segments below
+    # (0-1.5, 1.5-3.0, 3.0-4.5) carry enough words to trigger leveling.
+    (project.transcripts_dir / "c001.json").write_text(
+        json.dumps({
+            "clip": "c001", "language": "pl", "project_language": "pl",
+            "text": "raz dwa trzy",
+            "words": [
+                {"t": "raz", "s": 0.1, "e": 1.3},
+                {"t": "dwa", "s": 1.6, "e": 2.9},
+                {"t": "trzy", "s": 3.1, "e": 4.4},
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {"video": [
+            {"id": "s001", "clip": "c001", "in": 0.0, "out": 1.5,
+             "source_audio_gain_db": 0.0},
+            {"id": "s002", "clip": "c001", "in": 1.5, "out": 3.0,
+             "source_audio_gain_db": 12.0},
+            {"id": "s003", "clip": "c001", "in": 3.0, "out": 4.5,
+             "source_audio_gain_db": 6.0},
+        ]},
+    })
+    canvas = R.canvas_for(timeline, preview=True)
+    measured: list[float] = []
+    for seg in timeline.tracks.video:
+        path = R.render_segment(project, timeline, seg, canvas, "preview")
+        measured.append(A.measure_loudness(path)["input_i"])
+        key = R.segment_key(project, timeline, seg, canvas, "preview")
+        sidecar = project.renders_dir / "segments" / f"{key}.gain.json"
+        assert sidecar.exists(), f"{seg.id}: no speech-gain sidecar was written"
+
+    assert max(measured) - min(measured) <= 1.5, measured
+
+
+def test_speech_leveling_skips_muted_and_untranscribed_segments(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="level-skip-test")
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {"video": [
+            {"id": "s001", "clip": "c001", "in": 0.0, "out": 1.5, "mute_source": True},
+            {"id": "s002", "clip": "c002", "in": 0.0, "out": 1.5},  # c002 has no transcript
+        ]},
+    })
+    canvas = R.canvas_for(timeline, preview=True)
+    for seg in timeline.tracks.video:
+        R.render_segment(project, timeline, seg, canvas, "preview")
+        key = R.segment_key(project, timeline, seg, canvas, "preview")
+        sidecar = project.renders_dir / "segments" / f"{key}.gain.json"
+        assert not sidecar.exists(), f"{seg.id} should not have been leveled"
+
+
+def test_speech_target_lufs_change_invalidates_the_segment_cache(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="target-key-test")
+    timeline = Timeline.load(project.timeline_file)
+    canvas = R.canvas_for(timeline, preview=True)
+    seg = timeline.tracks.video[0]
+    before = R.segment_key(project, timeline, seg, canvas, "preview")
+
+    project._settings = load_settings(
+        project.path, overrides={"audio": {"speech_target_lufs": -20.0}}
+    )
+    assert R.segment_key(project, timeline, seg, canvas, "preview") != before
+
+    project._settings = load_settings(
+        project.path, overrides={"audio": {"speech_gain_max_db": 3.0}}
+    )
+    assert R.segment_key(project, timeline, seg, canvas, "preview") != before
+
+
+def test_voice_pickup_gain_includes_speech_leveling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``build_audio_bus`` must gain a quiet voice pickup toward the speech
+
+    target, on top of the item's own ``gain_db``, before handing it to the mix.
+    """
+    project = build_render_project(tmp_path, slug="voice-level-test")
+    project.voice_dir.mkdir(parents=True, exist_ok=True)
+    quiet_voice = project.voice_dir / "v001.wav"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "sine=frequency=300:sample_rate=48000:duration=3",
+         "-af", "volume=0.05", "-c:a", "pcm_s16le", "-ac", "2", str(quiet_voice)],
+        check=True,
+    )
+    expected_gain, _measured = A.level_voice_file_gain(
+        quiet_voice, target_lufs=-16.0, max_gain_db=10.0
+    )
+    assert expected_gain > 0, "the fixture pickup should measure quiet"
+
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {
+            "video": [{"id": "s001", "clip": "c001", "in": 0.0, "out": 3.0,
+                       "mute_source": True}],
+            "voice": [{"id": "v001", "file": "voice/v001.wav", "at": 0.0, "gain_db": 1.0}],
+        },
+    })
+    canvas = R.canvas_for(timeline, preview=True)
+    seg = timeline.tracks.video[0]
+    segment_path = R.render_segment(project, timeline, seg, canvas, "preview")
+    _video_out, program_audio = R.join_segments(
+        project, timeline, [segment_path], canvas, "preview"
+    )
+    to_render = R.build_time_map(timeline)
+
+    captured: dict[str, list[dict]] = {}
+    original_mix_program = R.audio_mod.mix_program
+
+    def spy(voice_wav, music_items, sfx_items, speech_ranges, out_wav, *args, **kwargs):
+        captured["items"] = list(sfx_items)
+        return original_mix_program(voice_wav, music_items, sfx_items, speech_ranges, out_wav,
+                                     *args, **kwargs)
+
+    monkeypatch.setattr(R.audio_mod, "mix_program", spy)
+    R.build_audio_bus(
+        project, timeline, program_audio, R.render_duration(timeline), to_render, two_pass=False,
+    )
+    [item] = [i for i in captured["items"] if i["file"] == str(quiet_voice)]
+    # the timeline's own gain_db (1.0) plus the automatic leveling gain.
+    assert item["gain_db"] == pytest.approx(1.0 + expected_gain, abs=0.05)
+
+
+def test_duck_ranges_for_an_audio_from_segment_come_from_the_borrowed_clips_words(
+    tmp_path: Path,
+) -> None:
+    """``duck.mode=auto`` must ride the words of the ``audio_from`` clip, not
+
+    the picture clip — the ducking counterpart of the mute-ranges check above.
+    """
+    project = build_render_project(tmp_path, slug="audio-from-duck-test")
+    # c002 (the borrowed *audio* clip) gets a transcript; c001 (the picture)
+    # keeps none here, so any ducking can only come from c002's words.
+    (project.transcripts_dir / "c001.json").unlink()
+    (project.transcripts_dir / "c002.json").write_text(
+        json.dumps({
+            "clip": "c002", "language": "pl", "project_language": "pl",
+            "text": "slowa w tle",
+            "words": [{"t": "slowa", "s": 0.5, "e": 1.0},
+                      {"t": "w", "s": 1.05, "e": 1.15},
+                      {"t": "tle", "s": 1.2, "e": 2.5}],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {
+            "video": [{"id": "s001", "clip": "c001", "in": 0.0, "out": 3.0,
+                       "audio_from": {"clip": "c002", "in": 0.0, "out": 3.0}}],
+            "music": [{"id": "m001", "file": "music/bed.wav", "at": 0.0, "end": 3.0,
+                       "gain_db": -18, "fade_in": 0.0, "fade_out": 0.0,
+                       "duck": {"mode": "auto", "amount_db": -15}}],
+        },
+    })
+    canvas = R.canvas_for(timeline, preview=True)
+    seg = timeline.tracks.video[0]
+    segment_path = R.render_segment(project, timeline, seg, canvas, "preview")
+    _video_out, program_audio = R.join_segments(
+        project, timeline, [segment_path], canvas, "preview"
+    )
+    to_render = R.build_time_map(timeline)
+    R.build_audio_bus(
+        project, timeline, program_audio, R.render_duration(timeline), to_render, two_pass=False,
+    )
+
+    cmd = project.renders_dir / "duck.cmd"
+    assert cmd.exists()
+    commands = re.findall(r"^(\d+\.\d{3}) volume volume (\d+\.\d+);$",
+                          cmd.read_text(encoding="utf-8"), re.M)
+    assert len(commands) >= 3, "expected a ramped envelope driven by the borrowed clip's words"
+    gains = [float(g) for _, g in commands]
+    assert min(gains) < max(gains) * 0.5, "the music must actually duck under the borrowed words"
 
 
 # ----------------------------------------------------------------------

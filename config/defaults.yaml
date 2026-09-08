@@ -102,7 +102,21 @@ audio:
     headroom: 0.12
   # Narration cleanup applied to the program voice bus before loudnorm
   # (playbook rule 17): none | light (highpass + compressor) | full (+ afftdn + deesser).
+  # Runs AFTER speech leveling (below) — it is glue for consistency, not gain-riding.
   voice_cleanup: light
+  # Speech leveling (render.py's segment pass, build_audio_bus's voice-pickup
+  # gain): every cut/pickup whose audio carries transcript words is measured
+  # (loudnorm integrated LUFS) and gained toward this target BEFORE the mix,
+  # so a fixed-depth music duck (see `ducking.amount_db` below) sits under a
+  # consistent voice instead of a voice whose level still swings clip to clip.
+  # Music cue gain (`MusicCue.gain_db`, default -18 dB) is chosen relative to
+  # this: -18…-21 dB under narration levelled to -16 LUFS lands roughly
+  # 14-18 LU under the voice once ducked, per the playbook's music-under-VO rule.
+  speech_target_lufs: -16.0
+  # Symmetric clamp (dB) on the leveling gain — a clip that would need more
+  # than this to reach the target (wind, a badly clipped take) is a
+  # denoise/re-record problem, not something to paper over with more gain.
+  speech_gain_max_db: 10.0
 
 # `ytedit voice` (ytedit/ai/voice.py): cleanup of the user's own narration pickups
 # recorded at home (voice/incoming/*.wav -> voice/<label>.wav). Reuses
@@ -114,7 +128,11 @@ voice:
   pause_keep: 0.5
 
 ducking:
-  amount_db: -12
+  # Now that narration is levelled to audio.speech_target_lufs before the mix
+  # (see above), the music can duck a bit deeper without either burying a
+  # quiet take or barely moving under a loud one: -15 dB under a cue mixed at
+  # -18...-21 dB is comfortably under a -16 LUFS voice.
+  amount_db: -15
   attack: 0.15
   release: 0.6
   pre_roll: 0.15
@@ -235,6 +253,18 @@ pacing:
     - { at: 180.0, label: re-engagement-1 }
     - { at: 360.0, label: re-engagement-2 }
     - { at: -20.0, label: payoff-cta }   # negative = relative to the end
+
+# Location cards (`ytedit captions`, ytedit/ai/locations.py): one card at
+# every genuinely new place, anchored to its segment so later padding/overlay/
+# dedupe passes never leave it drifting under the wrong shot.
+captions:
+  min_gap_s: 90.0          # don't re-card a place already shown this recently
+  location_seconds: 2.4    # on-screen duration of a generated location card
+  card_offset_s: 0.3       # seconds after the segment's cut before the card appears
+  min_segment_s: 2.5       # a shorter segment defers the card to the next same-place one
+  skip_cold_open_s: 10.0   # no cards during the cold-open montage
+  end_screen_s: 15.0       # nor in the closing seconds
+  max_tokens: 16000        # writer call that normalizes footage-log place names
 
 render:
   # Concurrent ffmpeg processes for the segment pass. Each ffmpeg already

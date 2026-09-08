@@ -843,9 +843,10 @@ def create_app(
             raise HTTPException(422, {"detail": "invalid timeline", "errors": exc.errors(
                 include_url=False)}) from exc
         # A hand edit in the Program view can move the segments an anchored
-        # voice pickup follows; re-pin it here before validating/saving rather
-        # than trusting whatever absolute `at` the client happened to send.
-        timeline.resolve_voice_anchors()
+        # voice pickup or caption follows; re-pin them here before
+        # validating/saving rather than trusting whatever absolute `at` the
+        # client happened to send.
+        timeline.resolve_anchors()
         issues = timeline.validate(project)
         if issues and not force:
             raise HTTPException(400, {"detail": "timeline has issues", "issues": issues})
@@ -895,7 +896,7 @@ def create_app(
         except ValidationError as exc:
             raise HTTPException(422, {"detail": "draft is not a valid timeline",
                                       "errors": exc.errors(include_url=False)}) from exc
-        timeline.resolve_voice_anchors()
+        timeline.resolve_anchors()
         backup = _backup_timeline(project)
         timeline.save(project.timeline_file)
         draft.unlink(missing_ok=True)

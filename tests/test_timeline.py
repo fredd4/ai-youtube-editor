@@ -10,6 +10,7 @@ from ytedit.project import Project
 from ytedit.timeline import (
     AudioFrom,
     Caption,
+    CaptionAnchor,
     Chapter,
     MusicCue,
     MuteRange,
@@ -222,6 +223,108 @@ def test_resolve_voice_anchors_ignores_unanchored_items() -> None:
     moved = tl.resolve_voice_anchors()
     assert moved == 0
     assert tl.tracks.voice[0].at == pytest.approx(2.0)
+
+
+# ----------------------------------------------------------------------
+# caption anchors
+# ----------------------------------------------------------------------
+def test_resolve_anchors_moves_caption_and_keeps_its_duration() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[
+                _segment("s001", "c001", 0.0, 4.0),
+                _segment("s002", "c002", 0.0, 3.0),
+            ],
+            captions=[
+                Caption(
+                    id="t001", at=0.0, end=0.7, text="Lisboa", style="location",
+                    anchor=CaptionAnchor(segment="s002", offset=0.3),
+                )
+            ],
+        )
+    )
+    moved = tl.resolve_anchors()
+    assert moved == 1
+    cap = tl.tracks.captions[0]
+    # s002 starts at 4.0s; offset 0.3s -> at 4.3, duration (0.7 - 0.0) kept.
+    assert cap.at == pytest.approx(4.3)
+    assert cap.end == pytest.approx(5.0)
+
+
+def test_resolve_anchors_resolves_voice_and_captions_together() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[
+                _segment("s001", "c001", 0.0, 4.0),
+                _segment("s002", "c002", 0.0, 3.0),
+            ],
+            voice=[
+                VoiceItem(
+                    id="v001", file="voice/n001.wav", at=0.0, end=2.0,
+                    anchor=VoiceAnchor(segment="s002", offset=0.5),
+                )
+            ],
+            captions=[
+                Caption(
+                    id="t001", at=0.0, end=0.7, text="Lisboa", style="location",
+                    anchor=CaptionAnchor(segment="s002", offset=0.3),
+                )
+            ],
+        )
+    )
+    moved = tl.resolve_anchors()
+    assert moved == 2
+    assert tl.tracks.voice[0].at == pytest.approx(4.5)
+    assert tl.tracks.captions[0].at == pytest.approx(4.3)
+
+
+def test_resolve_anchors_caption_dangling_segment_keeps_absolute_time() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[_segment("s001", "c001", 0.0, 4.0)],
+            captions=[
+                Caption(
+                    id="t001", at=7.5, end=9.0, text="Lisboa", style="location",
+                    anchor=CaptionAnchor(segment="s999", offset=0.0),
+                )
+            ],
+        )
+    )
+    moved = tl.resolve_anchors()
+    assert moved == 0
+    cap = tl.tracks.captions[0]
+    assert cap.at == pytest.approx(7.5)
+    assert cap.end == pytest.approx(9.0)
+
+
+def test_resolve_anchors_ignores_unanchored_captions() -> None:
+    tl = Timeline(
+        tracks=Tracks(
+            video=[_segment("s001", "c001", 0.0, 4.0)],
+            captions=[Caption(id="t001", at=2.0, end=3.0, text="Lisboa", style="location")],
+        )
+    )
+    moved = tl.resolve_anchors()
+    assert moved == 0
+    assert tl.tracks.captions[0].at == pytest.approx(2.0)
+
+
+def test_resolve_voice_anchors_is_an_alias_for_resolve_anchors() -> None:
+    """The pre-caption-anchor name still works and resolves captions too."""
+    tl = Timeline(
+        tracks=Tracks(
+            video=[_segment("s001", "c001", 0.0, 4.0), _segment("s002", "c002", 0.0, 3.0)],
+            captions=[
+                Caption(
+                    id="t001", at=0.0, end=0.7, text="Lisboa", style="location",
+                    anchor=CaptionAnchor(segment="s002", offset=0.3),
+                )
+            ],
+        )
+    )
+    moved = tl.resolve_voice_anchors()
+    assert moved == 1
+    assert tl.tracks.captions[0].at == pytest.approx(4.3)
 
 
 # ----------------------------------------------------------------------

@@ -130,8 +130,10 @@ def measure_loudness(
     TP: float = -1.0,
     LRA: float = 11.0,
     pre_chain: str = "",
+    start: float | None = None,
+    duration: float | None = None,
 ) -> dict[str, float]:
-    """Run the loudnorm analysis pass over a file.
+    """Run the loudnorm analysis pass over a file (or a range of it).
 
     Args:
         path: Audio or video file to measure.
@@ -140,6 +142,9 @@ def measure_loudness(
         LRA: Target loudness range in LU.
         pre_chain: Optional filters applied before the measurement (the same
             chain :func:`normalize` will apply before ``loudnorm``).
+        start: Optional ``-ss`` seconds into ``path`` — measure a range
+            instead of the whole file (e.g. one cut's audio).
+        duration: Optional ``-t`` seconds to read after ``start``.
 
     Returns:
         The parsed pass-1 report (see :func:`parse_loudnorm`).
@@ -147,12 +152,13 @@ def measure_loudness(
     chain = f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json"
     if pre_chain:
         chain = f"{pre_chain},{chain}"
-    stderr = ff(
-        "-i", str(path),
-        "-map", "0:a:0",
-        "-af", chain,
-        "-f", "null", "-",
-    )
+    args: list[Any] = []
+    if start is not None:
+        args += ["-ss", f"{float(start):.6f}"]
+    if duration is not None:
+        args += ["-t", f"{float(duration):.6f}"]
+    args += ["-i", str(path), "-map", "0:a:0", "-af", chain, "-f", "null", "-"]
+    stderr = ff(*args)
     return parse_loudnorm(stderr)
 
 
@@ -495,6 +501,177 @@ def duck_automation(
     return "\n".join(lines) + "\n"
 
 
+def speech_gate_expr(ranges: Sequence[tuple[float, float]], duration: float) -> str:
+    """Return a ``volume`` chain that silences everything OUTSIDE ``ranges``.
+
+    Used to gate a loudness measurement to just the speech portion of a cut
+    (see :func:`measure_speech_gain`): the complement of ``ranges`` within
+    ``[0, duration]`` is dropped to :data:`SILENCE_DB`, so ``loudnorm``'s own
+    below-threshold gating excludes it from the integrated measurement instead
+    of needing a real ``aselect``/``atrim`` splice.
+
+    Args:
+        ranges: ``(start, end)`` speech spans, any order.
+        duration: Total length of the audio being measured.
+
+    Returns:
+        A filter chain (via :func:`mute_ranges_expr`), or ``""`` when the
+        ranges already cover the whole duration.
+    """
+    total = max(0.0, float(duration))
+    spans = sorted((max(0.0, float(s)), min(total, float(e))) for s, e in ranges if e > s)
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in spans:
+        if start > cursor + 1e-6:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if total - cursor > 1e-6:
+        gaps.append((cursor, total))
+    if not gaps:
+        return ""
+    return mute_ranges_expr((s, e, SILENCE_DB) for s, e in gaps)
+
+
+def measure_speech_gain(
+    path: Path | str,
+    start: float,
+    raw_duration: float,
+    speech_ranges: Sequence[tuple[float, float]],
+    span: float,
+    target_lufs: float = -16.0,
+    max_gain_db: float = 10.0,
+    coverage_threshold: float = 0.6,
+    pre_chain: str = "",
+) -> tuple[float, float]:
+    """Measure a cut's speech loudness and the gain that levels it to ``target_lufs``.
+
+    Runs the loudnorm analysis pass (:func:`measure_loudness`) over
+    ``[start, start + raw_duration)`` of ``path``. When ``speech_ranges``
+    (already expressed in the same post-``pre_chain`` time base as ``span`` —
+    e.g. divided by speed when ``pre_chain`` includes an ``atempo``) cover less
+    than ``coverage_threshold`` of ``span``, everything outside them is muted
+    first (:func:`speech_gate_expr`) so the measurement reflects the
+    narration, not the ambience around it; a cut where speech already
+    dominates is measured whole (cheaper, and avoids a jittery gate right at a
+    word boundary).
+
+    Args:
+        path: Audio file to measure — the cut's own source, its active
+            denoised WAV, or an ``audio_from`` clip's source.
+        start: ``-ss`` seconds into ``path`` (the cut's own ``in``, or the
+            ``audio_from`` range's ``in``).
+        raw_duration: ``-t`` seconds to read, in ``path``'s own (pre-speed)
+            time base.
+        speech_ranges: Transcript word ranges, already converted into the time
+            base ``pre_chain`` leaves the audio in.
+        span: Total length of the audio in that same post-``pre_chain`` time
+            base — used for coverage and to bound the gate.
+        target_lufs: Target integrated loudness for the cut's speech.
+        max_gain_db: Symmetric clamp on the computed gain.
+        coverage_threshold: Speech-to-total ratio above which gating is
+            skipped and the whole cut is measured instead.
+        pre_chain: Filters already destined for this cut (``aformat``,
+            ``atempo``, manual gain, mute ranges) — applied before the gate and
+            the loudnorm analysis, so the measurement matches what the cut
+            will actually sound like once mixed.
+
+    Returns:
+        ``(gain_db, measured_lufs)``. ``gain_db`` is ``0.0`` when there is
+        nothing to measure or the measurement is not finite (e.g. digital
+        silence), in which case ``measured_lufs`` is ``nan``.
+    """
+    if not speech_ranges or span <= 0 or raw_duration <= 0:
+        return 0.0, float("nan")
+    covered = sum(max(0.0, min(e, span) - max(s, 0.0)) for s, e in speech_ranges)
+    coverage = covered / span if span else 0.0
+    chain = pre_chain
+    if coverage < coverage_threshold:
+        gate = speech_gate_expr(speech_ranges, span)
+        if gate:
+            chain = f"{chain},{gate}" if chain else gate
+    try:
+        report = measure_loudness(path, pre_chain=chain, start=start, duration=raw_duration)
+    except (FFmpegError, ValueError) as exc:
+        log.warning("speech-gain measurement failed for %s: %s", path, exc)
+        return 0.0, float("nan")
+    measured = float(report.get("input_i", float("nan")))
+    if not math.isfinite(measured):
+        return 0.0, measured
+    clamp = abs(float(max_gain_db))
+    gain = max(-clamp, min(clamp, float(target_lufs) - measured))
+    return round(gain, 3), round(measured, 3)
+
+
+def level_voice_file_gain(
+    path: Path | str,
+    target_lufs: float = -16.0,
+    max_gain_db: float = 10.0,
+) -> tuple[float, float]:
+    """Return ``(gain_db, measured_lufs)`` leveling a voice pickup file.
+
+    The measurement is cached next to the file as ``<file>.loudness.json``,
+    keyed by the file's mtime and the target/clamp: a re-recorded pickup (new
+    mtime) or a changed ``speech_target_lufs``/``speech_gain_max_db`` forces a
+    fresh measurement; otherwise repeated mixes read the cache instead of
+    re-running ffmpeg every time.
+
+    Args:
+        path: The voice pickup WAV.
+        target_lufs: Target integrated loudness.
+        max_gain_db: Symmetric clamp on the computed gain.
+
+    Returns:
+        ``(gain_db, measured_lufs)``; ``(0.0, nan)`` when the file cannot be
+        read or the measurement is not finite.
+    """
+    source = Path(path)
+    cache = source.with_name(source.name + ".loudness.json")
+    try:
+        mtime = source.stat().st_mtime_ns
+    except OSError:
+        return 0.0, float("nan")
+
+    if cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if (
+                data.get("mtime_ns") == mtime
+                and data.get("target_lufs") == target_lufs
+                and data.get("max_gain_db") == max_gain_db
+                and data.get("measured_lufs") is not None
+            ):
+                return float(data["gain_db"]), float(data["measured_lufs"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass  # fall through and remeasure
+
+    try:
+        report = measure_loudness(source)
+    except (FFmpegError, ValueError) as exc:
+        log.warning("voice pickup %s: loudness measurement failed (%s)", source.name, exc)
+        return 0.0, float("nan")
+    measured = float(report.get("input_i", float("nan")))
+    if math.isfinite(measured):
+        clamp = abs(float(max_gain_db))
+        gain = max(-clamp, min(clamp, float(target_lufs) - measured))
+    else:
+        gain = 0.0
+    try:
+        cache.write_text(
+            json.dumps({
+                "mtime_ns": mtime,
+                "target_lufs": target_lufs,
+                "max_gain_db": max_gain_db,
+                "measured_lufs": round(measured, 3) if math.isfinite(measured) else None,
+                "gain_db": round(gain, 3),
+            }),
+            encoding="utf-8",
+        )
+    except OSError:  # pragma: no cover - best-effort cache
+        pass
+    return round(gain, 3), (round(measured, 3) if math.isfinite(measured) else measured)
+
+
 def mute_ranges_expr(ranges: Iterable[tuple[float, float, float]]) -> str:
     """Build a ``volume`` chain that attenuates the given ranges.
 
@@ -540,7 +717,15 @@ def voice_cleanup_chain(level: str = "light") -> str:
     key = (level or "none").lower()
     if key in ("none", "off", ""):
         return ""
-    compressor = "acompressor=threshold=-18dB:ratio=3:attack=5:release=120"
+    # Runs on the program voice bus AFTER per-segment/per-pickup speech
+    # leveling (render.py's segment pass and build_audio_bus's voice-pickup
+    # gain), which already brings narration close to audio.speech_target_lufs
+    # cut by cut. This stage's job is consistency glue, not gain-riding, so it
+    # is a gentle ratio/attack/release with unity makeup gain (ffmpeg's
+    # acompressor takes `makeup` as a linear factor, 1..64 — 1 means "add
+    # none") — a hungrier setting would audibly pump an already-levelled bus
+    # instead of smoothing it.
+    compressor = "acompressor=threshold=-18dB:ratio=2.5:attack=15:release=250:makeup=1"
     if key == "light":
         return f"highpass=f=80,{compressor}"
     if key == "full":

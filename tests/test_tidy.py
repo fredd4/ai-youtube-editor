@@ -16,6 +16,7 @@ from ytedit.project import Project
 from ytedit.timeline import (
     AudioFrom,
     Caption,
+    CaptionAnchor,
     Timeline,
     VideoSegment,
     VoiceAnchor,
@@ -346,6 +347,45 @@ def test_anchored_voice_item_follows_its_segment_through_padding_and_a_merge(
     assert item.anchor is not None and item.anchor.segment == "s004"
     assert item.at == pytest.approx(target_start + 0.25, abs=1e-3)
     assert item.end == pytest.approx(item.at + 1.0, abs=1e-3)  # length (1000-999) kept
+
+
+def test_anchored_caption_follows_its_segment_through_padding_and_a_merge(
+    project: Project,
+) -> None:
+    """A location card anchored to a segment tracks it through ``tidy``, unlike
+    the plain absolute-time caption in ``test_voice_items_shift_with_padding``
+    (which only gets an approximate remap, the drift this feature fixes).
+    """
+    add_clip(project, "c001", 60.0, SPACED)
+    add_clip(project, "c002", 30.0)
+    add_clip(project, "c003", 30.0)
+    tl = timeline_of(
+        seg("s001", "c001", 3.1, 5.4),  # pads to (2.8, 5.85): grows the timeline
+        seg("s002", "c002", 1.0, 2.5),  # merges with s003 (0.05s gap): s003 dropped
+        seg("s003", "c002", 2.55, 4.0),
+        seg("s004", "c003", 5.0, 8.0),  # the anchor target
+    )
+    tl.tracks.captions = [
+        Caption(
+            id="t001", at=999.0, end=999.7, text="Lisboa", style="location",
+            anchor=CaptionAnchor(segment="s004", offset=0.3),
+        )
+    ]
+    tl.save(project.timeline_file)
+
+    result = tidy(project)
+    assert result["written"] == "plan/timeline.json"
+
+    saved = Timeline.load(project.timeline_file)
+    assert "s003" not in [s.id for s in saved.tracks.video]  # earlier segment dropped
+
+    target_start = next(
+        p.start for p in saved.segment_positions() if p.segment.id == "s004"
+    )
+    cap = saved.tracks.captions[0]
+    assert cap.anchor is not None and cap.anchor.segment == "s004"
+    assert cap.at == pytest.approx(target_start + 0.3, abs=1e-3)
+    assert cap.end == pytest.approx(cap.at + 0.7, abs=1e-3)  # duration (999.7-999) kept
 
 
 def test_voice_items_are_untouched_when_nothing_moves(project: Project) -> None:

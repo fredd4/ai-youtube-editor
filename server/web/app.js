@@ -1395,10 +1395,21 @@ function renderProgStrip() {
     // runs down through every lane and scrolls with the content.
     el('div', { class: 'prog-playhead', id: 'prog-playhead' }),
     strip,
-    lane('captions', width, (S.timeline.tracks?.captions || []).map((c) => ({
-      start: +c.at || 0, end: +c.end || 0, label: c.text || c.id, cls: 'cap',
-      title: `${c.id} · ${c.style} · ${tc(c.at)}–${tc(c.end)}\n${c.text || ''}`,
-    })), pps),
+    lane('captions', width, (S.timeline.tracks?.captions || []).map((c) => {
+      // A location card (or an anchored hook line) is pinned to a video
+      // segment rather than absolute time (see Timeline.resolve_anchors /
+      // ytedit/ai/locations.py) so it follows its picture through later
+      // padding/overlay/dedupe passes — shown read-only, same as the voice
+      // lane's anchor tag.
+      const anchorTag = c.anchor ? ` ⚓${c.anchor.segment}` : '';
+      const anchorNote = c.anchor
+        ? `\nanchored to ${c.anchor.segment} +${(+c.anchor.offset || 0).toFixed(2)}s`
+        : '';
+      return {
+        start: +c.at || 0, end: +c.end || 0, label: `${c.text || c.id}${anchorTag}`, cls: 'cap',
+        title: `${c.id} · ${c.style} · ${tc(c.at)}–${tc(c.end)}\n${c.text || ''}${anchorNote}`,
+      };
+    }), pps),
     lane('music', width, (S.timeline.tracks?.music || []).map((m) => ({
       start: +m.at || 0, end: +m.end || 0,
       label: `♪ ${m.id} ${m.gain_db ?? -18} dB`, cls: 'mus',

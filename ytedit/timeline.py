@@ -191,6 +191,22 @@ class VoiceAnchor(_Model):
     offset: float = 0.0
 
 
+class CaptionAnchor(_Model):
+    """Pins a :class:`Caption` to a video segment instead of absolute time.
+
+    ``offset`` seconds after the start of video segment ``segment`` (its
+    :attr:`SegmentPosition.start`, see :meth:`Timeline.segment_positions`).
+    Re-resolved by :meth:`Timeline.resolve_anchors` whenever the segment may
+    have moved — speech padding, sentence snapping, overlay cutaways, audio
+    dedupe, or a hand edit in the web editor all shift absolute time, but a
+    location card or hook line anchored this way follows its picture instead
+    of drifting under the wrong shot (see ``ytedit/ai/locations.py``).
+    """
+
+    segment: str
+    offset: float = 0.0
+
+
 class VoiceItem(_Model):
     """A narration pickup placed at an absolute timeline position.
 
@@ -236,6 +252,9 @@ class Caption(_Model):
     text: str = ""
     style: str = "location"
     position: CaptionPosition = "lower-left"
+    #: When set, this cue is pinned to a video segment instead of absolute
+    #: time (see :class:`CaptionAnchor`).
+    anchor: CaptionAnchor | None = None
 
     @property
     def duration(self) -> float:
@@ -416,14 +435,16 @@ class Timeline(_Model):
                 return pos
         return None
 
-    def resolve_voice_anchors(self) -> int:
-        """Recompute ``at``/``end`` for every anchored voice item.
+    def resolve_anchors(self) -> int:
+        """Recompute ``at``/``end`` for every anchored voice item and caption.
 
-        For each :class:`VoiceItem` carrying an :class:`VoiceAnchor`, ``at`` is
-        set to ``offset`` seconds after the current start of video segment
+        For each :class:`VoiceItem` or :class:`Caption` carrying an anchor
+        (:class:`VoiceAnchor` / :class:`CaptionAnchor`), ``at`` is set to
+        ``offset`` seconds after the current start of video segment
         ``anchor.segment`` (from :meth:`segment_positions`), and ``end`` is
         moved along with it so the item's length never changes (``length =
-        old end - old at``, or left ``None`` when it already was).
+        old end - old at`` for a voice item, or left ``None`` when it already
+        was; always ``end - at`` for a caption).
 
         An item whose anchor segment is no longer in the timeline (dropped by
         padding, overlay, dedupe or a hand edit) keeps its current absolute
@@ -431,8 +452,9 @@ class Timeline(_Model):
         a crash or a silent teleport to time zero.
 
         Returns:
-            The number of items successfully resolved against their anchor
-            (items with no anchor, or a dangling one, are not counted).
+            The number of items (voice + captions combined) successfully
+            resolved against their anchor (items with no anchor, or a
+            dangling one, are not counted).
         """
         starts = {pos.segment.id: pos.start for pos in self.segment_positions()}
         resolved = 0
@@ -452,7 +474,30 @@ class Timeline(_Model):
             if length is not None:
                 item.end = round(item.at + length, 3)
             resolved += 1
+        for cap in self.tracks.captions:
+            if cap.anchor is None:
+                continue
+            seg_start = starts.get(cap.anchor.segment)
+            if seg_start is None:
+                log.warning(
+                    "caption %s: anchor segment %r no longer exists — "
+                    "keeping absolute time %.3fs",
+                    cap.id, cap.anchor.segment, cap.at,
+                )
+                continue
+            length = cap.end - cap.at
+            cap.at = round(seg_start + cap.anchor.offset, 3)
+            cap.end = round(cap.at + length, 3)
+            resolved += 1
         return resolved
+
+    def resolve_voice_anchors(self) -> int:
+        """Alias for :meth:`resolve_anchors` (kept for backward compatibility).
+
+        The name predates caption anchoring; every call site now wants both
+        tracks resolved together, so this simply forwards.
+        """
+        return self.resolve_anchors()
 
     def clip_ids(self) -> list[str]:
         """Distinct source clip ids referenced by the video track, in order."""
