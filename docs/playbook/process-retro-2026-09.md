@@ -74,3 +74,13 @@ ingest ~2 h (HLG tonemap), each full render 25–45 min.
 7. **Hold-out check before the master**: a scripted listen-through — transcribe the rendered
    preview's audio and diff it against the planned script (sentence ids). Any sentence heard
    twice or cut short is caught by machine before the user watches.
+
+## 4. Lessons (added after the third correction round, 2026-09-08)
+
+1. **Draft first, always.** Every review round is a light draft from proxies (`render --draft`), never a master. The master is rendered once, after the user's OK, on the hardware tier. Rationale: three masters were rendered on this project, each an hour of machine time, and every one was superseded by a note that a draft would have surfaced.
+2. **Identity, not position.** Anything that must stay attached to a picture (pickups, captions, chapters) references a stable segment uid, never an absolute time or an ordinal. Two of the three correction rounds were drift bugs of this kind.
+3. **Machine-checkable gates before every hand-over.** QC 31–35 (no audio twice, sentence boundaries, pickup over speech, anchors) plus the script check and the reports of `voice`/`captions`. If a class of error reaches the user, the fix is a rule, not a manual check.
+4. **No scratch scripts on the timeline.** Every splice goes through `Timeline.insert_segments/remove_segments/replace_segment` or a CLI stage. The scratch script that renumbered segments is exactly how round three happened.
+5. **Ask for the timecode, then look it up.** `ytedit at` turns "at 4:27" into segment and sentence ids; guessing from memory of the cut is how narration was moved to the wrong place.
+6. **Cost and disk are budgets, not surprises.** Denoise everything the user speaks in (about $0.12 per clip minute), generate music once the cut is stable, `clean` after every master, keep 20 GB free.
+7. **The story is a script.** Sentences are the unit; retakes and semantic repeats are removed before picture exists; a summary-level callback is fine, a restated fact is not.

@@ -4,14 +4,16 @@ Five passes, each writing an artifact the next one reads (so a failed render
 can be resumed and a preview can be diffed against a master):
 
 1. **Segment pass** — every ``VideoSegment`` is cut from its normalized
-   mezzanine, graded, fitted to the canvas and written to
-   ``renders/segments/<hash>.mp4`` with PCM audio. The hash covers the segment
-   spec, the canvas, the encoder preset and the source mtime, so unchanged
-   segments are reused across renders. A clip with ``use_denoised`` set in
-   ``state.json`` takes its audio from ``media/audio/<clip>.denoised.wav``
-   instead of the mezzanine's own stream (that file's mtime is in the key too).
-   A segment carrying ``audio_from`` keeps its own picture but reads its audio
-   from another clip's range (an overlay cutaway with the narration running on
+   mezzanine (``--draft`` instead cuts picture from the 720p ingest proxy,
+   audio still from the mezzanine — see below), graded, fitted to the canvas
+   and written to ``renders/segments/<hash>.mp4`` (``renders/segments_draft/``
+   for ``--draft``) with PCM audio. The hash covers the segment spec, the
+   canvas, the encoder preset and the source mtime, so unchanged segments are
+   reused across renders. A clip with ``use_denoised`` set in ``state.json``
+   takes its audio from ``media/audio/<clip>.denoised.wav`` instead of the
+   mezzanine's own stream (that file's mtime is in the key too). A segment
+   carrying ``audio_from`` keeps its own picture but reads its audio from
+   another clip's range (an overlay cutaway with the narration running on
    underneath); that range is trimmed or padded to the segment's own frame
    count, and the audio clip's mute ranges, denoised WAV and mtime all take part
    in the cache key.
@@ -24,8 +26,18 @@ can be resumed and a preview can be diffed against a master):
    normalized to −14 LUFS / −1 dBTP into ``renders/final_audio.wav``.
 4. **Captions** — ``renders/captions.ass`` is burned in the final pass;
    ``exports/captions.srt`` is written from the transcripts for upload.
-5. **Final encode** — programme video + final audio, muxed with the master or
-   preview preset.
+5. **Final encode** — programme video + final audio, muxed with the master,
+   preview or draft preset (``renders/draft.mp4`` for ``--draft``: ~1 MB/10s,
+   meant for a first full-timeline review, not for watching quality).
+
+Render tiers
+------------
+``--draft`` < ``--preview`` < ``--master`` (default hardware tier) <
+``--master --x264`` (slowest, highest quality) in both speed and quality.
+Audio processing (denoise, speech leveling, ducking, loudnorm) is identical
+from ``--draft`` upward — only the picture source/encoder and the final
+video bitrate change — so a draft always previews what the master will
+sound like, just not what it will look like.
 
 Timeline time vs render time
 ---------------------------
@@ -230,29 +242,42 @@ def video_encoder_args(settings: Settings, mode: str, fps: int, fast: bool = Fal
     """Return the ``-c:v ...`` arguments for the final encode.
 
     Args:
-        settings: Project settings (``encoding.master`` / ``encoding.preview``).
-        mode: ``"master"`` or ``"preview"``.
+        settings: Project settings (``encoding.master`` / ``encoding.preview``
+            / ``encoding.draft``).
+        mode: ``"master"``, ``"preview"`` or ``"draft"``.
         fps: Output frame rate (drives the GOP length).
         fast: For ``mode == "master"``, use the ``encoding.master_fast``
-            hardware-encoder tier (``h264_videotoolbox``) instead of the
-            default ``libx264`` tier — a full-resolution export in a fraction
-            of the time, at some quality cost YouTube's own re-encode mostly
-            absorbs. Falls back to the default tier when the hardware encoder
-            is not available on this machine. Ignored for previews (already
+            hardware-encoder tier (``h264_videotoolbox``) — the default —
+            instead of the ``encoding.master`` ``libx264`` tier reached with
+            ``--x264``: a full-resolution export in a fraction of the time,
+            at some quality cost YouTube's own re-encode mostly absorbs.
+            Falls back to the x264 tier when the hardware encoder is not
+            available on this machine. Ignored for previews/drafts (already
             hardware-encoded when possible).
 
     Returns:
         A flat argument list.
     """
-    if mode == "preview":
-        enc = settings.encoding("preview")
+    if mode in ("preview", "draft"):
+        enc = settings.encoding(mode)
+        default_q = 60 if mode == "preview" else 32
         if has_encoder(str(enc.get("vcodec", "h264_videotoolbox"))):
-            return [
+            args = [
                 "-c:v", str(enc.get("vcodec", "h264_videotoolbox")),
-                "-q:v", str(enc.get("q", 60)),
+            ]
+            if "bitrate" in enc:
+                args += [
+                    "-b:v", str(enc.get("bitrate")),
+                    "-maxrate", str(enc.get("maxrate", enc.get("bitrate"))),
+                    "-bufsize", str(enc.get("bufsize", enc.get("bitrate"))),
+                ]
+            else:
+                args += ["-q:v", str(enc.get("q", default_q))]
+            args += [
                 "-profile:v", str(enc.get("profile", "high")),
                 "-pix_fmt", str(enc.get("pix_fmt", "yuv420p")),
             ]
+            return args
         return [
             "-c:v", str(enc.get("fallback_vcodec", "libx264")),
             "-crf", str(enc.get("fallback_crf", 23)),
@@ -279,8 +304,8 @@ def video_encoder_args(settings: Settings, mode: str, fps: int, fast: bool = Fal
                 "-colorspace", str(enc.get("colorspace", "bt709")),
             ]
         log.warning(
-            "master --fast requested but %s is not available on this machine; "
-            "falling back to the default x264 tier", vcodec,
+            "master's default hardware tier wants %s but it is not available on this "
+            "machine; falling back to the x264 tier", vcodec,
         )
 
     enc = settings.encoding("master")
@@ -314,6 +339,22 @@ def segment_encoder_args(settings: Settings, mode: str) -> list[str]:
                 "-profile:v", "high",
                 "-pix_fmt", "yuv420p",
             ]
+    if mode == "draft":
+        enc = settings.encoding("draft_segment")
+        vcodec = str(enc.get("vcodec", "h264_videotoolbox"))
+        if has_encoder(vcodec):
+            return [
+                "-c:v", vcodec,
+                "-q:v", str(enc.get("q", 45)),
+                "-profile:v", "high",
+                "-pix_fmt", "yuv420p",
+            ]
+        return [
+            "-c:v", str(enc.get("fallback_vcodec", "libx264")),
+            "-crf", str(enc.get("fallback_crf", 26)),
+            "-preset", str(enc.get("fallback_preset", "ultrafast")),
+            "-pix_fmt", str(enc.get("pix_fmt", "yuv420p")),
+        ]
     enc = settings.encoding("segment")
     return [
         "-c:v", str(enc.get("vcodec", "libx264")),
@@ -350,10 +391,16 @@ def aac_encoder(bitrate: int) -> str:
     return "aac"
 
 
-def audio_encoder_args(settings: Settings) -> list[str]:
-    """Return the ``-c:a ...`` arguments for the final mux (AAC-LC 384k/48k)."""
+def audio_encoder_args(settings: Settings, mode: str = "master") -> list[str]:
+    """Return the ``-c:a ...`` arguments for the final mux (AAC-LC 384k/48k).
+
+    ``mode == "draft"`` uses ``audio.draft_abitrate`` (default 128k) instead —
+    the processing (denoise, speech leveling, ducking, loudnorm) is identical
+    to preview/master, only the container bitrate drops, to help hit the
+    draft tier's ~1 MB/10s size target.
+    """
     cfg = settings.section("audio")
-    bitrate = str(cfg.get("abitrate", "384k"))
+    bitrate = str(cfg.get("draft_abitrate", "128k") if mode == "draft" else cfg.get("abitrate", "384k"))
     codec = str(cfg.get("acodec", "aac"))
     if codec == "aac":
         codec = aac_encoder(parse_bitrate(bitrate))
@@ -565,12 +612,24 @@ def segment_key(
     # re-transcribed clip or a changed audio.speech_target_lufs/
     # speech_gain_max_db must invalidate the segment just like a re-denoise.
     transcript_stamp = _transcript_stamp(project, seg.audio_source[0])
+    # A --draft segment is cut from the proxy, not the mezzanine: re-ingesting
+    # (a new proxy) must invalidate the draft cache even when the mezzanine
+    # itself is untouched. Harmless no-op for preview/master, which never cut
+    # picture from the proxy.
+    video_stamp: list[Any] | None = None
+    if mode == "draft":
+        proxy = project.proxy_path(seg.clip)
+        try:
+            video_stamp = [proxy.name, proxy.stat().st_mtime_ns, proxy.stat().st_size]
+        except OSError:
+            video_stamp = None
     payload = {
         "segment": seg.model_dump(by_alias=True, mode="json"),
         "canvas": [canvas.width, canvas.height, canvas.fps],
         "mode": mode,
         "mute": segment_mute_ranges(timeline, seg),
         "source": [source.name, mtime, size],
+        "video_source": video_stamp,
         "denoised": denoise_stamp,
         "audio_from": (
             seg.audio_from.model_dump(by_alias=True, mode="json")
@@ -584,7 +643,7 @@ def segment_key(
         "speech_gain_max_db": float(project.settings.get("audio.speech_gain_max_db", 10.0)),
         "grade": project.settings.get(f"grade.presets.{seg.grade}", []),
         "frames": seg.frames(canvas.fps),
-        "version": 5,
+        "version": 6,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
@@ -621,6 +680,39 @@ def _source_has_audio(path: Path) -> bool:
     return bool(info.get("streams"))
 
 
+@functools.lru_cache(maxsize=256)
+def _video_dimensions(path: Path) -> tuple[int, int] | None:
+    """Return ``(width, height)`` of a file's first video stream, cached per path.
+
+    Used for the ``--draft`` tier, where the segment pass cuts from the
+    ingest proxy rather than the mezzanine — ``state.json.clips[*].width/
+    height`` describe the *mezzanine*, not the (differently sized) proxy, so
+    the fit/scale chain needs the proxy's own coded size.
+    """
+    try:
+        info = ffprobe_json(path, "-show_streams", "-select_streams", "v")
+    except Exception:  # pragma: no cover - probe failure -> caller falls back
+        return None
+    for stream in info.get("streams", []):
+        w, h = stream.get("width"), stream.get("height")
+        if w and h:
+            return int(w), int(h)
+    return None
+
+
+def segment_cache_dir(project: Project, mode: str) -> Path:
+    """Return the segment cache directory for a render mode.
+
+    ``--draft`` gets its own ``renders/segments_draft/`` namespace so a
+    draft render never invalidates (or is invalidated by) the preview/master
+    segment cache in ``renders/segments/`` and vice versa — the two cuts are
+    encoded from different source resolutions and could otherwise collide on
+    an unlucky hash, or simply bloat one directory with files the other tier
+    will never reuse.
+    """
+    return project.renders_dir / ("segments_draft" if mode == "draft" else "segments")
+
+
 def render_segment(
     project: Project,
     timeline: Timeline,
@@ -636,11 +728,12 @@ def render_segment(
         timeline: The timeline (for ``mute_ranges``).
         seg: Segment to render.
         canvas: Output geometry.
-        mode: ``"master"`` or ``"preview"`` (chooses the intermediate encoder).
+        mode: ``"master"``, ``"preview"`` or ``"draft"`` (chooses the
+            intermediate encoder and, for ``"draft"``, the picture source).
         force: Re-render even when the cached file exists.
 
     Returns:
-        Path to ``renders/segments/<hash>.mp4``.
+        Path to ``<segment_cache_dir>/<hash>.mp4`` (see :func:`segment_cache_dir`).
 
     Raises:
         RenderError: When the clip's mezzanine (or that of an ``audio_from``
@@ -651,7 +744,22 @@ def render_segment(
     if not source.exists():
         raise RenderError(f"{seg.id}: missing normalized source {source}")
 
-    out_dir = project.renders_dir / "segments"
+    # --draft cuts picture from the 720p ingest proxy instead of the
+    # mezzanine — far less data to decode across the whole segment pass.
+    # Audio always still comes from the mezzanine/denoised WAV below, so a
+    # draft sounds exactly like the master would.
+    video_source = source
+    if mode == "draft":
+        proxy = project.proxy_path(seg.clip)
+        if proxy.exists():
+            video_source = proxy
+        else:
+            log.warning(
+                "%s: --draft requested but no proxy at %s; cutting picture from the "
+                "mezzanine instead (run 'ytedit ingest' to build it)", seg.id, proxy,
+            )
+
+    out_dir = segment_cache_dir(project, mode)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{segment_key(project, timeline, seg, canvas, mode)}.mp4"
     tmp = out.with_name(out.stem + ".partial.mp4")
@@ -669,6 +777,14 @@ def render_segment(
     clip = state.get("clips", {}).get(seg.clip, {})
     src_w = int(clip.get("width") or canvas.width)
     src_h = int(clip.get("height") or canvas.height)
+    if video_source != source:
+        # state.json records the *mezzanine*'s size; the proxy is scaled to
+        # fit within ingest.proxy's box and keeps the source aspect ratio, so
+        # its coded size differs (and, for a vertical clip, is a completely
+        # different shape) from the mezzanine's.
+        dims = _video_dimensions(video_source)
+        if dims:
+            src_w, src_h = dims
     is_iphone = bool(clip.get("is_iphone", False))
     has_audio = bool(clip.get("has_audio", True))
     if has_audio and not _source_has_audio(source):
@@ -735,7 +851,7 @@ def render_segment(
         audio_source = source
         audio_has = has_audio
 
-    inputs: list[Any] = ["-ss", f"{seg.in_:.6f}", "-i", str(source)]
+    inputs: list[Any] = ["-ss", f"{seg.in_:.6f}", "-i", str(video_source)]
     silent = seg.mute_source or not audio_has
     cleaned = None if silent else denoised_audio(project, audio_clip, state)
     if silent:
@@ -756,6 +872,13 @@ def render_segment(
             "segment %s: audio from %s %.3f-%.3f", seg.id, audio_clip, audio_in, audio_out
         )
         inputs += ["-ss", f"{audio_in:.6f}", "-i", str(audio_source)]
+        audio_index = 1
+    elif video_source != source:
+        # The picture came from the (lossy 128k-AAC) proxy; its own audio
+        # must not leak into the mix, so pull the segment's audio from the
+        # full-quality mezzanine instead — a draft should sound exactly like
+        # the master, only look worse.
+        inputs += ["-ss", f"{seg.in_:.6f}", "-i", str(source)]
         audio_index = 1
     else:
         audio_index = 0
@@ -869,7 +992,7 @@ def _collect_speech_gains(
             key = segment_key(project, timeline, seg, canvas, mode)
         except Exception:  # pragma: no cover - defensive, mirrors clean()
             continue
-        sidecar = project.renders_dir / "segments" / f"{key}.gain.json"
+        sidecar = segment_cache_dir(project, mode) / f"{key}.gain.json"
         if not sidecar.exists():
             continue
         try:
@@ -1032,21 +1155,27 @@ def preflight(
     return issues
 
 
-def _check_disk_space(project: Project, duration: float, settings: Settings) -> None:
+def _check_disk_space(
+    project: Project, duration: float, settings: Settings, mode: str = "master"
+) -> None:
     """Refuse to start a render likely to fill the disk partway through.
 
     Rough sizing: ``render.mb_per_second`` (default 20, generous enough for a
     1080p master) times the programme length, times a
     ``render.disk_headroom_factor`` (default 3) safety margin over that — the
     segment cache, the joined intermediates and the final export all exist on
-    disk at once for a while during a render.
+    disk at once for a while during a render. ``mode == "draft"`` uses
+    ``render.draft_mb_per_second`` instead — a draft's proxy-sourced segments
+    and heavily compressed export are a fraction of the size.
 
     Raises:
         RenderError: When free space on the renders volume is under the
             computed threshold.
     """
     cfg = settings.section("render")
-    mb_per_second = float(cfg.get("mb_per_second", 20))
+    mb_per_second = float(
+        cfg.get("draft_mb_per_second", 1) if mode == "draft" else cfg.get("mb_per_second", 20)
+    )
     factor = float(cfg.get("disk_headroom_factor", 3))
     expected = max(0.0, duration) * mb_per_second * 1_048_576
     required = expected * factor
@@ -1508,23 +1637,36 @@ def render(
     project: Project,
     preview: bool = False,
     master: bool = False,
+    draft: bool = False,
     timeline_path: Path | str | None = None,
     out: Path | str | None = None,
     progress_cb: Callable[[Progress], None] | None = None,
     force_segments: bool = False,
     no_music: bool = False,
     no_voice: bool = False,
-    fast: bool = False,
+    x264: bool = False,
 ) -> Path:
-    """Render ``plan/timeline.json`` to a preview or a YouTube master.
+    """Render ``plan/timeline.json`` to a draft, preview or YouTube master.
 
     Args:
         project: Project to render.
-        preview: Fast 720p render with the hardware encoder and single-pass
-            loudness normalization.
-        master: Full-quality ``libx264 -crf 18 -preset medium`` export with
-            two-pass loudness normalization. Ignored when ``preview`` is set;
-            when neither flag is given a preview is rendered.
+        preview: Fast 720p render, full-resolution mezzanine source, hardware
+            encoder, single-pass loudness normalization.
+        master: Full-quality export with two-pass loudness normalization,
+            hardware-encoded by default (see ``x264``). Ignored when
+            ``preview``/``draft`` is set; when none of the three is given a
+            preview is rendered.
+        draft: Very fast, very low quality 720p render for a first review
+            pass before spending 10-25 minutes on a ``preview`` — segments
+            are cut from the 720p ingest proxy (falling back to the
+            mezzanine, with a warning, when a clip has none) instead of the
+            full-resolution mezzanine, and the final export targets roughly
+            1 MB/10s. Audio is processed exactly like preview/master
+            (denoise, speech leveling, ducking, loudnorm), so a draft sounds
+            like the master will, it just looks worse. Takes priority over
+            ``preview``/``master`` when set. Segments are cached in their own
+            ``renders/segments_draft/`` namespace, so a draft render never
+            invalidates (or is invalidated by) the preview/master cache.
         timeline_path: Timeline to render (default ``plan/timeline.json``).
         out: Explicit output path.
         progress_cb: Receives :class:`~ytedit.media.ffmpeg.Progress` blocks from
@@ -1534,8 +1676,12 @@ def render(
             not modified). Useful for a quick cut review before music beds
             exist — a missing cue file no longer blocks the render.
         no_voice: Ignore every voice pickup for this render, symmetrically.
-        fast: For a master, use the ``encoding.master_fast`` hardware-encoder
-            tier instead of the default ``libx264`` tier. Ignored for previews.
+        x264: For a master, use the ``encoding.master`` ``libx264`` tier
+            instead of the default ``encoding.master_fast`` hardware-encoder
+            tier — slower, for a final upload when the extra quality margin
+            is wanted. YouTube re-encodes on ingest either way, so the two
+            tiers land visually equivalent in the delivered stream. Ignored
+            for previews/drafts.
 
     Returns:
         The rendered file.
@@ -1545,7 +1691,7 @@ def render(
             pre-flight check finds a segment/range/file problem (see
             :func:`preflight`) — every problem is reported at once.
     """
-    mode = "preview" if preview or not master else "master"
+    mode = "draft" if draft else ("preview" if preview or not master else "master")
     source_timeline = Path(timeline_path) if timeline_path else project.timeline_file
     if not source_timeline.exists():
         raise RenderError(f"no timeline at {source_timeline} — run the plan stage first")
@@ -1563,7 +1709,7 @@ def render(
     if not timeline.tracks.video:
         raise RenderError("timeline has no video segments")
 
-    canvas = canvas_for(timeline, mode == "preview")
+    canvas = canvas_for(timeline, mode != "master")
     duration = render_duration(timeline)
     to_render = build_time_map(timeline)
     timeline_duration = timeline.duration()
@@ -1575,23 +1721,28 @@ def render(
         )
 
     project.ensure_dirs()
-    _check_disk_space(project, duration, project.settings)
+    _check_disk_space(project, duration, project.settings, mode=mode)
     project.set_stage("render", "running")
     job = _Job(project, mode, duration)
     workers = max(1, int(project.settings.get("render.workers", 3)))
+    tier_note = ""
+    if mode == "master":
+        tier_note = " · x264 tier" if x264 else " · hardware tier (default)"
     log.info(
         "render [stage]%s[/] · %s @ %d fps · %.2fs · %d segment(s)%s",
-        mode, canvas.size, canvas.fps, duration, len(timeline.tracks.video),
-        " · fast (hardware) tier" if mode == "master" and fast else "",
+        mode, canvas.size, canvas.fps, duration, len(timeline.tracks.video), tier_note,
     )
     if no_music:
         log.info("--no-music: music cues ignored for this render")
     if no_voice:
         log.info("--no-voice: voice pickups ignored for this render")
 
+    render_started = time.perf_counter()
+
     try:
         # -- pass 1: segments (parallel across render.workers) --------
         job.step("segments", 0.0)
+        pass_t0 = time.perf_counter()
 
         def _segment_done(completed: int, total: int, seg: VideoSegment) -> None:
             log.info("segment %d/%d done (%s)", completed, total, seg.id)
@@ -1601,6 +1752,7 @@ def render(
             project, timeline, canvas, mode,
             force=force_segments, workers=workers, on_done=_segment_done,
         )
+        log.info("segments pass: %.1fs", time.perf_counter() - pass_t0)
 
         speech_gains = _collect_speech_gains(project, timeline, canvas, mode)
         if speech_gains:
@@ -1610,27 +1762,36 @@ def render(
 
         # -- pass 2: join ---------------------------------------------
         job.step("join", 40.0)
+        pass_t0 = time.perf_counter()
         program_video, program_audio = join_segments(
             project, timeline, segments, canvas, mode
         )
+        log.info("join pass: %.1fs", time.perf_counter() - pass_t0)
 
         # -- pass 3: audio bus ----------------------------------------
         job.step("audio", 55.0)
+        pass_t0 = time.perf_counter()
         final_audio = build_audio_bus(
             project, timeline, program_audio, duration, to_render,
             two_pass=(mode == "master"), skip_music=no_music, skip_voice=no_voice,
         )
+        log.info("audio pass: %.1fs", time.perf_counter() - pass_t0)
 
         # -- pass 4: captions -----------------------------------------
         job.step("captions", 70.0)
+        pass_t0 = time.perf_counter()
         ass_path, _srt = build_captions(project, timeline, canvas, duration, to_render)
+        log.info("captions pass: %.1fs", time.perf_counter() - pass_t0)
 
         # -- pass 5: final encode -------------------------------------
         job.step("encode", 75.0)
+        pass_t0 = time.perf_counter()
         if out is not None:
             target = Path(out)
         elif mode == "preview":
             target = project.renders_dir / "preview.mp4"
+        elif mode == "draft":
+            target = project.renders_dir / "draft.mp4"
         else:
             target = project.exports_dir / f"master_{canvas.height}p.mp4"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1648,8 +1809,8 @@ def render(
         args += [
             "-map", "0:v:0",
             "-map", "1:a:0",
-            *video_encoder_args(project.settings, mode, canvas.fps, fast=fast),
-            *audio_encoder_args(project.settings),
+            *video_encoder_args(project.settings, mode, canvas.fps, fast=not x264),
+            *audio_encoder_args(project.settings, mode),
             "-movflags", "+faststart",
             "-t", f"{duration:.6f}",
             str(target),
@@ -1660,6 +1821,7 @@ def render(
             ff(*args, progress_cb=sink, total_duration=duration)
         finally:
             close()
+        log.info("encode pass: %.1fs", time.perf_counter() - pass_t0)
 
         job.finish(target)
         project.set_stage(
@@ -1670,7 +1832,10 @@ def render(
             canvas=canvas.size,
             fps=canvas.fps,
         )
-        log.info("render done: [stage]%s[/] (%.2fs)", target, duration)
+        log.info(
+            "render done: [stage]%s[/] (%.2fs programme, %.1fs wall)",
+            target, duration, time.perf_counter() - render_started,
+        )
         return target
     except (FFmpegError, RenderError, OSError, ValueError) as exc:
         job.finish(None, status="error", error=str(exc))
@@ -1733,7 +1898,9 @@ def referenced_segment_keys(project: Project, timeline: Timeline) -> set[str]:
 
     Computed the same way :func:`render_segment` names its cache file, for
     both canvases the timeline can be rendered at, so ``clean`` never deletes
-    a segment the next preview *or* master render would otherwise hit.
+    a segment the next preview *or* master render would otherwise hit. Draft
+    keys live in a separate cache dir/namespace — see
+    :func:`referenced_draft_segment_keys`.
     """
     referenced: set[str] = set()
     for is_preview in (True, False):
@@ -1747,6 +1914,23 @@ def referenced_segment_keys(project: Project, timeline: Timeline) -> set[str]:
     return referenced
 
 
+def referenced_draft_segment_keys(project: Project, timeline: Timeline) -> set[str]:
+    """Segment cache keys the current timeline could reuse under ``--draft``.
+
+    Mirrors :func:`referenced_segment_keys` for the single draft canvas (same
+    720p sizing as preview), so ``clean`` never deletes a segment the next
+    draft render would otherwise hit.
+    """
+    referenced: set[str] = set()
+    canvas = canvas_for(timeline, True)
+    for seg in timeline.tracks.video:
+        try:
+            referenced.add(segment_key(project, timeline, seg, canvas, "draft"))
+        except Exception:  # pragma: no cover - a broken segment shouldn't block clean
+            log.warning("clean: could not compute draft cache key for segment %s", seg.id)
+    return referenced
+
+
 def clean(
     project: Project,
     *,
@@ -1757,11 +1941,12 @@ def clean(
 
     Args:
         project: Project to clean.
-        segments: Remove cached segment files under ``renders/segments/`` that
-            are not referenced by ``plan/timeline.json`` at its current
-            preview or master cache key (a segment cache accumulates every
-            variant ever rendered — a long programme re-edited a few times
-            easily leaves hundreds of stale files behind).
+        segments: Remove cached segment files under ``renders/segments/`` and
+            ``renders/segments_draft/`` that are not referenced by
+            ``plan/timeline.json`` at its current preview/master/draft cache
+            key (a segment cache accumulates every variant ever rendered — a
+            long programme re-edited a few times easily leaves hundreds of
+            stale files behind).
         intermediates: Remove the per-render intermediates that always get
             regenerated (``program_video.mp4``, ``program_audio*.wav``,
             ``mix.wav``, ``final_audio*.wav``, ``concat.txt``, ``duck.cmd``).
@@ -1784,11 +1969,19 @@ def clean(
                 removed_intermediates.append(path.name)
 
     if segments:
-        seg_dir = renders / "segments"
-        referenced: set[str] = set()
-        if project.timeline_file.exists():
-            referenced = referenced_segment_keys(project, Timeline.load(project.timeline_file))
-        if seg_dir.is_dir():
+        current_timeline = Timeline.load(project.timeline_file) if project.timeline_file.exists() else None
+        for seg_dir, referenced in (
+            (
+                renders / "segments",
+                referenced_segment_keys(project, current_timeline) if current_timeline else set(),
+            ),
+            (
+                renders / "segments_draft",
+                referenced_draft_segment_keys(project, current_timeline) if current_timeline else set(),
+            ),
+        ):
+            if not seg_dir.is_dir():
+                continue
             for path in sorted(seg_dir.iterdir()):
                 if not path.is_file():
                     continue

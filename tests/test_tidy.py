@@ -798,3 +798,20 @@ def test_tidy_stops_at_max_rounds_and_says_so(project: Project) -> None:
     assert result["changes"][-1].startswith(
         "stopped: pacing.tidy_max_rounds (1) reached without convergence"
     )
+
+
+# ----------------------------------------------------------------------
+# a pad that spills into the first word of the NEXT sentence retracts
+# ----------------------------------------------------------------------
+def test_pad_after_a_full_stop_never_swallows_the_next_sentence(project: Project) -> None:
+    words = [
+        (50.6, 51.2, "krtań"), (51.7, 52.0, "lepiej"), (52.02, 52.64, "oddychało."),
+        (52.79, 52.88, "I"), (52.90, 53.14, "powiem"), (53.2, 53.3, "wam,"),
+        (53.36, 53.4, "że"), (53.44, 53.52, "jest"), (53.54, 53.62, "to"),
+        (53.64, 54.08, "niezwykle"), (54.14, 54.48, "ważne."),
+    ]
+    add_clip(project, "c213", 70.0, words)
+    # the editor cut 0.45 s after "oddychało." — which lands inside "powiem"
+    tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c213", 35.5, 53.05)), project)
+    out = tl.tracks.video[0].out
+    assert 52.64 <= out < 52.79, (out, changes)   # after the full stop, before "I"

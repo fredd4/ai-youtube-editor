@@ -52,14 +52,17 @@ Point him at `http://localhost:8765` to adjust in/out points, reorder, set verti
 ### 2.5 Music
 `ytedit music <slug>` generates tracks for the cue sheet (ElevenLabs Music, instrumental, loop mode). Confirm the mood/length list with the user before generating more than 1-2 tracks (§11 cost gate). Check each track matches its intended mood/length and leaves headroom for ducking.
 
-### 2.6 Render preview
-`ytedit render <slug> --preview`: fast 720p, not for color/loudness QC (single-pass loudnorm, hardware encode). Use it to judge cut rhythm, caption legibility, and whether the story plays as intended — watch at 1.5× for dead spots.
+### 2.6 Draft render — the review gate
+`ytedit render <slug> --draft`: 720p cut from the proxies with hardware encoding, the same audio chain as the master (denoised sources, speech leveling, ducking, single-pass loudnorm), captions burned. Minutes, not an hour, and no 1080p segment cache. **This is what the user reviews, every round.** Before sending a draft: `ytedit qc <slug>` must show zero errors (rules 31–35), and you have read `edit_plan.md`'s script check, the captions report and the voice report yourself. Send the draft with a short Polish note of what changed since the last one. Then wait: no music generation beyond the first beds, no master, no publish until he answers. `--preview` (720p from the mezzanine) still exists for the rare case where picture quality itself is under review.
 
 ### 2.7 QC
-`ytedit qc <slug>` → `qc_report.json/md`: rule checker (§10) plus measured loudness. Triage, don't just relay: separate real problems from acceptable exceptions (a long reflective A-roll near the end is fine; one at 0:40 isn't). Fix what you can directly in `timeline.json` (silence trims, mute tweaks) before asking the user to re-review.
+`ytedit qc <slug>` → `qc_report.json/md`: rule checker (§10) plus measured loudness. Triage, don't just relay: separate real problems from acceptable exceptions (a long reflective A-roll near the end is fine; one at 0:40 isn't). Fix what you can directly (through the CLI stages or the `Timeline` edit API) before asking the user to re-review. Errors block the render pre-flight by design.
+
+### 2.7b Correction rounds
+the user's notes come as timecodes and sentences ("at 4:27 the story is cut", "the street party narration is early"). `ytedit at <slug> 4:27` shows the segment, the sentence ids and words, the pickup and the captions playing at that moment — use it before touching anything, and quote the segment/sentence ids back in your reply so both of you talk about the same cut. Apply → `tidy` → `qc` → `render --draft` → send → wait. A round that changes the picture under a pickup or a caption must be re-checked with `qc` (anchors) — never assume.
 
 ### 2.8 Render master
-`ytedit render <slug> --master`: two-pass loudnorm, slow x264, native resolution. Only once QC is clean or the user has explicitly accepted known exceptions.
+`ytedit render <slug> --master`: two-pass loudnorm, native resolution, hardware H.264 tier by default (YouTube re-encodes; visually equivalent and ten times faster); `--x264` for the slow software tier when the user explicitly wants it. Only once the user has accepted the latest draft and QC is clean or he has explicitly accepted known exceptions. Run it in the background, then `qc` again on the file, then `ytedit clean <slug>`.
 
 ### 2.9 Publish pack
 `ytedit publish <slug>`: titles, description, chapters, thumbnail prompts/images (fal nano-banana-pro). Apply the §8 validators before presenting candidates — never show the user a title that fails character-count or keyword-position.

@@ -619,27 +619,44 @@ def music(
 @app.command()
 def render(
     slug: str = typer.Argument(..., help="Project slug."),
-    preview: bool = typer.Option(False, "--preview", help="Fast 720p preview render."),
-    master: bool = typer.Option(False, "--master", help="Full-quality master export."),
+    draft: bool = typer.Option(
+        False, "--draft",
+        help="Very fast, very low quality 720p render (~1 MB/10s) from the ingest proxy — "
+        "recommended for a first full-timeline review before spending 10-25 minutes on "
+        "--preview. Audio (denoise/leveling/ducking/loudnorm) already matches the master.",
+    ),
+    preview: bool = typer.Option(
+        False, "--preview", help="Fast 720p preview render (full mezzanine, hardware encoder)."
+    ),
+    master: bool = typer.Option(
+        False, "--master",
+        help="Full-quality master export (hardware-encoded by default; add --x264 for the "
+        "slower libx264 tier). Default when no tier flag is given.",
+    ),
     no_music: bool = typer.Option(
         False, "--no-music", help="Ignore music cues for this render (timeline untouched)."
     ),
     no_voice: bool = typer.Option(
         False, "--no-voice", help="Ignore voice pickups for this render, symmetrically."
     ),
-    fast: bool = typer.Option(
-        False, "--fast",
-        help="Master only: hardware-encoded (h264_videotoolbox) tier, several times "
-        "faster than the default libx264 tier at some quality cost.",
+    x264: bool = typer.Option(
+        False, "--x264",
+        help="Master only: use the slower libx264 tier instead of the hardware-encoded "
+        "default — YouTube re-encodes on ingest anyway, so the hardware tier is visually "
+        "equivalent and about 10x faster; reach for --x264 only when you want the extra "
+        "quality margin for a final upload.",
     ),
 ) -> None:
-    """Render the timeline to a preview or a master file."""
+    """Render the timeline to a draft, preview or master file."""
+    if sum([draft, preview, master]) > 1:
+        console.print("[bold red]pick one of --draft, --preview, --master[/]")
+        raise typer.Exit(code=2)
     fn = _lazy("ytedit.media.render", "render")
     if fn is None:
         _not_implemented("render", "ytedit.media.render")
     fn(
-        _load(slug), preview=preview, master=master or not preview,
-        no_music=no_music, no_voice=no_voice, fast=fast,
+        _load(slug), preview=preview, draft=draft, master=master or not (preview or draft),
+        no_music=no_music, no_voice=no_voice, x264=x264,
     )
 
 
@@ -676,6 +693,102 @@ def clean(
         f"{len(result['removed_intermediates'])} intermediate file(s), "
         f"{len(result['removed_segments'])} segment file(s)"
     )
+
+
+@app.command()
+def at(
+    slug: str = typer.Argument(..., help="Project slug."),
+    times: list[str] = typer.Argument(
+        ..., help="Timecode(s): mm:ss, mm:ss.s, hh:mm:ss or bare seconds."
+    ),
+    around: float | None = typer.Option(
+        None, "--around", help="Also list every segment within +/- this many seconds."
+    ),
+    window: float = typer.Option(
+        3.0, "--window", help="Seconds either side to search for transcript words/sentences."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON instead."),
+) -> None:
+    """Resolve a rendered timecode to its exact segment/audio/caption/chapter.
+
+    Turns a timecoded note ("at 4:27 the sentence is cut") into a precise
+    reference into plan/timeline.json — the segment id/uid/clip/in-out, where
+    its audio actually comes from, the transcript words or voice pickup heard
+    there, active captions, the music cue and the chapter.
+    """
+    from .inspect import TimecodeError, inspect_moment, inspect_range, parse_timecode
+    from .timeline import Timeline
+
+    project = _load(slug)
+    if not project.timeline_file.exists():
+        console.print(f"[bold red]no timeline at {project.timeline_file}[/]")
+        raise typer.Exit(code=2)
+    timeline = Timeline.load(project.timeline_file)
+
+    try:
+        seconds = [parse_timecode(t) for t in times]
+    except TimecodeError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(code=2) from exc
+
+    results = []
+    for at_seconds in seconds:
+        moment = inspect_moment(project, timeline, at_seconds, window=window)
+        entry: dict[str, Any] = {"moment": moment.to_dict()}
+        if around is not None:
+            entry["around"] = inspect_range(project, timeline, at_seconds, around)
+        results.append(entry)
+
+    if as_json:
+        console.print_json(json.dumps(results, ensure_ascii=False))
+        return
+
+    for entry in results:
+        moment = entry["moment"]
+        console.print(f"\n[bold cyan]{moment['at_tc']}[/] ({moment['at']}s)")
+        seg = moment["segment"]
+        if seg is None:
+            console.print("  [dim]no video segment at this time[/]")
+        else:
+            table = Table(show_header=False, box=None, padding=(0, 1))
+            table.add_row("segment", f"{seg['id']} (uid {seg['uid']})")
+            table.add_row("clip", f"{seg['clip']}  [{seg['in']}-{seg['out']}]")
+            table.add_row("role", seg["role"] or "-")
+            table.add_row("mute_source", str(seg["mute_source"]))
+            if seg["audio_from"]:
+                af = seg["audio_from"]
+                table.add_row("audio_from", f"{af['clip']} [{af['in']}-{af['out']}]")
+            table.add_row(
+                "render span", f"{seg['render_start']}s - {seg['render_end']}s"
+            )
+            console.print(table)
+        console.print(f"  audio: [yellow]{moment['audio_description']}[/]")
+        if moment["audio_clip"]:
+            console.print(
+                f"  audio source: {moment['audio_clip']} @ {moment['audio_clip_time']}s"
+            )
+        if moment["sentence_ids"]:
+            console.print(f"  sentence ids: {', '.join(moment['sentence_ids'])}")
+        if moment["words"]:
+            words = " ".join(w["text"] for w in moment["words"])
+            console.print(f"  words nearby: {words}")
+        if moment["captions"]:
+            for cap in moment["captions"]:
+                console.print(f"  caption [{cap['style']}]: {cap['text']!r}")
+        if moment["music"]:
+            console.print(f"  music: {moment['music']['file']}")
+        if moment["chapter"]:
+            console.print(f"  chapter: {moment['chapter']}")
+
+        if "around" in entry:
+            around_table = Table(title=f"segments within +/-{around}s", header_style="bold cyan")
+            for col in ("id", "uid", "clip", "in", "out", "role", "render_start", "render_end"):
+                around_table.add_column(col)
+            for seg_info in entry["around"]:
+                around_table.add_row(*(str(seg_info[c]) for c in (
+                    "id", "uid", "clip", "in", "out", "role", "render_start", "render_end"
+                )))
+            console.print(around_table)
 
 
 @app.command()

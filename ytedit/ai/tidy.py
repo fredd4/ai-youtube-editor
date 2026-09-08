@@ -276,6 +276,23 @@ def _pad_out(
     snapped = False
     anchor = _straddling(words, seg.out)
     if anchor is not None:
+        # The cut lands inside a word. If that word opens a NEW sentence right
+        # after one that just closed (the editor cut after the full stop and
+        # the pad merely spilled into the next word), retract to the sentence
+        # end instead of swallowing the next word — otherwise the sentence
+        # snap would then drag the cut through the whole following sentence.
+        before = [w for w in words if w.e <= anchor.s + _EPS and w.e > seg.in_ + _EPS]
+        closers = [w for w in before if ends_sentence(w)]
+        if closers and seg.out - closers[-1].e <= pad_after + 0.15:
+            prev = closers[-1]
+            after_prev = [w for w in words if w.s >= prev.e - _EPS and w is not prev]
+            new_out = prev.e + pad_after
+            if after_prev:
+                new_out = min(new_out, after_prev[0].s - GUARD)
+            new_out = max(new_out, prev.e)
+            if abs(new_out - seg.out) <= 1e-3:
+                return None
+            return round(new_out, 3), prev, True
         snapped = True
     else:
         tail = [w for w in words if w.e <= seg.out + _EPS and w.e > seg.in_ + _EPS]
@@ -748,6 +765,33 @@ def pad_segments_to_speech(
 # ``from ytedit.ai.tidy import _shift_map``.
 
 
+def _retime_end_relative_markers(timeline: Timeline, settings: Settings | None) -> int:
+    """Re-derive markers configured relative to the end (negative ``at``).
+
+    Returns the number of markers moved. Markers with a positive configured
+    ``at`` are absolute and left alone.
+    """
+    cfg = settings or Settings()
+    total = timeline.duration()
+    moved = 0
+    for spec in cfg.get("pacing.markers", []) or []:
+        if not isinstance(spec, dict):
+            continue
+        try:
+            at = float(spec.get("at", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if at >= 0:
+            continue
+        label = str(spec.get("label", ""))
+        target = round(max(0.0, total + at), 3)
+        for marker in timeline.markers:
+            if marker.label == label and abs(marker.at - target) > 1e-3:
+                marker.at = target
+                moved += 1
+    return moved
+
+
 def _mergeable(prev: VideoSegment, seg: VideoSegment) -> bool:
     """True when two segments differ only in their in/out points."""
     return (
@@ -998,6 +1042,10 @@ def tidy(
         # round's padding/overlay/dedupe have all settled the segments they
         # follow — part of the state the fixed point below is measured on.
         timeline.resolve_anchors()
+        # End-relative structural markers (``pacing.markers`` with a negative
+        # ``at``, e.g. payoff-cta = end - 20 s) follow the programme's new
+        # length; a marker left past the end is a QC error that blocks renders.
+        _retime_end_relative_markers(timeline, project.settings)
 
         round_changes = padded + overlaid + deduped
         changes_by_round.append(round_changes)

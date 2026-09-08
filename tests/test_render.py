@@ -1132,3 +1132,146 @@ def test_clean_never_touches_media_input_or_exports(tmp_path: Path) -> None:
 
     assert master.exists()
     assert source.exists()
+
+
+# ----------------------------------------------------------------------
+# --draft tier
+# ----------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def drafted(tmp_path_factory) -> tuple[Project, Path]:
+    """A project with the draft tier rendered exactly once (real ingest, real proxies)."""
+    project = build_render_project(tmp_path_factory.mktemp("draft"), slug="draft-test")
+    return project, R.render(project, draft=True)
+
+
+def test_draft_lands_where_it_should(drafted: tuple[Project, Path]) -> None:
+    project, out = drafted
+    assert out == project.renders_dir / "draft.mp4"
+    assert out.exists() and out.stat().st_size > 1_000
+
+
+def test_draft_has_the_expected_duration_and_720p_canvas(drafted: tuple[Project, Path]) -> None:
+    _project, out = drafted
+    data = probe(out)
+    assert float(data["format"]["duration"]) == pytest.approx(EXPECTED_DURATION, abs=0.15)
+    video = next(s for s in data["streams"] if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (1280, 720)
+    audio = next(s for s in data["streams"] if s["codec_type"] == "audio")
+    assert int(audio["sample_rate"]) == 48000
+    assert audio["channels"] == 2
+
+
+def test_draft_is_far_smaller_than_a_preview_of_the_same_cut(
+    drafted: tuple[Project, Path], rendered: tuple[Project, Path]
+) -> None:
+    _draft_project, draft_out = drafted
+    _preview_project, preview_out = rendered
+    # ~1 MB/10s target vs. the preview's much higher bitrate — same programme
+    # length (both built from timeline_document()), very different size.
+    assert draft_out.stat().st_size < preview_out.stat().st_size
+
+
+def test_draft_uses_its_own_segment_cache_namespace(drafted: tuple[Project, Path]) -> None:
+    project, _out = drafted
+    draft_segments = project.renders_dir / "segments_draft"
+    assert draft_segments.is_dir()
+    assert any(draft_segments.glob("*.mp4"))
+    # The preview/master namespace is untouched by a draft-only render.
+    assert not (project.renders_dir / "segments").exists()
+
+
+def test_draft_and_preview_segment_caches_never_collide(tmp_path: Path) -> None:
+    project = build_render_project(tmp_path, slug="draft-preview-cache-test")
+    R.render(project, draft=True)
+    R.render(project, preview=True)
+
+    draft_keys = {p.stem for p in (project.renders_dir / "segments_draft").glob("*.mp4")}
+    preview_keys = {p.stem for p in (project.renders_dir / "segments").glob("*.mp4")}
+    assert draft_keys, "draft segments were not cached"
+    assert preview_keys, "preview segments were not cached"
+    assert draft_keys.isdisjoint(preview_keys)
+
+
+def test_draft_audio_matches_the_preview_loudness_target(
+    drafted: tuple[Project, Path],
+) -> None:
+    from ytedit.media.audio import measure_loudness
+
+    _project, out = drafted
+    loudness = measure_loudness(out)
+    # Same single-pass loudnorm target as preview (-14 LUFS); draft only
+    # differs in picture quality, not audio processing.
+    assert loudness["input_i"] == pytest.approx(-14.0, abs=1.5)
+
+
+def test_draft_falls_back_to_the_mezzanine_when_a_proxy_is_missing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    project = build_render_project(tmp_path, slug="draft-no-proxy-test")
+    project.proxy_path("c001").unlink()
+
+    with caplog.at_level(logging.WARNING, logger="ytedit.media.render"):
+        out = R.render(project, draft=True)
+
+    assert out.exists()
+    assert any("no proxy" in rec.message for rec in caplog.records)
+
+
+def test_video_dimensions_reads_the_proxys_own_coded_size(project: Project) -> None:
+    # The vertical fixture's proxy is scaled to fit within 1280x720 keeping
+    # its aspect ratio, so it is a very different shape from the mezzanine.
+    from fixtures.make_fixtures import build_all
+
+    media = build_all()
+    shutil.copy(media["vertical.mp4"], project.input_dir / "v.mp4")
+    from ytedit.media.ingest import ingest
+
+    ingest(project, show_table=False)
+    proxy = project.proxy_path("c001")
+    dims = R._video_dimensions(proxy)
+    assert dims is not None
+    width, height = dims
+    assert height == 720
+    assert width < height  # still vertical, just smaller
+
+
+# ----------------------------------------------------------------------
+# master tier: hardware default vs --x264
+# ----------------------------------------------------------------------
+def test_master_default_uses_the_hardware_tier(project: Project) -> None:
+    settings = load_settings(project.path)
+    args = R.video_encoder_args(settings, "master", fps=30, fast=True)
+    assert "h264_videotoolbox" in args
+
+
+def test_master_x264_flag_selects_the_libx264_tier(project: Project) -> None:
+    settings = load_settings(project.path)
+    args = R.video_encoder_args(settings, "master", fps=30, fast=False)
+    assert "libx264" in args
+    assert "h264_videotoolbox" not in args
+
+
+def test_render_passes_fast_true_by_default_and_false_with_x264(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``render(..., master=True)`` must reach ``video_encoder_args`` with
+    ``fast=True`` unless ``x264=True`` is passed — this is the actual wiring
+    ``ytedit render --master`` / ``--master --x264`` depends on."""
+    project = build_render_project(tmp_path, slug="master-tier-wiring-test")
+    seen: list[bool] = []
+    real = R.video_encoder_args
+
+    def spy(settings, mode, fps, fast=False):
+        if mode == "master":
+            seen.append(fast)
+        return real(settings, mode, fps, fast=fast)
+
+    monkeypatch.setattr(R, "video_encoder_args", spy)
+    R.render(project, master=True)
+    assert seen == [True]
+
+    seen.clear()
+    R.render(project, master=True, x264=True)
+    assert seen == [False]

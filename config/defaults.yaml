@@ -52,10 +52,14 @@ encoding:
     color_primaries: bt709
     color_trc: bt709
     colorspace: bt709
-  # `ytedit render --master --fast`: hardware-encoded master, several times
+  # `ytedit render --master` DEFAULT tier: hardware-encoded, several times
   # faster than even the x264 `medium` tier at some quality cost the
-  # YouTube re-encode mostly absorbs. Falls back to the `master` tier when
-  # h264_videotoolbox is not available on this machine.
+  # YouTube re-encode mostly absorbs anyway (it re-encodes everything on
+  # ingest, so the two tiers land visually equivalent in the delivered
+  # stream). Falls back to the `master` (x264) tier when h264_videotoolbox
+  # is not available on this machine. Ask for the x264 tier explicitly with
+  # `ytedit render --master --x264` when you want the extra quality margin
+  # for a final upload.
   master_fast:
     vcodec: h264_videotoolbox
     bitrate: 24M
@@ -80,12 +84,41 @@ encoding:
     fallback_vcodec: libx264
     fallback_crf: 23
     fallback_preset: veryfast
+  # `ytedit render --draft`: per-segment intermediate cut straight from the
+  # 720p ingest proxy instead of the mezzanine, so the whole segment pass
+  # reads far less data than a preview/master. Falls back to libx264
+  # ultrafast when h264_videotoolbox is unavailable.
+  draft_segment:
+    vcodec: h264_videotoolbox
+    q: 45
+    fallback_vcodec: libx264
+    fallback_crf: 26
+    fallback_preset: ultrafast
+    pix_fmt: yuv420p
+  # `ytedit render --draft` final encode: heavily compressed (~1 MB/10s) —
+  # meant for a first full-timeline review before spending 10-25 minutes on
+  # a --preview, not for watching quality.
+  draft:
+    vcodec: h264_videotoolbox
+    bitrate: 900k
+    maxrate: 1200k
+    bufsize: 1800k
+    profile: high
+    pix_fmt: yuv420p
+    movflags: "+faststart"
+    fallback_vcodec: libx264
+    fallback_crf: 30
+    fallback_preset: ultrafast
 
 audio:
   sample_rate: 48000
   channels: 2
   acodec: aac
   abitrate: 384k
+  # `ytedit render --draft` final encode only: lower audio bitrate to help
+  # hit the ~1 MB/10s draft target. Same loudnorm/ducking/mix processing as
+  # preview/master either way — only the container bitrate drops.
+  draft_abitrate: 128k
   # Mono 48k wav extracted by ingest for STT / analysis / peaks.
   work_wav:
     sample_rate: 48000
@@ -277,6 +310,10 @@ render:
   # for a while during a render.
   mb_per_second: 4
   disk_headroom_factor: 2
+  # A --draft segment/export is a fraction of the size of a preview/master
+  # (720p proxy source, ~1 MB/10s final encode), so the disk guard uses a
+  # much lower per-second estimate for that tier.
+  draft_mb_per_second: 1
 
 ingest:
   extensions: [".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".M4V"]
