@@ -55,7 +55,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from ytedit.ai.tidy import Word, _retime_absolute_tracks, _shift_map, load_words
+from ytedit.ai.tidy import Word, load_words
 from ytedit.config import Settings
 from ytedit.log import get_logger
 from ytedit.project import Project
@@ -358,12 +358,15 @@ def dedupe_audio(
         mutated = True
         _merge_into(bucket, *seg.audio_source[1:])
 
-    if dropped:
-        timeline.tracks.video = [s for s in video if id(s) not in dropped]
-
     if mutated:
-        remap = _shift_map(before_positions, timeline.segment_positions())
-        _retime_absolute_tracks(timeline, remap)
+        # Route the drop (if any) through the timeline's own edit API — see
+        # the identical note in ``ytedit.ai.overlay.overlay_cutaways``. Called
+        # unconditionally whenever anything mutated (even a resize with
+        # nothing dropped) so the re-time always runs from ``before_positions``.
+        dropped_uids = {s.uid for s in video if id(s) in dropped}
+        timeline.remove_segments(
+            lambda s: s.uid in dropped_uids, before=before_positions, renumber=False,
+        )
         log.info("audio ledger: %d fix(es) applied", sum(1 for c in changes if AMBIENT_TAG not in c))
 
     return timeline, changes

@@ -10,11 +10,14 @@ transcript (rule 8), vertical-clip handling (rule 15), caption bounds and the
 safe-area font check (rule 21), Content-ID pre-flight (every
 ``background_music`` flag the footage log raised must be answered by a
 ``mute_range``, rule 19), the audio ledger dedupe check (no audio range may
-play twice, rule 31) and a true-break sentence check (a cut where the audio
-actually stops landing mid-sentence, rule 32). Rules 31-32 are not in
-``docs/research/youtube-production-playbook.md`` (1-30) — they encode the
-"no audio may ever play twice" rule added afterwards; see
-:mod:`ytedit.ai.ledger`.
+play twice, rule 31), a true-break sentence check (a cut where the audio
+actually stops landing mid-sentence, rule 32), a voice pickup overlapping a
+segment's own narration (rule 33), an anchor that could not be resolved
+against a stable segment (rule 34), and a voice pickup spilling past the
+muted/ambient picture it was covered by (rule 35). Rules 31-35 are not in
+``docs/research/youtube-production-playbook.md`` (1-30) — they encode rules
+added afterwards; see :mod:`ytedit.ai.ledger` (31) and
+:attr:`ytedit.timeline.VideoSegment.uid` (33-35, the stable-anchor fix).
 
 **Rendered file** — container and codec conformance (rule 23: H.264 High,
 yuv420p, faststart with ``moov`` ahead of ``mdat``, bt709 tags, AAC-LC
@@ -86,6 +89,10 @@ MIN_MEASURE_SECONDS: float = 3.0
 AAC_BITRATE_TARGET: int = 320_000
 #: ...this hard floor, under which it becomes an error.
 AAC_BITRATE_FLOOR: int = 192_000
+
+#: Rule 33: a voice pickup may overlap a segment carrying its own narration
+#: by up to this much (float/frame noise) before it is an error.
+VOICE_OVERLAP_TOLERANCE: float = 0.3
 
 
 class QCError(RuntimeError):
@@ -301,6 +308,10 @@ def measure_ranges_loudness(
 # ----------------------------------------------------------------------
 def check_timeline(project: Project, timeline: Timeline, report: Report) -> None:
     """Run every timeline-level playbook rule into ``report``."""
+    # Resolve anchors against the timeline as it stands now (not whatever it
+    # held when last saved) so rule 34 sees fresh anchor_issues and rules 33/
+    # 35 check the pickups' actual current positions.
+    timeline.resolve_anchors()
     total = timeline.duration()
     report.checks["duration"] = total
     report.checks["segments"] = len(timeline.tracks.video)
@@ -384,6 +395,18 @@ def check_timeline(project: Project, timeline: Timeline, report: Report) -> None
 
     # --- rule 32: a true cut landing mid-sentence ------------------------
     _check_sentence_breaks(project, timeline, report)
+
+    # --- rule 33: a voice pickup over a segment's own narration ----------
+    for issue in voice_pickup_overlap_issues(project, timeline):
+        report.error(issue)
+
+    # --- rule 34: an anchor that could not be resolved -------------------
+    for issue in anchor_issue_messages(timeline):
+        report.error(issue)
+
+    # --- rule 35: a voice pickup spilling past its muted/ambient picture -
+    for issue in voice_spill_issues(project, timeline):
+        report.warn(issue)
 
 
 def pacing_warnings(timeline: Timeline, settings: Any) -> list[str]:
@@ -596,6 +619,123 @@ def _check_sentence_breaks(project: Project, timeline: Timeline, report: Report)
                     f"rule 32: {seg.id} in at {_mmss(seg.in_)} opens mid-sentence "
                     f"— previous word was '{head[0].text}'"
                 )
+
+
+def voice_pickup_overlap_issues(
+    project: Project, timeline: Timeline, tolerance: float = VOICE_OVERLAP_TOLERANCE
+) -> list[str]:
+    """Rule 33 (ERROR): a voice pickup must not run over a segment carrying
+    its own narration.
+
+    This is the exact failure mode that motivated stable segment identity
+    (see :attr:`ytedit.timeline.VideoSegment.uid`): a hand-edit or a stale
+    anchor can leave a pickup's absolute position sitting on top of a shot
+    that has its own spoken narration — the CTA plays over someone else's
+    sentence, or a narration pickup starts before the picture it was written
+    for. "Carries its own narration" means the segment is not muted and
+    either its own ``[in, out)`` (no ``audio_from``) or its ``audio_from``
+    range has a transcript word in it.
+
+    Args:
+        project: Project supplying transcripts.
+        timeline: The EDL to check.
+        tolerance: Overlap under this many seconds is not reported (frame
+            rounding, a deliberate handoff at the very edge of a cut).
+
+    Returns:
+        One message per offending (voice item, segment) pair.
+    """
+    words_cache: dict[str, list] = {}
+
+    def has_words(clip: str, s: float, e: float) -> bool:
+        if clip not in words_cache:
+            from .ai.tidy import load_words
+            words_cache[clip] = load_words(project, clip)
+        return any(w.e > s + 1e-6 and w.s < e - 1e-6 for w in words_cache[clip])
+
+    issues: list[str] = []
+    positions = timeline.segment_positions()
+    for item in timeline.tracks.voice:
+        end = item.end if item.end is not None else item.at
+        if end <= item.at:
+            continue
+        for pos in positions:
+            overlap = _overlap((item.at, end), (pos.start, pos.end))
+            if overlap <= tolerance + 1e-9:
+                continue
+            seg = pos.segment
+            if seg.mute_source:
+                continue
+            if seg.audio_from is not None:
+                clip, s, e = seg.audio_from.clip, seg.audio_from.in_, seg.audio_from.out
+            else:
+                clip, s, e = seg.clip, seg.in_, seg.out
+            if not has_words(clip, s, e):
+                continue
+            issues.append(
+                f"rule 33: voice {item.id} ({_mmss(item.at)}-{_mmss(end)}) overlaps "
+                f"{seg.id} ({clip} {_mmss(pos.start)}-{_mmss(pos.end)}) by {overlap:.2f}s, "
+                "which carries its own narration"
+            )
+    return issues
+
+
+def anchor_issue_messages(timeline: Timeline) -> list[str]:
+    """Rule 34 (ERROR): an anchor :meth:`Timeline.resolve_anchors` could not
+    resolve — uid not found and no unique signature match either.
+
+    Call ``timeline.resolve_anchors()`` before this so
+    :attr:`ytedit.timeline.Meta.anchor_issues` reflects the timeline as it
+    stands now, not whatever it held when the file was last saved.
+    """
+    return [f"rule 34: {issue}" for issue in timeline.meta.anchor_issues]
+
+
+def voice_spill_issues(project: Project, timeline: Timeline) -> list[str]:
+    """Rule 35 (WARNING): a voice pickup whose end runs past the last
+    muted/ambient picture under it — the narration spills into the next
+    scene instead of ending inside the B-roll it was covered by.
+
+    Walks forward from the segment the pickup starts under, for as long as
+    each further segment is muted or ambient (reuses
+    :func:`ytedit.ai.voice._is_coverable`, the same notion the pickup-growth
+    pass uses to decide what it may run over); if the pickup's end reaches
+    past where that run stops, it is spilling into a segment that was never
+    grown/inserted to cover it.
+    """
+    try:
+        from .ai.voice import _is_coverable
+    except ImportError:  # pragma: no cover - AI layer not installed
+        log.debug("ytedit.ai.voice is unavailable; skipping the voice-spill rule")
+        return []
+
+    issues: list[str] = []
+    positions = timeline.segment_positions()
+    for item in timeline.tracks.voice:
+        end = item.end if item.end is not None else item.at
+        if end <= item.at:
+            continue
+        # The segment that is on screen when the pickup starts: a pickup
+        # anchored to a cut starts exactly at one segment's end / the next
+        # one's start, so the end bound is exclusive.
+        idx = next(
+            (i for i, pos in enumerate(positions) if pos.start - 1e-6 <= item.at < pos.end - 1e-6),
+            None,
+        )
+        if idx is None:
+            continue
+        run_end = positions[idx].start
+        i = idx
+        while i < len(positions) and _is_coverable(project, positions[i].segment):
+            run_end = positions[i].end
+            i += 1
+        if end > run_end + 0.05:
+            issues.append(
+                f"rule 35: voice {item.id} ends at {_mmss(end)}, {end - run_end:.2f}s past "
+                f"the muted/ambient picture under it (ends {_mmss(run_end)}) — spills into "
+                "the next scene"
+            )
+    return issues
 
 
 # ----------------------------------------------------------------------

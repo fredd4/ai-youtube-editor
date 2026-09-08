@@ -78,6 +78,7 @@ from ytedit.log import get_logger
 from ytedit.media.ffmpeg import FFmpegError, ff
 from ytedit.project import Project, utcnow
 from ytedit.timeline import (
+    AnchorSignature,
     AudioFrom,
     Caption,
     Chapter,
@@ -1529,8 +1530,19 @@ def _build_voice_items(
         item_id = f"v{i + 1:03d}"
         # Anchor to the first picture segment of the group, offset 0, so the
         # pickup follows it through any later pass instead of staying pinned
-        # to the absolute time computed here.
-        anchor = VoiceAnchor(segment=anchor_segment.id, offset=0.0) if anchor_segment else None
+        # to the absolute time computed here. Keyed on the segment's uid
+        # (stable across every later renumbering), with a clip/in signature
+        # to repair the anchor if that uid is ever lost.
+        anchor = (
+            VoiceAnchor(
+                segment=anchor_segment.id,
+                offset=0.0,
+                uid=anchor_segment.uid,
+                signature=AnchorSignature(clip=anchor_segment.clip, **{"in": anchor_segment.in_}),
+            )
+            if anchor_segment
+            else None
+        )
         items.append(
             VoiceItem(id=item_id, file=group["file"], at=round(start, 3), end=end, anchor=anchor)
         )

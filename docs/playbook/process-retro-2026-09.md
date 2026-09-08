@@ -21,6 +21,7 @@ project, not during one.
 | Joined programme 0.5 s longer than the timeline | Segments cut on whole frames, positions computed in seconds | Frame-exact segment cuts and positions (`f2cc46a`) |
 | Render failed at segment 179 after 20 min | Picture range beyond the clip's duration; validation happened per segment | Pre-flight validation of every range before any ffmpeg call (in progress) |
 | Master lost, re-rendered from scratch | A remux script deleted its backup before verifying the replacement | Rule: replace only after the new file is verified; `exports/` is never touched by scratch scripts |
+| Narration pickups 10–20 s early after a manual insert (street party before the pole, CTA over the market take) | Anchors referenced display ids (`s073`), which every insert/drop renumbers; resolution only checked that an id existed | Stable `VideoSegment.uid`, anchors carry uid + signature and self-repair, `Timeline.insert_segments/remove_segments` API, QC rules 33–35 and render pre-flight refuse a pickup over on-camera speech |
 | Disk full twice | 4.7 GB segment cache + 3 GB intermediates per render; a worker copied the project | `ytedit clean`, free-space check before render (in progress); never copy project media |
 
 Cost of the project: $12.32 of the $20 budget (STT $0.28, analysis $4.00, plan $3.72,

@@ -1002,6 +1002,19 @@ def preflight(
     """
     issues = timeline.validate(project, skip_music=no_music, skip_voice=no_voice)
 
+    # Same checks as ``ytedit qc`` rules 33/34 (not a copy): an anchor that
+    # never resolved to a stable segment (rule 34, whatever track it is on),
+    # and — unless this render ignores the voice track entirely — a voice
+    # pickup sitting over a segment's own narration (rule 33). Better to
+    # catch the Chinchero-street party-over-the-pole-raising class of bug before
+    # rendering than after.
+    from ..qc import anchor_issue_messages, voice_pickup_overlap_issues
+
+    timeline.resolve_anchors()
+    issues += anchor_issue_messages(timeline)
+    if not no_voice:
+        issues += voice_pickup_overlap_issues(project, timeline)
+
     checked: set[str] = set()
     for seg in timeline.tracks.video:
         clips = [("clip", seg.clip)]

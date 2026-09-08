@@ -40,7 +40,7 @@ from ..config import Settings
 from ..costs import charge
 from ..log import get_logger
 from ..project import Project, utcnow
-from ..timeline import Caption, CaptionAnchor, Timeline
+from ..timeline import AnchorSignature, Caption, CaptionAnchor, Timeline
 from .openrouter import OpenRouter
 from .plan import PlanError, footage_entries, load_footage_log, units_for_ledger
 from .prompts import render
@@ -516,6 +516,9 @@ def generate_location_captions(
         rows.append(
             {
                 "segment": target.segment.id,
+                "segment_uid": target.segment.uid,
+                "segment_clip": target.segment.clip,
+                "segment_in": target.segment.in_,
                 "place_id": place_id,
                 "label": place["label"],
                 "region": place.get("region", ""),
@@ -572,7 +575,10 @@ def build_timeline_captions(
         Caption(
             id="", at=r["at"], end=r["end"], text=r["label"], style="location",
             position="lower-left",
-            anchor=CaptionAnchor(segment=r["segment"], offset=card_offset_s),
+            anchor=CaptionAnchor(
+                segment=r["segment"], offset=card_offset_s, uid=r["segment_uid"],
+                signature=AnchorSignature(clip=r["segment_clip"], **{"in": r["segment_in"]}),
+            ),
         )
         for r in rows
     ]
@@ -587,7 +593,11 @@ def build_timeline_captions(
             seg_pos = timeline.segment_at(cap.at)
             if seg_pos is not None:
                 cap.anchor = CaptionAnchor(
-                    segment=seg_pos.segment.id, offset=round(cap.at - seg_pos.start, 3)
+                    segment=seg_pos.segment.id, offset=round(cap.at - seg_pos.start, 3),
+                    uid=seg_pos.segment.uid,
+                    signature=AnchorSignature(
+                        clip=seg_pos.segment.clip, **{"in": seg_pos.segment.in_}
+                    ),
                 )
             kept.append(cap)
             continue

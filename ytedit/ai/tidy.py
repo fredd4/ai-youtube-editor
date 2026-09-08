@@ -36,15 +36,20 @@ fresh plan is tidy) and can be re-run over an existing EDL with ``ytedit tidy``.
 
 from __future__ import annotations
 
-import bisect
 import json
 import shutil
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from ytedit.config import Settings
 from ytedit.log import get_logger
 from ytedit.project import Project, utcnow
-from ytedit.timeline import SegmentPosition, Timeline, VideoSegment
+from ytedit.timeline import (
+    SegmentPosition,
+    Timeline,
+    VideoSegment,
+    _retime_absolute_tracks,
+    _shift_map,
+)
 
 log = get_logger(__name__)
 
@@ -736,81 +741,11 @@ def pad_segments_to_speech(
     return timeline, changes
 
 
-def _shift_map(
-    before: Sequence[SegmentPosition], after: Sequence[SegmentPosition]
-) -> Callable[[float], float]:
-    """Build a step function mapping an old absolute time to its new one.
-
-    Padding only ever grows a segment (never shrinks it — "padding only ever
-    adds air"), which shifts every later segment's absolute start by the same
-    amount; merging drops a segment but keeps the one it merged into, never
-    reordering anything. Both effects reduce to one lookup: the shift in force
-    at time ``t`` is that of the last original segment starting at or before
-    ``t`` that is still in the timeline — or, when it was merged away, that of
-    the nearest earlier surviving one (equal in practice, since a jump-cut
-    merge only joins segments a few hundred milliseconds apart).
-
-    Args:
-        before: ``segment_positions()`` captured before this pass touched
-            anything.
-        after: ``segment_positions()`` of the padded/merged result.
-
-    Returns:
-        A function from an old absolute time to its new one.
-    """
-    after_by_id = {id(pos.segment): pos.start for pos in after}
-    starts: list[float] = []
-    shifts: list[float] = []
-    last_shift = 0.0
-    for pos in before:
-        new_start = after_by_id.get(id(pos.segment))
-        if new_start is not None:
-            last_shift = new_start - pos.start
-        starts.append(pos.start)
-        shifts.append(last_shift)
-
-    def remap(t: float) -> float:
-        if not starts:
-            return t
-        i = bisect.bisect_right(starts, t) - 1
-        return round(t + (shifts[i] if i >= 0 else 0.0), 3)
-
-    return remap
-
-
-def _retime_absolute_tracks(timeline: Timeline, remap: Callable[[float], float]) -> None:
-    """Shift every absolute-time item downstream of a padding-induced move."""
-    for cap in timeline.tracks.captions:
-        if cap.anchor is not None:
-            # Anchored captions (location cards, anchored hook lines) are
-            # pinned to a segment id, not absolute time; Timeline.resolve_anchors()
-            # re-derives their position from wherever that segment ends up
-            # once every pass has settled — the same treatment as anchored
-            # voice items just below.
-            continue
-        cap.at = remap(cap.at)
-        cap.end = remap(cap.end)
-    for cue in timeline.tracks.music:
-        cue.at = remap(cue.at)
-        cue.end = remap(cue.end)
-    for item in timeline.tracks.voice:
-        if item.anchor is not None:
-            # Anchored items are pinned to a segment id, not absolute time;
-            # Timeline.resolve_anchors() re-derives their position from
-            # wherever that segment ends up once every pass has settled.
-            continue
-        # A pickup is a fixed-length file: move it, never stretch it. Remapping
-        # ``end`` separately would grow it by every pad inserted underneath.
-        length = None if item.end is None else item.end - item.at
-        item.at = remap(item.at)
-        if length is not None:
-            item.end = round(item.at + length, 3)
-    # Structural markers and chapters are pinned to absolute time as well; a
-    # chapter list that lags the picture by a minute is worse than none.
-    for marker in timeline.markers:
-        marker.at = remap(marker.at)
-    for chapter in timeline.chapters:
-        chapter.at = remap(chapter.at)
+# ``_shift_map``/``_retime_absolute_tracks`` now live in ``ytedit.timeline``
+# (imported above) so :class:`Timeline`'s own edit API — ``insert_segments``,
+# ``remove_segments``, ``replace_segment`` — can share them without a
+# circular import; kept importable from here too for anything still doing
+# ``from ytedit.ai.tidy import _shift_map``.
 
 
 def _mergeable(prev: VideoSegment, seg: VideoSegment) -> bool:

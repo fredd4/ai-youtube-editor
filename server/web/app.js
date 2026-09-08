@@ -1597,6 +1597,11 @@ function splitSegment() {
   }
   const copy = JSON.parse(JSON.stringify(seg));
   copy.id = nextId(S.timeline.tracks.video, 's');
+  // A split makes a genuinely new piece — it must not keep the original's
+  // uid (anchors key on that; two segments sharing one would resolve an
+  // anchor to whichever one happens to match first). Leaving the key out
+  // makes the server assign a fresh one on save (ensure_segment_uids).
+  delete copy.uid;
   copy.in = round3(at);
   copy.transition_in = { type: 'cut', duration: 0, name: 'fade' };
   seg.out = round3(at);

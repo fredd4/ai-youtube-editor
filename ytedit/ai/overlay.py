@@ -42,7 +42,7 @@ import re
 from typing import Sequence
 
 from ytedit.ai.ledger import _consumed_overlap, committed_audio_ranges
-from ytedit.ai.tidy import Word, _retime_absolute_tracks, _shift_map, load_words
+from ytedit.ai.tidy import Word, load_words
 from ytedit.config import Settings
 from ytedit.log import get_logger
 from ytedit.project import Project
@@ -293,10 +293,16 @@ def overlay_cutaways(
             mutations += 1
 
     if mutations:
-        if dropped:
-            timeline.tracks.video = [s for s in video if id(s) not in dropped]
-        remap = _shift_map(before_positions, timeline.segment_positions())
-        _retime_absolute_tracks(timeline, remap)
+        # Route every drop through the timeline's own edit API — it re-times
+        # everything downstream by uid (stable across the drop) instead of
+        # this pass doing its own shift-map bookkeeping, and re-resolves
+        # anchors. ``renumber=False``: ids are re-assigned by the caller
+        # (``ytedit.ai.plan.build_timeline`` or ``ytedit.ai.tidy.tidy``)
+        # once every pass in the round has run, not after each one.
+        dropped_uids = {s.uid for s in video if id(s) in dropped}
+        timeline.remove_segments(
+            lambda s: s.uid in dropped_uids, before=before_positions, renumber=False,
+        )
         if patterns:
             changes.append(
                 f"{patterns} cutaway run(s) now carry the narration from underneath"

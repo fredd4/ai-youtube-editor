@@ -297,7 +297,7 @@ def voice_anchor(
     ``ytedit tidy``) instead of drifting at a fixed timestamp.
     """
     from .ai.tidy import backup_timeline
-    from .timeline import Timeline, VoiceAnchor
+    from .timeline import AnchorSignature, Timeline, VoiceAnchor
 
     project = _load(slug)
     if not project.timeline_file.exists():
@@ -311,11 +311,15 @@ def voice_anchor(
     if item is None:
         console.print(f"[bold red]no voice item {voice_id!r} in tracks.voice[/]")
         raise typer.Exit(code=1)
-    if not any(s.id == segment_id for s in timeline.tracks.video):
+    target_seg = next((s for s in timeline.tracks.video if s.id == segment_id), None)
+    if target_seg is None:
         console.print(f"[bold red]no video segment {segment_id!r} in tracks.video[/]")
         raise typer.Exit(code=1)
 
-    item.anchor = VoiceAnchor(segment=segment_id, offset=offset)
+    item.anchor = VoiceAnchor(
+        segment=segment_id, offset=offset, uid=target_seg.uid,
+        signature=AnchorSignature(clip=target_seg.clip, **{"in": target_seg.in_}),
+    )
     timeline.resolve_anchors()
 
     backup = backup_timeline(project)

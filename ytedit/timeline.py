@@ -15,12 +15,15 @@ those frame-snapped values, so absolute placements match the rendered file.
 
 from __future__ import annotations
 
+import bisect
+import hashlib
 import json
 import math
 import os
+import secrets
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NamedTuple, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -124,6 +127,17 @@ class VideoSegment(_Model):
     """One cut from a normalized source clip."""
 
     id: str
+    #: Stable identity, assigned once (random on creation) and NEVER
+    #: reassigned or renumbered by any pass — unlike :attr:`id`, the display
+    #: label that ``ytedit.ai.plan``/``ytedit tidy`` renumber to ``s001,
+    #: s002, ...`` whenever a segment is inserted, dropped or merged.
+    #: :class:`VoiceAnchor` / :class:`CaptionAnchor` key on this so a
+    #: narration pickup or caption keeps following its picture even after
+    #: ids shift under it — see :meth:`Timeline.resolve_anchors`. A file
+    #: saved before this field existed gets one filled in deterministically
+    #: on load (see :func:`ensure_segment_uids`) rather than a fresh random
+    #: one every time it is read.
+    uid: str = Field(default_factory=lambda: secrets.token_hex(4))
     clip: str
     in_: float = Field(0.0, alias="in", serialization_alias="in")
     out: float = 0.0
@@ -176,35 +190,61 @@ class VideoSegment(_Model):
         return frames_to_seconds(self.frames(fps), fps)
 
 
+class AnchorSignature(_Model):
+    """A fingerprint of the segment a :class:`VoiceAnchor`/:class:`CaptionAnchor`
+    pointed at when it was created, used to repair the anchor if its ``uid``
+    is ever lost or stops resolving (see :meth:`Timeline.resolve_anchors`).
+    """
+
+    clip: str = ""
+    in_: float = Field(0.0, alias="in", serialization_alias="in")
+
+
 class VoiceAnchor(_Model):
     """Pins a :class:`VoiceItem` to a video segment instead of absolute time.
 
-    ``offset`` seconds after the start of video segment ``segment`` (its
+    ``offset`` seconds after the start of the anchored segment (its
     :attr:`SegmentPosition.start`, see :meth:`Timeline.segment_positions`).
     Re-resolved by :meth:`Timeline.resolve_voice_anchors` whenever the segment
     may have moved — speech padding, sentence snapping, overlay cutaways,
     audio dedupe, or a hand edit in the web editor all shift absolute time,
     but a pickup anchored this way follows its picture instead of drifting.
+
+    ``segment`` is the segment's display ``id`` at the time it was last
+    resolved — kept for readability (log lines, the web editor) — but
+    resolution itself uses ``uid`` when present, since ``id`` gets
+    renumbered whenever segments are inserted, dropped or merged elsewhere
+    (see ``ytedit/ai/plan.py``). ``signature`` records that segment's
+    ``clip``/``in`` at anchoring time, so a lost or stale ``uid`` can be
+    repaired by finding the (hopefully unique) segment still carrying that
+    fingerprint, rather than silently resolving to the wrong picture.
     """
 
     segment: str
     offset: float = 0.0
+    uid: str | None = None
+    signature: AnchorSignature | None = None
 
 
 class CaptionAnchor(_Model):
     """Pins a :class:`Caption` to a video segment instead of absolute time.
 
-    ``offset`` seconds after the start of video segment ``segment`` (its
+    ``offset`` seconds after the start of the anchored segment (its
     :attr:`SegmentPosition.start`, see :meth:`Timeline.segment_positions`).
     Re-resolved by :meth:`Timeline.resolve_anchors` whenever the segment may
     have moved — speech padding, sentence snapping, overlay cutaways, audio
     dedupe, or a hand edit in the web editor all shift absolute time, but a
     location card or hook line anchored this way follows its picture instead
     of drifting under the wrong shot (see ``ytedit/ai/locations.py``).
+
+    See :class:`VoiceAnchor` for why ``uid``/``signature`` exist alongside
+    the readable ``segment`` display id.
     """
 
     segment: str
     offset: float = 0.0
+    uid: str | None = None
+    signature: AnchorSignature | None = None
 
 
 class VoiceItem(_Model):
@@ -303,6 +343,10 @@ class Meta(_Model):
     generated_by: str = ""
     edited_by_human: bool = False
     notes: str = ""
+    #: Anchors :meth:`Timeline.resolve_anchors` could not resolve (uid not
+    #: found and no unique signature match either) on its most recent call —
+    #: cleared and rebuilt every time it runs. See ``ytedit qc`` rule 34.
+    anchor_issues: list[str] = Field(default_factory=list)
 
 
 class Tracks(_Model):
@@ -348,6 +392,19 @@ class Timeline(_Model):
             path: Path to ``timeline.json``.
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        ensure_segment_uids(data)
+        return cls.model_validate(data)
+
+    @classmethod
+    def model_validate_migrated(cls, data: dict[str, Any]) -> "Timeline":
+        """Like :meth:`model_validate`, but fills any missing segment ``uid``
+        first (see :func:`ensure_segment_uids`).
+
+        Use this instead of ``model_validate`` for a raw dict that might
+        predate ``uid`` and did not come through :meth:`load` — e.g. the web
+        editor validating/saving a posted payload.
+        """
+        ensure_segment_uids(data)
         return cls.model_validate(data)
 
     def save(self, path: Path | str) -> Path:
@@ -439,54 +496,102 @@ class Timeline(_Model):
         """Recompute ``at``/``end`` for every anchored voice item and caption.
 
         For each :class:`VoiceItem` or :class:`Caption` carrying an anchor
-        (:class:`VoiceAnchor` / :class:`CaptionAnchor`), ``at`` is set to
-        ``offset`` seconds after the current start of video segment
-        ``anchor.segment`` (from :meth:`segment_positions`), and ``end`` is
-        moved along with it so the item's length never changes (``length =
-        old end - old at`` for a voice item, or left ``None`` when it already
-        was; always ``end - at`` for a caption).
+        (:class:`VoiceAnchor` / :class:`CaptionAnchor`), the anchored segment
+        is located by ``anchor.uid`` first (never renumbered — see
+        :attr:`VideoSegment.uid`); a legacy anchor with no ``uid`` yet falls
+        back to its readable ``segment`` display id. If the ``uid`` lookup
+        fails, or resolves to a segment whose ``(clip, in)`` no longer
+        matches ``anchor.signature`` within 0.5 s (someone renumbered ids and
+        a *different* segment now happens to hold that uid — should not
+        normally happen, but this is the safety net for it), a repair is
+        attempted by searching every segment for a unique ``(clip, in)``
+        match to the signature. Whichever way a segment is found, ``at`` is
+        set to ``offset`` seconds after its current start (from
+        :meth:`segment_positions`), ``end`` moves with it so the item's
+        length never changes (``length = old end - old at`` for a voice
+        item, or left ``None`` when it already was; always ``end - at`` for
+        a caption), and the anchor's ``uid``/``segment``/``signature`` are
+        refreshed to match.
 
-        An item whose anchor segment is no longer in the timeline (dropped by
-        padding, overlay, dedupe or a hand edit) keeps its current absolute
-        time untouched and is logged — better a stale but sane position than
-        a crash or a silent teleport to time zero.
+        An item that cannot be resolved at all keeps its current absolute
+        time untouched, is logged, and is recorded in
+        :attr:`Meta.anchor_issues` (cleared and rebuilt on every call — see
+        ``ytedit qc`` rule 34) — better a stale but sane position than a
+        crash or a silent teleport to time zero.
 
         Returns:
             The number of items (voice + captions combined) successfully
-            resolved against their anchor (items with no anchor, or a
-            dangling one, are not counted).
+            resolved against their anchor (items with no anchor, or one that
+            could not be resolved, are not counted).
         """
-        starts = {pos.segment.id: pos.start for pos in self.segment_positions()}
+        positions = self.segment_positions()
+        by_uid: dict[str, SegmentPosition] = {}
+        by_display_id: dict[str, SegmentPosition] = {}
+        for pos in positions:
+            if pos.segment.uid:
+                by_uid.setdefault(pos.segment.uid, pos)
+            by_display_id.setdefault(pos.segment.id, pos)
+
+        self.meta.anchor_issues = []
         resolved = 0
+
+        def _locate(anchor: VoiceAnchor | CaptionAnchor, kind: str, item_id: str) -> SegmentPosition | None:
+            pos: SegmentPosition | None = None
+            if anchor.uid:
+                pos = by_uid.get(anchor.uid)
+                sig = anchor.signature
+                if pos is not None and sig is not None and (
+                    pos.segment.clip != sig.clip or abs(pos.segment.in_ - sig.in_) > 0.5
+                ):
+                    pos = None  # uid resolved, but no longer the segment we anchored to
+            if pos is None and anchor.signature is not None:
+                sig = anchor.signature
+                candidates = [
+                    p for p in positions
+                    if p.segment.clip == sig.clip and abs(p.segment.in_ - sig.in_) <= 0.5
+                ]
+                if len(candidates) == 1:
+                    pos = candidates[0]
+                    log.warning(
+                        "%s %s: anchor uid %r lost or stale — repaired via signature "
+                        "(clip=%s in=%.2f) to segment %s",
+                        kind, item_id, anchor.uid, sig.clip, sig.in_, pos.segment.id,
+                    )
+            if pos is None and not anchor.uid and anchor.segment:
+                # Legacy anchor predating uid/signature: fall back to the
+                # display id it always used. Self-heals into uid+signature
+                # below once found, so this branch only fires once per item.
+                pos = by_display_id.get(anchor.segment)
+            if pos is None:
+                ref = anchor.segment or anchor.uid or "?"
+                issue = f"{kind} {item_id}: anchor to segment {ref!r} could not be resolved"
+                self.meta.anchor_issues.append(issue)
+                log.warning(issue)
+                return None
+            anchor.uid = pos.segment.uid
+            anchor.segment = pos.segment.id
+            anchor.signature = AnchorSignature(clip=pos.segment.clip, **{"in": pos.segment.in_})
+            return pos
+
         for item in self.tracks.voice:
             if item.anchor is None:
                 continue
-            seg_start = starts.get(item.anchor.segment)
-            if seg_start is None:
-                log.warning(
-                    "voice %s: anchor segment %r no longer exists — "
-                    "keeping absolute time %.3fs",
-                    item.id, item.anchor.segment, item.at,
-                )
+            pos = _locate(item.anchor, "voice", item.id)
+            if pos is None:
                 continue
             length = None if item.end is None else item.end - item.at
-            item.at = round(seg_start + item.anchor.offset, 3)
+            item.at = round(pos.start + item.anchor.offset, 3)
             if length is not None:
                 item.end = round(item.at + length, 3)
             resolved += 1
         for cap in self.tracks.captions:
             if cap.anchor is None:
                 continue
-            seg_start = starts.get(cap.anchor.segment)
-            if seg_start is None:
-                log.warning(
-                    "caption %s: anchor segment %r no longer exists — "
-                    "keeping absolute time %.3fs",
-                    cap.id, cap.anchor.segment, cap.at,
-                )
+            pos = _locate(cap.anchor, "caption", cap.id)
+            if pos is None:
                 continue
             length = cap.end - cap.at
-            cap.at = round(seg_start + cap.anchor.offset, 3)
+            cap.at = round(pos.start + cap.anchor.offset, 3)
             cap.end = round(cap.at + length, 3)
             resolved += 1
         return resolved
@@ -506,6 +611,133 @@ class Timeline(_Model):
             if seg.clip not in seen:
                 seen.append(seg.clip)
         return seen
+
+    # ------------------------------------------------------------------
+    # edit API — insert/remove/replace video segments
+    # ------------------------------------------------------------------
+    def renumber_segment_ids(self) -> None:
+        """Reassign every video segment's display ``id`` to ``s001, s002, ...``.
+
+        Never touches :attr:`VideoSegment.uid` — anything anchored by uid
+        (see :meth:`resolve_anchors`) is unaffected by a renumbering.
+        """
+        for i, seg in enumerate(self.tracks.video):
+            seg.id = f"s{i + 1:03d}"
+
+    def insert_segments(
+        self,
+        index: int,
+        segments: Sequence[VideoSegment],
+        *,
+        before: Sequence[SegmentPosition] | None = None,
+        renumber: bool = True,
+    ) -> None:
+        """Splice new segments into the video track at ``index``.
+
+        This is the one supported way to grow the video track: every new
+        segment gets a ``uid`` if it doesn't already have one, everything
+        downstream — unanchored voice items, captions, music cues, markers
+        and chapters — is re-timed by the frame-exact duration the insertion
+        adds at that point (the same shift-map machinery
+        ``ytedit.ai.tidy.pad_segments_to_speech`` uses for speech padding),
+        display ids are renumbered, and every anchor is re-resolved.
+
+        Args:
+            index: Position in ``tracks.video`` the new segments are
+                inserted before (``len(tracks.video)`` appends).
+            segments: The new segments, in order.
+            before: The positions to diff against for re-timing, for a
+                caller that already captured them earlier — e.g. before a
+                resize it applied directly to a surviving segment's
+                ``in``/``out`` — so one combined re-time covers both edits,
+                exactly like a single before/after diff would have.
+                Defaults to a fresh snapshot taken right now.
+            renumber: Reassign every segment's display ``id`` afterward
+                (default on). Pass ``False`` for a caller that must keep its
+                own numbering scheme across the edit (e.g. ``ytedit.ai.voice``,
+                which never renumbers segments other stages already anchored
+                against).
+        """
+        if before is None:
+            before = self.segment_positions()
+        for seg in segments:
+            if not seg.uid:
+                seg.uid = secrets.token_hex(4)
+        self.tracks.video[index:index] = list(segments)
+        remap = _shift_map(before, self.segment_positions())
+        _retime_absolute_tracks(self, remap)
+        if renumber:
+            self.renumber_segment_ids()
+        self.resolve_anchors()
+
+    def remove_segments(
+        self,
+        predicate: Callable[[VideoSegment], bool] | Iterable[str],
+        *,
+        before: Sequence[SegmentPosition] | None = None,
+        renumber: bool = True,
+    ) -> int:
+        """Drop every video segment ``predicate`` accepts, re-timing what follows.
+
+        See :meth:`insert_segments` for ``before``/``renumber``.
+
+        Args:
+            predicate: ``callable(segment) -> bool`` (true means drop it), or
+                an iterable of ids/uids to drop (matched against either).
+
+        Returns:
+            How many segments were dropped.
+        """
+        if before is None:
+            before = self.segment_positions()
+        if callable(predicate):
+            pred: Callable[[VideoSegment], bool] = predicate
+        else:
+            keys = set(predicate)
+            pred = lambda s: s.uid in keys or s.id in keys  # noqa: E731
+        kept = [s for s in self.tracks.video if not pred(s)]
+        removed = len(self.tracks.video) - len(kept)
+        self.tracks.video = kept
+        remap = _shift_map(before, self.segment_positions())
+        _retime_absolute_tracks(self, remap)
+        if renumber:
+            self.renumber_segment_ids()
+        self.resolve_anchors()
+        return removed
+
+    def replace_segment(
+        self,
+        uid: str,
+        new_segments: Sequence[VideoSegment],
+        *,
+        before: Sequence[SegmentPosition] | None = None,
+        renumber: bool = True,
+    ) -> bool:
+        """Replace one video segment (by ``uid``) with one or more new ones.
+
+        The usual case is a split in the web editor: the original segment's
+        ``uid`` disappears and two fresh ones take its place. See
+        :meth:`insert_segments` for ``before``/``renumber``.
+
+        Returns:
+            ``False`` when ``uid`` is not found (nothing changed); ``True``
+            otherwise.
+        """
+        idx = next((i for i, s in enumerate(self.tracks.video) if s.uid == uid), None)
+        if idx is None:
+            return False
+        if before is None:
+            before = self.segment_positions()
+        for seg in new_segments:
+            if not seg.uid:
+                seg.uid = secrets.token_hex(4)
+        self.tracks.video[idx:idx + 1] = list(new_segments)
+        remap = _shift_map(before, self.segment_positions())
+        _retime_absolute_tracks(self, remap)
+        if renumber:
+            self.renumber_segment_ids()
+        self.resolve_anchors()
+        return True
 
     # ------------------------------------------------------------------
     # validation
@@ -697,6 +929,126 @@ def _check_overlaps(items: Iterable[tuple[str, float, float]], kind: str) -> lis
         if bstart < aend - 1e-6:
             issues.append(f"{kind} {bid!r} overlaps {aid!r} by {aend - bstart:.3f}s")
     return issues
+
+
+# ----------------------------------------------------------------------
+# stable segment identity — migration for files predating ``uid``
+# ----------------------------------------------------------------------
+def _deterministic_uid(clip: str, in_: float, out: float, index: int) -> str:
+    """Stable fallback uid for a video segment loaded from a pre-``uid`` file.
+
+    Derived from ``(clip, in, out, index)`` so two loads of the same
+    not-yet-migrated file agree on a segment's identity instead of each
+    minting a fresh random one (which :class:`VideoSegment`'s default
+    factory would otherwise do for every field missing from the JSON).
+    """
+    seed = f"{clip}|{in_!r}|{out!r}|{index}".encode("utf-8")
+    return hashlib.sha1(seed).hexdigest()[:8]
+
+
+def ensure_segment_uids(data: dict[str, Any]) -> None:
+    """Fill a missing ``uid`` on every video segment in raw timeline JSON.
+
+    Mutates ``data`` in place. Used by :meth:`Timeline.load` and
+    :meth:`Timeline.model_validate_migrated` (the web editor's timeline
+    endpoints go through the latter) so a segment that never had a ``uid`` —
+    an old file predating the field, or a brand-new piece a client forgot to
+    stamp, such as one half of a split — gets one deterministically instead
+    of a fresh random uid on every read.
+    """
+    tracks = data.get("tracks")
+    if not isinstance(tracks, dict):
+        return
+    segments = tracks.get("video")
+    if not isinstance(segments, list):
+        return
+    for i, seg in enumerate(segments):
+        if not isinstance(seg, dict) or seg.get("uid"):
+            continue
+        try:
+            in_ = float(seg.get("in", 0.0) or 0.0)
+            out = float(seg.get("out", 0.0) or 0.0)
+        except (TypeError, ValueError):  # pragma: no cover - malformed timeline
+            in_, out = 0.0, 0.0
+        seg["uid"] = _deterministic_uid(str(seg.get("clip", "")), in_, out, i)
+
+
+# ----------------------------------------------------------------------
+# re-timing absolute-time tracks after an edit shifts the video track
+# ----------------------------------------------------------------------
+def _shift_map(
+    before: Sequence[SegmentPosition], after: Sequence[SegmentPosition]
+) -> Callable[[float], float]:
+    """Build a step function mapping an old absolute time to its new one.
+
+    An edit that grows, shrinks, inserts or removes video segments shifts
+    the absolute start of everything after the change by the same amount;
+    this reduces that to one lookup: the shift in force at time ``t`` is
+    that of the last segment (matched by :attr:`VideoSegment.uid`, stable
+    across the edit) starting at or before ``t`` that is still in the
+    timeline — or, when it was dropped, that of the nearest earlier
+    surviving one.
+
+    Used by :meth:`Timeline.insert_segments`/``remove_segments``/
+    ``replace_segment`` and by ``ytedit.ai.tidy``'s speech padding.
+
+    Args:
+        before: ``segment_positions()`` captured before the edit.
+        after: ``segment_positions()`` of the result.
+
+    Returns:
+        A function from an old absolute time to its new one.
+    """
+    after_by_uid = {pos.segment.uid: pos.start for pos in after if pos.segment.uid}
+    starts: list[float] = []
+    shifts: list[float] = []
+    last_shift = 0.0
+    for pos in before:
+        new_start = after_by_uid.get(pos.segment.uid) if pos.segment.uid else None
+        if new_start is not None:
+            last_shift = new_start - pos.start
+        starts.append(pos.start)
+        shifts.append(last_shift)
+
+    def remap(t: float) -> float:
+        if not starts:
+            return t
+        i = bisect.bisect_right(starts, t) - 1
+        return round(t + (shifts[i] if i >= 0 else 0.0), 3)
+
+    return remap
+
+
+def _retime_absolute_tracks(timeline: "Timeline", remap: Callable[[float], float]) -> None:
+    """Shift every absolute-time item downstream of a video-track edit.
+
+    Anchored captions and voice items are skipped — they are pinned to a
+    segment, not absolute time, and :meth:`Timeline.resolve_anchors`
+    re-derives their position from wherever that segment ends up once every
+    pass has settled.
+    """
+    for cap in timeline.tracks.captions:
+        if cap.anchor is not None:
+            continue
+        cap.at = remap(cap.at)
+        cap.end = remap(cap.end)
+    for cue in timeline.tracks.music:
+        cue.at = remap(cue.at)
+        cue.end = remap(cue.end)
+    for item in timeline.tracks.voice:
+        if item.anchor is not None:
+            continue
+        # A pickup is a fixed-length file: move it, never stretch it.
+        length = None if item.end is None else item.end - item.at
+        item.at = remap(item.at)
+        if length is not None:
+            item.end = round(item.at + length, 3)
+    # Structural markers and chapters are pinned to absolute time as well; a
+    # chapter list that lags the picture by a minute is worse than none.
+    for marker in timeline.markers:
+        marker.at = remap(marker.at)
+    for chapter in timeline.chapters:
+        chapter.at = remap(chapter.at)
 
 
 # ----------------------------------------------------------------------

@@ -197,14 +197,14 @@ Distinct raw `(name, city, country)` strings are grouped once (exact match only)
   "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
   "tracks": {
     "video": [
-      {"id": "s001", "clip": "c003", "in": 12.0, "out": 16.5, "role": "cold-open",
+      {"id": "s001", "uid": "3e4669c0", "clip": "c003", "in": 12.0, "out": 16.5, "role": "cold-open",
        "transform": {"fit": "cover|contain|blur-fill|crop-pan", "zoom": 1.0}, "grade": "default",
        "transition_in": {"type": "cut|fade|xfade", "duration": 0.0}, "speed": 1.0, "mute_source": false,
        "source_audio_gain_db": 0, "notes": "drone reveal"}
     ],
     "voice": [
       {"id": "v001", "file": "voice/intro_pickup.wav", "at": 0.5, "gain_db": 0,
-       "anchor": {"segment": "s003", "offset": 0.0}}
+       "anchor": {"segment": "s003", "offset": 0.0, "uid": "004a3254", "signature": {"clip": "c003", "in": 12.0}}}
     ],
     "music": [
       {"id": "m001", "file": "music/arrival_warm.mp3", "at": 0.0, "end": 185.0, "gain_db": -18, "fade_in": 2.0, "fade_out": 3.0,
@@ -212,23 +212,29 @@ Distinct raw `(name, city, country)` strings are grouped once (exact match only)
     ],
     "captions": [
       {"id": "t001", "at": 0.5, "end": 3.0, "text": "LIZBONA, PORTUGALIA", "style": "location", "position": "lower-left",
-       "anchor": {"segment": "s001", "offset": 0.3}}
+       "anchor": {"segment": "s001", "offset": 0.3, "uid": "3e4669c0", "signature": {"clip": "c003", "in": 12.0}}}
     ],
     "sfx": []
   },
   "mute_ranges": [{"clip": "c005", "s": 3.0, "e": 20.0, "gain_db": -60, "reason": "copyrighted bar music"}],
   "markers": [{"at": 0.0, "label": "hook"}, {"at": 7.0, "label": "promise"}, {"at": 180.0, "label": "re-engagement-1"}],
   "chapters": [{"at": 0, "title": "Przyjazd do Lizbony"}],
-  "meta": {"title_candidates": [], "generated_by": "plan@2026-09-04", "edited_by_human": false}
+  "meta": {"title_candidates": [], "generated_by": "plan@2026-09-04", "edited_by_human": false, "anchor_issues": []}
 }
 ```
 Rules: times in seconds (float). Timeline time for a video segment = cumulative position; `render.py` computes absolute placement. Captions/music/voice use absolute timeline time. `mute_ranges` are in **clip** time and apply to source audio wherever that clip range is used.
+
+**Stable segment identity (`VideoSegment.uid`):** every video segment carries `id` (the display label, `s001`/`s002`/... — renumbered by `plan.py` and `ytedit tidy` every time a segment is inserted, dropped or merged) and `uid` (8 hex chars from `secrets.token_hex(4)`, assigned once on creation and **never** reassigned or renumbered by anything). A file saved before `uid` existed gets one filled in deterministically from `(clip, in, out, index)` the first time it is loaded (`ensure_segment_uids`, called by `Timeline.load()` and `Timeline.model_validate_migrated()`) rather than a fresh random one on every read, so two loads of the same not-yet-migrated file agree on identity. This exists because an anchor that keys on the display id silently resolves to the wrong picture once ids shift under it — three segments inserted upstream used to mean every anchor after that point pointed three segments early, with nothing detecting it (see the process retro for the incident this fixed).
+
+**Anchors key on `uid`, not `id`:** `VoiceAnchor`/`CaptionAnchor` carry `segment` (the display id, kept only for readability — logs, the web editor), `offset`, `uid` (the segment's stable identity at anchoring time) and `signature: {clip, in}` (a fingerprint of that segment, for repair). `Timeline.resolve_anchors()` looks the segment up by `uid` first; if the uid is missing (a legacy anchor) it falls back once to the display id, and if the uid doesn't resolve (or resolves to a segment whose `clip`/`in` no longer matches `signature` within 0.5 s — should not normally happen, but is the safety net for it) it searches every segment for a unique `signature` match and repairs the anchor, logging a WARNING that names the item. An anchor that cannot be resolved at all keeps its last absolute position and is recorded in `meta.anchor_issues` (cleared and rebuilt on every `resolve_anchors()` call) — see `ytedit qc` rule 34. Every anchor-creating call site (`plan.py`'s `_build_voice_items`, `voice.py`'s pickup placement, `locations.py`'s location/hook cards, the `ytedit voice-anchor` CLI command, and the web editor's own anchor retrofit in `PUT /timeline`) fills `uid` + `signature`, not just `segment`.
+
+**The video-track edit API (`Timeline.insert_segments`/`remove_segments`/`replace_segment`):** the one supported way to grow, drop or split video segments outside of the initial `build_timeline` construction. Each assigns a `uid` to any new segment that doesn't have one, re-times everything downstream (unanchored voice items, captions, music cues, markers, chapters) by the frame-exact duration the edit adds or removes at that point — the same shift-map machinery `ytedit.ai.tidy.pad_segments_to_speech` uses for speech padding, now living in `ytedit/timeline.py` so both the tidy pass and the edit API share one implementation — renumbers every segment's display `id` (unless called with `renumber=False`, for a pass like `ytedit.ai.voice` that must keep its own numbering across the edit because something upstream already anchored against it), and re-resolves every anchor. `ytedit/ai/overlay.py` and `ytedit/ai/ledger.py` route their segment drops through `remove_segments`; `ytedit/ai/voice.py`'s pickup-growth pass routes its B-roll inserts through `insert_segments`. The web editor's split action creates the new piece without a `uid` so the server assigns a fresh one on save.
 
 A video segment also accepts an optional `audio_from: {"clip", "in", "out"}` (an *overlay cutaway*): the picture stays `clip[in, out]` but the rendered audio is read from `audio_from.clip[audio_from.in, audio_from.out]` instead, trimmed or padded to the segment's own picture frame count, with the segment's own `speed`/`source_audio_gain_db` and the audio clip's mute ranges and denoised WAV. `mute_source: true` still wins and renders silence. `ytedit/ai/overlay.py` sets it so a cutaway dropped between two contiguous pieces of one take does not interrupt the narration underneath.
 
 `plan.py`'s planner-facing segment schema (before deterministic post-processing) also accepts an optional `voice_over: {"picture": [{"clip", "in", "out"}]}` on a segment: `build_timeline` extracts that segment's own clip audio as a `tracks.voice` item (a WAV cut from `media/audio/<clip>.wav`, or the denoised variant when active, written to `voice/vo_<clip>_<in>_<out>.wav`) and replaces the segment with the listed picture cuts (`mute_source: true`, `role: "b-roll"`) so the narrator is heard but not seen, except where those cuts fall short of the narration's length — then the clip's own picture fills the gap.
 
-A `tracks.voice` item also accepts an optional `anchor: {"segment", "offset"}`: the pickup is pinned `offset` seconds after the start of that video segment id instead of an absolute time, and `Timeline.resolve_anchors()` recomputes `at`/`end` from the segment's current position (keeping the pickup's length) every time padding, sentence snapping, overlay cutaways, audio dedupe or a hand edit in the web editor moves segments around — `plan.py` sets it on every voice-over pickup it creates (anchored to the first picture segment, offset 0) and `ytedit tidy`/`PUT /timeline`/`accept_draft` all re-resolve it before saving; `ytedit voice-anchor <slug> <voice_id> <segment_id>` sets it by hand. A dangling anchor (its segment was dropped) keeps the pickup's last absolute time and logs a warning instead of failing. (`Timeline.resolve_voice_anchors()` still exists as an alias, kept for callers written before captions could anchor too.)
+A `tracks.voice` item also accepts an optional `anchor: {"segment", "offset"}`: the pickup is pinned `offset` seconds after the start of that video segment id instead of an absolute time, and `Timeline.resolve_anchors()` recomputes `at`/`end` from the segment's current position (keeping the pickup's length) every time padding, sentence snapping, overlay cutaways, audio dedupe or a hand edit in the web editor moves segments around — `plan.py` sets it on every voice-over pickup it creates (anchored to the first picture segment, offset 0) and `ytedit tidy`/`PUT /timeline`/`accept_draft` all re-resolve it before saving; `ytedit voice-anchor <slug> <voice_id> <segment_id>` sets it by hand. A dangling anchor (its `uid` no longer resolves, and no unique `signature` match can repair it) keeps the pickup's last absolute time, logs a warning, and is recorded in `meta.anchor_issues` instead of failing outright. (`Timeline.resolve_voice_anchors()` still exists as an alias, kept for callers written before captions could anchor too.)
 
 A `tracks.captions` cue accepts the same `anchor: {"segment", "offset"}` (duration `end - at` kept fixed instead of a voice item's file length), resolved by the same `Timeline.resolve_anchors()` call. This is how `ytedit captions <slug>` (`ytedit/ai/locations.py`) fixes location cards drifting under the wrong picture: instead of a card pinned at an absolute second that a later pad/snap/overlay/dedupe pass silently invalidates, it is pinned to the video segment showing that place, offset `captions.card_offset_s` (default 0.3 s) into it, and always renders under the right shot regardless of how much the timeline has shifted since. The planner's own `hook` captions get the same anchor treatment (retrofitted to whichever segment sits under their current `at`) the first time `ytedit captions` runs; its `location` captions are dropped and replaced by the generated ones unless `--keep-existing`.
 

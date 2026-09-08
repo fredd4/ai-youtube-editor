@@ -48,12 +48,19 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from ytedit.ai.sentences import split_words_into_sentences
-from ytedit.ai.tidy import Word, _retime_absolute_tracks, _shift_map, load_words
+from ytedit.ai.tidy import Word, load_words
 from ytedit.config import Settings
 from ytedit.log import get_logger
 from ytedit.media.ffmpeg import FFmpegError, ff
 from ytedit.project import Project
-from ytedit.timeline import Timeline, Transform, VideoSegment, VoiceAnchor, VoiceItem
+from ytedit.timeline import (
+    AnchorSignature,
+    Timeline,
+    Transform,
+    VideoSegment,
+    VoiceAnchor,
+    VoiceItem,
+)
 
 log = get_logger(__name__)
 
@@ -532,12 +539,22 @@ def _target_segment(timeline: Timeline, text: str) -> VideoSegment | None:
     return None
 
 
+def _make_anchor(segment: VideoSegment, offset: float) -> VoiceAnchor:
+    """Build a :class:`VoiceAnchor` pinned to ``segment`` by uid + signature."""
+    return VoiceAnchor(
+        segment=segment.id,
+        offset=offset,
+        uid=segment.uid,
+        signature=AnchorSignature(clip=segment.clip, **{"in": segment.in_}),
+    )
+
+
 def _anchor_after(timeline: Timeline, target: VideoSegment) -> VoiceAnchor:
     video = timeline.tracks.video
     idx = next(i for i, s in enumerate(video) if s.id == target.id)
     if idx + 1 < len(video):
-        return VoiceAnchor(segment=video[idx + 1].id, offset=0.0)
-    return VoiceAnchor(segment=target.id, offset=round(target.duration, 3))
+        return _make_anchor(video[idx + 1], 0.0)
+    return _make_anchor(target, round(target.duration, 3))
 
 
 def resolve_anchor(
@@ -555,7 +572,7 @@ def resolve_anchor(
         if seg is None:
             return None, f"anchor segment {entry.anchor!r} not found in timeline.json"
         return (
-            VoiceAnchor(segment=entry.anchor, offset=entry.offset),
+            _make_anchor(seg, entry.offset),
             f"explicit anchor {entry.anchor} +{entry.offset:.2f}s",
         )
     if entry.request:
@@ -600,16 +617,26 @@ def _new_segment_id(video: Sequence[VideoSegment]) -> str:
 
 
 def _undo_growth(timeline: Timeline, growth: Mapping[str, Any] | None) -> None:
-    """Revert a previous :func:`_cover_voice_item` result before recomputing it."""
+    """Revert a previous :func:`_cover_voice_item` result before recomputing it.
+
+    Matches by ``uid`` (stable across a renumbering elsewhere, e.g. a fresh
+    ``ytedit plan``/``ytedit tidy`` run between two ``ytedit voice`` runs) —
+    with a fallback to the old cached value as a display id, for a
+    ``voice_incoming/state.json`` written before this field existed.
+    """
     if not growth:
         return
     inserted = set(growth.get("inserted_segments") or [])
     if inserted:
-        timeline.tracks.video = [s for s in timeline.tracks.video if s.id not in inserted]
-    ext_id = growth.get("extended_segment")
+        timeline.tracks.video = [
+            s for s in timeline.tracks.video if s.uid not in inserted and s.id not in inserted
+        ]
+    ext_ref = growth.get("extended_segment")
     ext_by = float(growth.get("extended_by") or 0.0)
-    if ext_id and ext_by > _EPS:
-        seg = next((s for s in timeline.tracks.video if s.id == ext_id), None)
+    if ext_ref and ext_by > _EPS:
+        seg = next(
+            (s for s in timeline.tracks.video if s.uid == ext_ref or s.id == ext_ref), None
+        )
         if seg is not None:
             seg.out = round(seg.out - ext_by, 3)
 
@@ -633,8 +660,9 @@ def _cover_voice_item(
     or the pool runs out.
 
     Every absolute-time track is re-timed exactly like a ``ytedit tidy`` pass
-    would (:func:`ytedit.ai.tidy._shift_map`/``_retime_absolute_tracks``), and
-    anchored voice items (including ``item`` itself) are re-resolved.
+    would (:meth:`ytedit.timeline.Timeline.insert_segments`, the same
+    shift-map machinery), and anchored voice items (including ``item``
+    itself) are re-resolved.
 
     Returns:
         ``(covered, changes, growth_record)`` — ``growth_record`` is what
@@ -690,11 +718,12 @@ def _cover_voice_item(
         if extend > _EPS:
             seg.out = round(seg.out + extend, 3)
             shortfall -= extend
-            record["extended_segment"] = seg.id
+            record["extended_segment"] = seg.uid
             record["extended_by"] = round(extend, 3)
             changes.append(f"grew {seg.id} ({seg.clip}) by {extend:.2f}s to cover the pickup")
 
     insert_at = (last_ok + 1) if last_ok is not None else start_idx
+    new_segments: list[VideoSegment] = []
     if insert_at is not None:
         from ytedit.ai.plan import _vertical_fit  # local: avoids a module-load cycle risk
 
@@ -708,7 +737,7 @@ def _cover_voice_item(
             use_out = out_s if dur <= shortfall + _EPS else in_s + shortfall
             clip_meta = clips.get(clip_id) or {}
             new_seg = VideoSegment(
-                id=_new_segment_id(video),
+                id=_new_segment_id(video + new_segments),
                 clip=clip_id,
                 **{"in": round(in_s, 3)},
                 out=round(use_out, 3),
@@ -717,18 +746,21 @@ def _cover_voice_item(
                 mute_source=True,
                 notes="voice: broll_pool fill for an overlong pickup",
             )
-            video.insert(insert_at, new_seg)
-            insert_at += 1
+            new_segments.append(new_seg)
             added = new_seg.duration
             shortfall -= added
-            record["inserted_segments"].append(new_seg.id)
             changes.append(
                 f"inserted {clip_id}[{in_s:.2f}-{use_out:.2f}] ({added:.2f}s) from broll_pool"
             )
 
-    remap = _shift_map(before, timeline.segment_positions())
-    _retime_absolute_tracks(timeline, remap)
-    timeline.resolve_voice_anchors()
+    # A single edit-API call, diffed against ``before`` (captured at the top
+    # of this function, ahead of the extend above too) so this one re-time
+    # covers both the extend and the insert — exactly what a single
+    # before/after shift-map would have produced. ``renumber=False``: voice.py
+    # deliberately never renumbers ids other stages already anchored against
+    # (see :func:`_new_segment_id`); it always resolves anchors internally.
+    timeline.insert_segments(insert_at, new_segments, before=before, renumber=False)
+    record["inserted_segments"] = [s.uid for s in new_segments]
 
     ok = shortfall <= _EPS
     if not ok:
@@ -749,8 +781,13 @@ def _upsert_voice_item(
     timeline: Timeline, rel_file: str, duration: float, anchor: VoiceAnchor
 ) -> str:
     """Place (or replace, by ``file``) the :class:`VoiceItem` for one pickup."""
-    starts = {pos.segment.id: pos.start for pos in timeline.segment_positions()}
-    at = round(starts.get(anchor.segment, 0.0) + anchor.offset, 3)
+    positions = timeline.segment_positions()
+    starts_by_uid = {pos.segment.uid: pos.start for pos in positions if pos.segment.uid}
+    starts_by_id = {pos.segment.id: pos.start for pos in positions}
+    start = starts_by_uid.get(anchor.uid) if anchor.uid else None
+    if start is None:
+        start = starts_by_id.get(anchor.segment, 0.0)
+    at = round(start + anchor.offset, 3)
     end = round(at + duration, 3)
     existing = next((v for v in timeline.tracks.voice if v.file == rel_file), None)
     if existing is not None:

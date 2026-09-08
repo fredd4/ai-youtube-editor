@@ -37,7 +37,7 @@ from ytedit import costs
 from ytedit.config import PROJECTS_DIR
 from ytedit.log import get_logger
 from ytedit.project import Project, ProjectError, utcnow, validate_slug
-from ytedit.timeline import MuteRange, Timeline, new_timeline
+from ytedit.timeline import MuteRange, Timeline, ensure_segment_uids, new_timeline
 
 from .jobs import STAGE_ORDER, JobError, JobManager
 
@@ -729,7 +729,7 @@ def create_app(
         data = _read_json(project.timeline_file)
         issues: list[str] = []
         try:
-            issues = Timeline.model_validate(data).validate(project)
+            issues = Timeline.model_validate_migrated(data).validate(project)
         except ValidationError as exc:  # pragma: no cover - hand-edited file
             issues = [f"schema: {e['loc']}: {e['msg']}" for e in exc.errors()]
         return {
@@ -751,6 +751,7 @@ def create_app(
         data = _read_json(project.plan_dir / "timeline.draft.json")
         if data is None:
             raise HTTPException(404, "no draft timeline")
+        ensure_segment_uids(data)
         return data
 
     @api.get("/api/p/{slug}/timeline/positions")
@@ -768,7 +769,7 @@ def create_app(
         if data is None:
             raise HTTPException(404, "no timeline yet — run Plan")
         try:
-            timeline = Timeline.model_validate(data)
+            timeline = Timeline.model_validate_migrated(data)
         except ValidationError as exc:
             raise HTTPException(422, {"detail": "timeline on disk is invalid",
                                       "errors": exc.errors(include_url=False)}) from exc
@@ -838,7 +839,7 @@ def create_app(
         """
         project = load(slug)
         try:
-            timeline = Timeline.model_validate(payload)
+            timeline = Timeline.model_validate_migrated(payload)
         except ValidationError as exc:
             raise HTTPException(422, {"detail": "invalid timeline", "errors": exc.errors(
                 include_url=False)}) from exc
@@ -875,7 +876,7 @@ def create_app(
         if data is None:
             raise HTTPException(404, "no timeline to validate")
         try:
-            timeline = Timeline.model_validate(data)
+            timeline = Timeline.model_validate_migrated(data)
         except ValidationError as exc:
             return {"ok": False, "issues": [
                 f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors(
@@ -892,7 +893,7 @@ def create_app(
             raise HTTPException(404, "no draft timeline to accept")
         data = _read_json(draft)
         try:
-            timeline = Timeline.model_validate(data)
+            timeline = Timeline.model_validate_migrated(data)
         except ValidationError as exc:
             raise HTTPException(422, {"detail": "draft is not a valid timeline",
                                       "errors": exc.errors(include_url=False)}) from exc
@@ -929,7 +930,7 @@ def create_app(
         if project.timeline_file.exists():
             data = _read_json(project.timeline_file) or {}
             try:
-                timeline = Timeline.model_validate(data)
+                timeline = Timeline.model_validate_migrated(data)
             except ValidationError as exc:
                 raise HTTPException(422, {"detail": "timeline on disk is invalid",
                                           "errors": exc.errors(include_url=False)}) from exc
