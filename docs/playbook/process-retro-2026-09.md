@@ -77,7 +77,7 @@ ingest ~2 h (HLG tonemap), each full render 25–45 min.
 
 ## 4. Lessons (added after the third correction round, 2026-09-08)
 
-1. **Draft first, always.** Every review round is a light draft from proxies (`render --draft`), never a master. The master is rendered once, after the user's OK, on the hardware tier. Rationale: three masters were rendered on this project, each an hour of machine time, and every one was superseded by a note that a draft would have surfaced.
+1. **Draft first, always.** Every review round is a light draft from proxies (`render --draft`; measured on the 18:27 The reference project cut: 10.6 min cold with a test suite running alongside, of which 8.3 min was the segment pass — subsequent drafts reuse the draft cache and take ~2–3 min), never a master. The master is rendered once, after the user's OK, on the hardware tier. Rationale: three masters were rendered on this project, each an hour of machine time, and every one was superseded by a note that a draft would have surfaced.
 2. **Identity, not position.** Anything that must stay attached to a picture (pickups, captions, chapters) references a stable segment uid, never an absolute time or an ordinal. Two of the three correction rounds were drift bugs of this kind.
 3. **Machine-checkable gates before every hand-over.** QC 31–35 (no audio twice, sentence boundaries, pickup over speech, anchors) plus the script check and the reports of `voice`/`captions`. If a class of error reaches the user, the fix is a rule, not a manual check.
 4. **No scratch scripts on the timeline.** Every splice goes through `Timeline.insert_segments/remove_segments/replace_segment` or a CLI stage. The scratch script that renumbered segments is exactly how round three happened.
