@@ -815,3 +815,65 @@ def test_pad_after_a_full_stop_never_swallows_the_next_sentence(project: Project
     tl, changes = pad_segments_to_speech(timeline_of(seg("s001", "c213", 35.5, 53.05)), project)
     out = tl.tracks.video[0].out
     assert 52.64 <= out < 52.79, (out, changes)   # after the full stop, before "I"
+
+
+# ----------------------------------------------------------------------
+# close_silent_interruptions inside the full tidy() round loop
+# ----------------------------------------------------------------------
+#: Three well-separated sentences on one clip (mirrors ``tests.test_overlay``).
+_THREE_SENTENCES = [
+    (1.0, 1.4, "Alfa"), (1.6, 3.0, "Beta."),
+    (4.0, 4.4, "Gamma"), (4.6, 6.0, "Delta."),
+    (7.0, 7.4, "Epsilon"), (7.6, 9.0, "Zeta."),
+]
+
+
+def test_tidy_closes_a_silent_interruption_and_a_second_run_is_a_no_op(
+    project: Project,
+) -> None:
+    """The full ``ytedit tidy`` round loop (pad -> overlay -> close -> dedupe)
+    must close a muted-cutaway skip in its very first call and settle: a
+    second, independent ``tidy()`` call must find nothing left to do.
+
+    ``s002`` is a 0.55 s *muted* cutaway sitting between two speech pieces of
+    ``c030`` with a 3.25 s skip between them ("Gamma Delta." would otherwise
+    be silently dropped) — exactly the pattern from the user's fourth-round
+    verdict. Every timing here is already at the value ``pad_segments_to_speech``
+    would produce, and 0.55 s is chosen so the fill lands exactly on the next
+    word's own start (4.0, "Gamma") rather than inside it — otherwise the
+    *next* round's word-level pad would try to reopen the boundary it just
+    closed, and the test would be exercising that convergence machinery
+    instead of this feature.
+    """
+    add_clip(project, "c030", 60.0, _THREE_SENTENCES)
+    add_clip(project, "c033", 20.0)      # cutaway footage, no words
+    timeline_of(
+        seg("s001", "c030", 0.7, 3.45, role="a-roll"),
+        seg("s002", "c033", 0.0, 0.55, role="cutaway", mute_source=True),
+        seg("s003", "c030", 6.7, 9.45, role="a-roll"),
+    ).save(project.timeline_file)
+
+    result = tidy(project)
+    assert result["converged"] is True
+    assert result["issues"] == []
+    assert result["silent_interruptions_closed"] >= 1
+    assert any("fill:" in c for c in result["changes"])
+    first_bytes = project.timeline_file.read_bytes()
+
+    saved = Timeline.load(project.timeline_file)
+    s002 = next(s for s in saved.tracks.video if s.id == "s002")
+    s003 = next(s for s in saved.tracks.video if s.id == "s003")
+    assert s002.mute_source is False
+    assert s002.audio_from is not None and s002.audio_from.clip == "c030"
+    assert s003.in_ == pytest.approx(s002.audio_from.out, abs=1e-3)
+
+    from ytedit.ai.overlay import find_silent_interruptions
+
+    assert find_silent_interruptions(saved, project) == []
+
+    # A second, independent run (a fresh load from disk) must be a no-op.
+    result2 = tidy(project)
+    assert result2["changes"] == []
+    assert result2["written"] is None
+    assert result2["rounds"] == 1
+    assert project.timeline_file.read_bytes() == first_bytes

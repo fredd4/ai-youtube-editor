@@ -13,11 +13,15 @@ safe-area font check (rule 21), Content-ID pre-flight (every
 play twice, rule 31), a true-break sentence check (a cut where the audio
 actually stops landing mid-sentence, rule 32), a voice pickup overlapping a
 segment's own narration (rule 33), an anchor that could not be resolved
-against a stable segment (rule 34), and a voice pickup spilling past the
-muted/ambient picture it was covered by (rule 35). Rules 31-35 are not in
+against a stable segment (rule 34), a voice pickup spilling past the
+muted/ambient picture it was covered by (rule 35), a muted cutaway run
+stranding the narrator mid-take with no audio at all (rule 36), and a speech
+segment whose ``out`` is not a sentence end when the next segment's audio
+comes from somewhere else (rule 37). Rules 31-37 are not in
 ``docs/research/youtube-production-playbook.md`` (1-30) — they encode rules
-added afterwards; see :mod:`ytedit.ai.ledger` (31) and
-:attr:`ytedit.timeline.VideoSegment.uid` (33-35, the stable-anchor fix).
+added afterwards; see :mod:`ytedit.ai.ledger` (31),
+:attr:`ytedit.timeline.VideoSegment.uid` (33-35, the stable-anchor fix), and
+:mod:`ytedit.ai.overlay` (36-37, story continuity over cutaway pacing).
 
 **Rendered file** — container and codec conformance (rule 23: H.264 High,
 yuv420p, faststart with ``moov`` ahead of ``mdat``, bt709 tags, AAC-LC
@@ -408,6 +412,14 @@ def check_timeline(project: Project, timeline: Timeline, report: Report) -> None
     for issue in voice_spill_issues(project, timeline):
         report.warn(issue)
 
+    # --- rule 36: a silent cutaway stranding a take mid-thought -----------
+    for issue in silent_interruption_issues(project, timeline):
+        report.error(issue)
+
+    # --- rule 37: a speech segment cut off, not at a sentence end --------
+    for issue in mid_thought_cut_issues(project, timeline):
+        report.warn(issue)
+
 
 def pacing_warnings(timeline: Timeline, settings: Any) -> list[str]:
     """Return :func:`ytedit.ai.plan.pacing_report` output, or ``[]``.
@@ -735,6 +747,89 @@ def voice_spill_issues(project: Project, timeline: Timeline) -> list[str]:
                 f"the muted/ambient picture under it (ends {_mmss(run_end)}) — spills into "
                 "the next scene"
             )
+    return issues
+
+
+def silent_interruption_issues(project: Project, timeline: Timeline) -> list[str]:
+    """Rule 36 (ERROR): a muted cutaway run leaves the narrator silent
+    mid-take.
+
+    Thin wrapper over :func:`ytedit.ai.overlay.find_silent_interruptions` —
+    the exact pattern :func:`ytedit.ai.overlay.close_silent_interruptions`
+    exists to fix on every ``ytedit tidy``. Seeing this here almost always
+    means a hand-edited ``timeline.json`` was never run back through tidy, or
+    the fix was blocked (a voice pickup covers the run, or the ledger already
+    claims the range it would need).
+    """
+    try:
+        from .ai.overlay import find_silent_interruptions
+    except ImportError:  # pragma: no cover - AI layer not installed
+        log.debug("ytedit.ai.overlay is unavailable; skipping the silent-interruption rule")
+        return []
+    try:
+        findings = find_silent_interruptions(timeline, project)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("find_silent_interruptions failed: %s", exc)
+        return []
+    return [f"rule 36: {finding}" for finding in findings]
+
+
+def mid_thought_cut_issues(project: Project, timeline: Timeline) -> list[str]:
+    """Rule 37 (WARNING): a speech segment's ``out`` is not a sentence end
+    when the next segment's audio comes from somewhere else — the thought is
+    cut, whether or not a nearby word would have let rule 32's narrower "true
+    break" check complete it.
+
+    Unlike rule 32 (:func:`_check_sentence_breaks`, which only fires when the
+    transcript has more words within ``pacing.sentence_gap_max`` to finish the
+    sentence with), this fires on *any* non-final last word — including one
+    where the rest of the sentence is too far away to ever be reachable. That
+    is exactly the story-continuity rule from the fourth review round: a
+    cutaway must land after the sentence that closes the thought, never in
+    the middle of it, no matter how far the next word actually sits.
+    """
+    try:
+        from .ai.tidy import Word, _inside, _is_continuous_handoff, ends_sentence, load_words
+    except ImportError:  # pragma: no cover - AI layer not installed
+        log.debug("ytedit.ai.tidy is unavailable; skipping the mid-thought-cut rule")
+        return []
+
+    cfg = project.settings
+    merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
+    words_cache: dict[str, list[Word]] = {}
+    video = timeline.tracks.video
+    issues: list[str] = []
+
+    def words_for(clip_id: str) -> list[Word]:
+        if clip_id not in words_cache:
+            words_cache[clip_id] = load_words(project, clip_id)
+        return words_cache[clip_id]
+
+    for index, seg in enumerate(video):
+        if seg.mute_source:
+            continue
+        words = words_for(seg.clip)
+        if not words:
+            continue
+        indices = _inside(seg, words)
+        if not indices:
+            continue
+        last = words[indices[-1]]
+        if ends_sentence(last):
+            continue
+        next_seg = video[index + 1] if index + 1 < len(video) else None
+        if next_seg is None:
+            # No hand-off to another source at all — that is rule 8's ending
+            # guard's concern (or simply the programme's own last word), not
+            # a cutaway interrupting a thought.
+            continue
+        if _is_continuous_handoff(seg, next_seg, merge_gap):
+            continue
+        issues.append(
+            f"rule 37: {seg.id} out at {_mmss(seg.out)} ends mid-thought (last word "
+            f"'{last.text}' doesn't close the sentence) while {next_seg.id} carries "
+            "different audio"
+        )
     return issues
 
 

@@ -11,7 +11,13 @@ import pytest
 
 from tests.test_tidy import C030, add_clip, seg, timeline_of
 from ytedit.ai.ledger import dedupe_audio, find_duplicate_audio
-from ytedit.ai.overlay import overlay_cutaways
+from ytedit.ai.overlay import (
+    FILL_TAG,
+    JCUT_TAG,
+    close_silent_interruptions,
+    find_silent_interruptions,
+    overlay_cutaways,
+)
 from ytedit.ai.tidy import pad_segments_to_speech
 from ytedit.project import Project
 from ytedit.timeline import Caption, MusicCue, Timeline, VoiceItem
@@ -363,3 +369,132 @@ def test_overlay_reassigning_the_same_audio_from_is_a_silent_no_op(project: Proj
 
     tl, second_changes = overlay_cutaways(tl, project)
     assert second_changes == []
+
+
+# ----------------------------------------------------------------------
+# close_silent_interruptions: story continuity over a muted cutaway
+# ----------------------------------------------------------------------
+#: THREE_SENTENCES plus a fourth sentence far enough away to force a J-cut.
+JCUT_WORDS = THREE_SENTENCES + [(20.0, 20.4, "Eta"), (20.6, 24.0, "Theta.")]
+
+
+def test_a_short_skip_is_filled_with_continuous_narration(project: Project) -> None:
+    """A silent cutaway run over a skip within ``story_fill_max_s`` is a
+    "fill": the cutaway carries the narrator's own voice continuously from
+    where ``A`` left off, and ``A2`` resumes wherever that lands — not at its
+    original ``in`` — so nothing is ever heard twice and nothing is ever
+    silent.
+    """
+    add_clip(project, "c001", 60.0, THREE_SENTENCES)
+    add_clip(project, "c002", 20.0)          # cutaway footage, no words
+    a = seg("s001", "c001", 0.7, 3.45, role="a-roll")           # ends 'Beta.' + pad
+    cutaway = seg("s002", "c002", 0.0, 0.55, role="cutaway", mute_source=True)
+    a2 = seg("s003", "c001", 6.7, 9.45, role="a-roll")          # 'Gamma Delta.' skipped
+    tl, changes = close_silent_interruptions(timeline_of(a, cutaway, a2), project)
+    a1, cut, a2f = tl.tracks.video
+
+    assert a1.out == pytest.approx(3.45)                        # A is untouched
+    assert cut.mute_source is False
+    assert (cut.audio_from.clip, cut.audio_from.in_, cut.audio_from.out) == (
+        "c001", pytest.approx(3.45), pytest.approx(4.0),
+    )
+    assert a2f.in_ == pytest.approx(4.0)                        # not its original 6.7
+    assert a2f.out == pytest.approx(9.45)
+    assert any(FILL_TAG in c for c in changes)
+    assert not any(JCUT_TAG in c for c in changes)
+
+
+def test_a_long_skip_gets_a_j_cut_carrying_a2s_own_start(project: Project) -> None:
+    """A skip past ``story_fill_max_s`` is a "J-cut": the cutaway carries
+    ``A2``'s own opening words early, and ``A2``'s picture starts once its
+    audio has caught up. ``A`` already ends on a sentence, so no extension is
+    needed here (see the next test for that).
+    """
+    add_clip(project, "c001", 60.0, JCUT_WORDS)
+    add_clip(project, "c002", 20.0)
+    a = seg("s001", "c001", 1.0, 3.0, role="a-roll")            # ends exactly on 'Beta.'
+    cutaway = seg("s002", "c002", 0.0, 2.0, role="cutaway", mute_source=True)
+    a2 = seg("s003", "c001", 20.0, 25.0, role="a-roll")         # 17 s away > 10 s fill_max
+    tl, changes = close_silent_interruptions(timeline_of(a, cutaway, a2), project)
+    a1, cut, a2f = tl.tracks.video
+
+    assert a1.out == pytest.approx(3.0)                         # already a sentence end
+    assert cut.mute_source is False
+    assert (cut.audio_from.clip, cut.audio_from.in_, cut.audio_from.out) == (
+        "c001", pytest.approx(20.0), pytest.approx(22.0),
+    )
+    assert a2f.in_ == pytest.approx(22.0)                       # advanced past what the cutaway now carries
+    assert any(JCUT_TAG in c for c in changes)
+    assert not any(FILL_TAG in c for c in changes)
+
+
+def test_j_cut_extends_a_mid_sentence_take_to_the_sentence_end(project: Project) -> None:
+    """When ``A`` stops mid-sentence, the J-cut extends it to finish the
+    thought (the same sentence-snap machinery ``ytedit.ai.tidy`` uses for
+    padding) before handing the cutaways to ``A2``'s own audio.
+    """
+    add_clip(project, "c001", 60.0, JCUT_WORDS)
+    add_clip(project, "c002", 20.0)
+    a = seg("s001", "c001", 1.0, 1.5, role="a-roll")            # stops after 'Alfa', mid-sentence
+    cutaway = seg("s002", "c002", 0.0, 2.0, role="cutaway", mute_source=True)
+    a2 = seg("s003", "c001", 20.0, 25.0, role="a-roll")
+    tl, changes = close_silent_interruptions(timeline_of(a, cutaway, a2), project)
+    a1, cut, a2f = tl.tracks.video
+
+    assert a1.out == pytest.approx(3.45)                        # extended to 'Beta.' + pad
+    assert cut.audio_from is not None and cut.audio_from.clip == "c001"
+    assert a2f.in_ == pytest.approx(22.0)
+    assert any("extend" in c and JCUT_TAG in c for c in changes)
+
+
+def test_a_cutaway_between_different_clips_is_left_alone(project: Project) -> None:
+    """``A2`` on a different clip is not the same take resuming — nothing
+    to fix here."""
+    add_clip(project, "c001", 60.0, THREE_SENTENCES)
+    add_clip(project, "c002", 20.0)
+    add_clip(project, "c003", 20.0, [(5.0, 5.4, "Ipsum"), (5.6, 6.0, "Lorem.")])
+    a = seg("s001", "c001", 0.7, 3.45, role="a-roll")
+    cutaway = seg("s002", "c002", 0.0, 0.55, role="cutaway", mute_source=True)
+    a2 = seg("s003", "c003", 5.0, 8.0, role="a-roll")
+    tl, changes = close_silent_interruptions(timeline_of(a, cutaway, a2), project)
+
+    assert changes == []
+    cut = tl.tracks.video[1]
+    assert cut.mute_source is True and cut.audio_from is None
+    assert tl.tracks.video[2].in_ == pytest.approx(5.0)
+
+
+def test_a_vo_picture_cut_is_left_alone(project: Project) -> None:
+    """A ``VO picture for`` montage segment never becomes a cutaway."""
+    add_clip(project, "c001", 60.0, THREE_SENTENCES)
+    add_clip(project, "c002", 20.0)
+    a = seg("s001", "c001", 0.7, 3.45, role="a-roll")
+    vo_picture = seg(
+        "s002", "c002", 0.0, 1.0, role="b-roll", mute_source=True,
+        notes="VO picture for c009",
+    )
+    a2 = seg("s003", "c001", 6.7, 9.45, role="a-roll")
+    tl, changes = close_silent_interruptions(timeline_of(a, vo_picture, a2), project)
+
+    assert changes == []
+    assert tl.tracks.video[1].audio_from is None
+    assert tl.tracks.video[1].mute_source is True
+    assert tl.tracks.video[2].in_ == pytest.approx(6.7)
+
+
+def test_rule_36_fires_on_the_silent_pattern_and_clears_after_the_fix(project: Project) -> None:
+    """``find_silent_interruptions`` (QC rule 36) sees the same pattern
+    :func:`close_silent_interruptions` closes, and is quiet once it has."""
+    add_clip(project, "c001", 60.0, THREE_SENTENCES)
+    add_clip(project, "c002", 20.0)
+    a = seg("s001", "c001", 0.7, 3.45, role="a-roll")
+    cutaway = seg("s002", "c002", 0.0, 0.55, role="cutaway", mute_source=True)
+    a2 = seg("s003", "c001", 6.7, 9.45, role="a-roll")
+    tl = timeline_of(a, cutaway, a2)
+
+    before = find_silent_interruptions(tl, project)
+    assert len(before) == 1
+    assert "silent interruption" in before[0]
+
+    tl, _changes = close_silent_interruptions(tl, project)
+    assert find_silent_interruptions(tl, project) == []

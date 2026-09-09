@@ -109,6 +109,8 @@ Adapted from the MrBeast-derived retention research (`docs/research/youtube-prod
 
 Cite `plan/timeline.json.markers[]` against this table when reviewing the plan — every listed marker needs a real beat, and a beat with no marker is a sign the plan skipped a structural step.
 
+The pacing ceilings above are subordinate to story continuity: never accept a cut that mutes the narrator or interrupts a thought mid-sentence just to hit a shot-length target — a cutaway carries the narration through it or waits for the sentence to finish (`ytedit tidy`'s `close_silent_interruptions` enforces this automatically; QC rule 36 catches anything left over).
+
 ---
 
 ## 5. Narration requests
@@ -232,7 +234,7 @@ Condensed from the research report's "Agent editing checklist" — run at QC (2.
 
 **Structure:** cold open within 2 s, no logo/greeting · thumbnail promise confirmed before 0:25 · premise in ≤5 s · pattern interrupt at 0:25-0:35 · re-engagement beats near 3:00 and 6:00 (or flagged as a gap) · payoff then hard cut, no wrap-up phrase before it · final 20 s clean for the end screen.
 
-**Pacing:** no shot >4 s before 6:00 / >7 s after (rolling, not spot-check) · no 12 s stretch without a visual change · no A-roll run >10 s without a cutaway · passes the 1.5× watch test.
+**Pacing:** no shot >4 s before 6:00 / >7 s after (rolling, not spot-check, and subordinate to story continuity — a longer take that finishes a thought is fine) · no 12 s stretch without a visual change · no A-roll run >10 s without a cutaway · passes the 1.5× watch test · no silent interruption of a take (rule 36) and no cutaway landing mid-sentence (rule 37).
 
 **Audio:** master measures −14 LUFS / −1 dBTP · music 14-18 LU under narration, no pumping · every flagged background-music range muted/ducked/explicitly accepted · voice cleanup applied where source was noisy.
 

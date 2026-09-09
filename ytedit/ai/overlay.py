@@ -34,6 +34,33 @@ uses (:func:`ytedit.ai.tidy._shift_map`).
 
 The pass runs at the end of :func:`ytedit.ai.plan.build_timeline` and again on
 every ``ytedit tidy``.
+
+:func:`close_silent_interruptions` handles the pattern :func:`overlay_cutaways`
+deliberately leaves alone: ``A`` → ``C_1..C_k`` (cutaways carrying no audio at
+all — muted, no ``audio_from``) → ``A2`` (the same clip resuming *later* than
+``A`` left off, and further than the cutaways or ``sentence_gap_max`` would
+excuse). That used to mean the narrator was silenced for however long the
+cutaways lasted and then resumed mid-breath — the user's fourth-round verdict: "if
+you did not mute me... or if the cutaway came at the end of the thought".
+Story continuity now wins over the shot-length ceilings:
+
+* a skip of at most ``pacing.story_fill_max_s`` is a **fill** — the cutaways
+  carry ``A``'s clip continuously from ``A.out``, so every word in the gap is
+  still heard (just under different pictures), and ``A2`` resumes wherever
+  that continuous narration lands, not at its original ``in``;
+* a longer skip is a **J-cut** — ``A`` is first extended (or, failing that,
+  retracted) to a real sentence end with the same machinery
+  :mod:`ytedit.ai.tidy` uses for padding, so the thought actually finishes;
+  the cutaways then carry ``A2``'s own opening words early, and ``A2``'s
+  picture starts once its audio has caught up. Either way the audio never
+  stops.
+
+A cutaway that already carries ``audio_from``, a ``VO picture for`` montage
+segment, or a run sitting under a ``tracks.voice`` pickup is left exactly as
+it is — this pass only closes a run that is genuinely silent right now.
+:func:`find_silent_interruptions` is the read-only counterpart (``ytedit qc``
+rule 36): it reports any such pattern still standing, the way
+:func:`ytedit.ai.ledger.find_duplicate_audio` reports rule 31.
 """
 
 from __future__ import annotations
@@ -42,11 +69,20 @@ import re
 from typing import Sequence
 
 from ytedit.ai.ledger import _consumed_overlap, committed_audio_ranges
-from ytedit.ai.tidy import Word, load_words
+from ytedit.ai.tidy import (
+    Word,
+    _clip_bounds,
+    _out_tail,
+    _retract_out_to_previous_sentence,
+    _snap_out_to_sentence,
+    excised_ranges,
+    has_sentence_marks,
+    load_words,
+)
 from ytedit.config import Settings
 from ytedit.log import get_logger
 from ytedit.project import Project
-from ytedit.timeline import AudioFrom, Timeline, VideoSegment
+from ytedit.timeline import AudioFrom, SegmentPosition, Timeline, VideoSegment
 
 log = get_logger(__name__)
 
@@ -315,4 +351,348 @@ def overlay_cutaways(
     return timeline, changes
 
 
-__all__ = ["CUTAWAY_ROLE_RE", "overlay_cutaways"]
+# ----------------------------------------------------------------------
+# story continuity: close a silent A -> muted cutaway(s) -> A2 interruption
+# ----------------------------------------------------------------------
+#: Tags used in the change log (see :func:`close_silent_interruptions`) and by
+#: any caller wanting to count one kind of rewrite without parsing prose.
+FILL_TAG = "fill:"
+JCUT_TAG = "J-cut:"
+
+
+def _is_silent_cutaway(seg: VideoSegment, clip: str) -> bool:
+    """True when ``seg`` is a cutaway carrying no audio at all right now.
+
+    The candidate picture for :func:`close_silent_interruptions`: a genuine
+    cutaway (see :func:`_is_cutaway`) that is muted with no ``audio_from`` —
+    i.e. dead air, not merely a cutaway playing its own ambience (which is not
+    the defect this pass exists to fix) or one another pass has already
+    handed narration to.
+    """
+    return _is_cutaway(seg, clip) and seg.mute_source and seg.audio_from is None
+
+
+def _voice_covers_span(
+    timeline: Timeline, positions: Sequence[SegmentPosition], segs: Sequence[VideoSegment]
+) -> bool:
+    """True when a ``tracks.voice`` pickup overlaps the absolute span of ``segs``.
+
+    ``positions`` should be a snapshot taken before this round's mutations
+    (segment identity, not index, is what is looked up) — a pickup already
+    covering this stretch of the picture is a voice-pickup cover this pass
+    must never touch, not a silent interruption.
+    """
+    wanted = {id(s) for s in segs}
+    spans = [(p.start, p.end) for p in positions if id(p.segment) in wanted]
+    if not spans:
+        return False
+    lo = min(s for s, _e in spans)
+    hi = max(e for _s, e in spans)
+    for item in timeline.tracks.voice:
+        end = item.end if item.end is not None else item.at
+        if end <= item.at:
+            continue
+        if end > lo + _EPS and item.at < hi - _EPS:
+            return True
+    return False
+
+
+def _shrink_or_drop_continuation(
+    run: Sequence[VideoSegment],
+    a2: VideoSegment,
+    clips: dict,
+) -> None:
+    """Shared fallback for both fill and J-cut: too little of ``a2`` survives.
+
+    Mirrors the min-shot shrink in :func:`overlay_cutaways`: the last cutaway
+    in ``run`` grows its picture (and, capped to what audio is actually
+    available, its ``audio_from``) to cover the rest of what ``a2`` would have
+    shown, instead of leaving a sub-``min_shot`` sliver of ``a2`` on the
+    timeline. ``a2`` itself is left for the caller to drop.
+    """
+    last = run[-1]
+    assert last.audio_from is not None
+    audio_available = max(0.0, a2.out - last.audio_from.in_)
+    wanted = last.duration + a2.duration
+    clip_duration = float((clips.get(last.clip) or {}).get("duration") or 0.0)
+    last_speed = last.speed if last.speed > 0 else 1.0
+    new_out = last.in_ + wanted * last_speed
+    new_out = min(new_out, last.in_ + audio_available * last_speed)
+    if clip_duration > 0:
+        new_out = min(new_out, clip_duration)
+    new_out = max(new_out, last.out)
+    last.out = round(new_out, 3)
+    capped_audio_out = min(last.audio_from.in_ + last.duration, a2.out)
+    if capped_audio_out > last.audio_from.in_ + _EPS:
+        last.audio_from.out = round(capped_audio_out, 3)
+
+
+def close_silent_interruptions(
+    timeline: Timeline, project: Project, settings: Settings | None = None
+) -> tuple[Timeline, list[str]]:
+    """Never leave the narrator muted between two speech pieces of one take.
+
+    Args:
+        timeline: The EDL to rewrite; it is modified in place and returned.
+        project: Project supplying transcripts, analyses and clip durations.
+        settings: Settings override (defaults to ``project.settings``); reads
+            ``pacing.story_fill_max_s``, ``pacing.min_shot_seconds``,
+            ``pacing.audio_dupe_tolerance``, ``pacing.speech_pad_after``,
+            ``pacing.sentence_gap_max`` and ``pacing.sentence_extend_max``.
+
+    Returns:
+        ``(timeline, changes)`` — one line per rewrite, tagged ``fill:`` or
+        ``J-cut:`` (see :data:`FILL_TAG`/:data:`JCUT_TAG`); empty when no
+        silent-interruption pattern was found.
+    """
+    cfg = settings or project.settings
+    fill_max = max(0.0, float(cfg.get("pacing.story_fill_max_s", 10.0)))
+    min_shot = max(0.0, float(cfg.get("pacing.min_shot_seconds", 0.8)))
+    tolerance = max(0.0, float(cfg.get("pacing.audio_dupe_tolerance", 0.25)))
+    pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
+    gap_max = max(0.0, float(cfg.get("pacing.sentence_gap_max", 1.2)))
+    extend_max = max(0.0, float(cfg.get("pacing.sentence_extend_max", 8.0)))
+
+    clips = project.load_state().get("clips", {})
+    words_cache: dict[str, list[Word]] = {}
+    cuts_cache: dict[str, list[tuple[float, float]]] = {}
+
+    def words_for(clip_id: str) -> list[Word]:
+        if clip_id not in words_cache:
+            words_cache[clip_id] = load_words(project, clip_id)
+        return words_cache[clip_id]
+
+    def cuts_for(clip_id: str) -> list[tuple[float, float]]:
+        if clip_id not in cuts_cache:
+            cuts_cache[clip_id] = excised_ranges(project, clip_id)
+        return cuts_cache[clip_id]
+
+    changes: list[str] = []
+    video: Sequence[VideoSegment] = timeline.tracks.video
+    before_positions = timeline.segment_positions()
+    dropped: set[int] = set()
+    mutations = 0
+
+    i = 0
+    while i < len(video) - 1:
+        a = video[i]
+        if a.mute_source or not _has_speech(project, a, words_cache):
+            i += 1
+            continue
+
+        j = i + 1
+        while j < len(video) and _is_silent_cutaway(video[j], a.clip):
+            j += 1
+        if j == i + 1 or j >= len(video):
+            i += 1
+            continue
+
+        a2 = video[j]
+        if a2.clip != a.clip or a2.mute_source or not _has_speech(project, a2, words_cache):
+            i = j
+            continue
+        if a2.in_ <= a.out + _EPS:
+            # No gap to close — a.out already reaches a2.in (or past it); not
+            # this pass's concern.
+            i = j
+            continue
+
+        run = list(video[i + 1:j])
+        if _voice_covers_span(timeline, before_positions, run):
+            log.debug(
+                "%s -> %s: cutaway run sits under a voice pickup — left alone", a.id, a2.id
+            )
+            i = j
+            continue
+
+        skip = a2.in_ - a.out
+        total_cutaway = sum(seg.duration for seg in run)
+
+        if skip <= fill_max + _EPS:
+            # ---- fill: continuous narration under the cutaways -----------
+            committed = committed_audio_ranges(timeline, video_slice=slice(0, i)).get(a.clip, [])
+            if _consumed_overlap(committed, a.out, a.out + total_cutaway) > tolerance + _EPS:
+                log.debug(
+                    "%s -> %s: fill range already claimed earlier in the track — left alone",
+                    a.id, a2.id,
+                )
+                i = j
+                continue
+
+            old_a2_in = a2.in_
+            cursor = a.out
+            for cutaway in run:
+                end = round(cursor + cutaway.duration, 3)
+                cutaway.audio_from = AudioFrom(clip=a.clip, **{"in": round(cursor, 3)}, out=end)
+                cutaway.mute_source = False
+                cursor = end
+            new_in = round(cursor, 3)
+            speed2 = a2.speed if a2.speed > 0 else 1.0
+            if (a2.out - new_in) / speed2 < min_shot - _EPS:
+                _shrink_or_drop_continuation(run, a2, clips)
+                dropped.add(id(a2))
+                changes.append(
+                    f"{a.id} {FILL_TAG} {len(run)} cutaway(s) carry {a.clip} audio "
+                    f"{_fmt(a.out)}→{_fmt(run[-1].audio_from.out)} continuously, closing a "
+                    f"{skip:.2f}s silent gap; {a2.id} dropped (too little of it left)"
+                )
+            else:
+                a2.in_ = new_in
+                changes.append(
+                    f"{a.id} {FILL_TAG} {len(run)} cutaway(s) carry {a.clip} audio "
+                    f"{_fmt(a.out)}→{_fmt(new_in)} continuously, closing a {skip:.2f}s silent "
+                    f"gap; {a2.id} in {_fmt(old_a2_in)}→{_fmt(new_in)}"
+                )
+            mutations += 1
+            i = j + (1 if id(a2) in dropped else 0)
+            continue
+
+        # ---- J-cut: finish the sentence, then start the next one --------
+        words = words_for(a.clip)
+        if words and has_sentence_marks(words):
+            tail = _out_tail(a, words, gap_max)
+            if tail is not None:
+                _low, high = _clip_bounds(video, i)
+                cuts = cuts_for(a.clip)
+                duration = float((clips.get(a.clip) or {}).get("duration") or 0.0)
+                snap = _snap_out_to_sentence(
+                    a, words, cuts, high, duration, pad_after, gap_max, extend_max
+                )
+                if snap is not None:
+                    new_out, anchor = snap
+                    changes.append(
+                        f"{a.id} out {_fmt(a.out)}→{_fmt(new_out)} ({JCUT_TAG} extend to the "
+                        f"end of the sentence at '{anchor.text}' before the cutaway)"
+                    )
+                    a.out = new_out
+                    mutations += 1
+                else:
+                    speed_a = a.speed if a.speed > 0 else 1.0
+                    retracted = _retract_out_to_previous_sentence(a, words, pad_after)
+                    if (
+                        retracted is not None
+                        and retracted[0] < a.out - 1e-3
+                        and (retracted[0] - a.in_) / speed_a >= min_shot - _EPS
+                    ):
+                        new_out, anchor = retracted
+                        changes.append(
+                            f"{a.id} out {_fmt(a.out)}→{_fmt(new_out)} ({JCUT_TAG} retract to "
+                            f"the sentence already finished at '{anchor.text}' — the next one "
+                            "is unreachable before the cutaway)"
+                        )
+                        a.out = new_out
+                        mutations += 1
+                    # else: extension and retraction are both blocked (a guard,
+                    # a neighbouring cut, min_shot); leave a.out mid-sentence —
+                    # ytedit qc rule 37 reports it, the same way rule 32
+                    # reports a pad that hit the same wall.
+
+        committed = committed_audio_ranges(timeline, video_slice=slice(0, j)).get(a.clip, [])
+        if _consumed_overlap(committed, a2.in_, a2.in_ + total_cutaway) > tolerance + _EPS:
+            log.debug(
+                "%s -> %s: J-cut range already claimed earlier in the track — left alone",
+                a.id, a2.id,
+            )
+            i = j
+            continue
+
+        old_a2_in = a2.in_
+        cursor = old_a2_in
+        for cutaway in run:
+            end = round(cursor + cutaway.duration, 3)
+            cutaway.audio_from = AudioFrom(clip=a.clip, **{"in": round(cursor, 3)}, out=end)
+            cutaway.mute_source = False
+            cursor = end
+        new_in = round(cursor, 3)
+        speed2 = a2.speed if a2.speed > 0 else 1.0
+        if (a2.out - new_in) / speed2 < min_shot - _EPS:
+            _shrink_or_drop_continuation(run, a2, clips)
+            dropped.add(id(a2))
+            changes.append(
+                f"{a.id} {JCUT_TAG} {len(run)} cutaway(s) carry {a.clip} audio from {a2.id}'s "
+                f"own start ({_fmt(old_a2_in)}→{_fmt(run[-1].audio_from.out)}); {a2.id} dropped "
+                "(too little of it left) — the thought finishes, then the next starts clean"
+            )
+        else:
+            a2.in_ = new_in
+            changes.append(
+                f"{a.id} {JCUT_TAG} {len(run)} cutaway(s) carry {a2.id}'s own audio "
+                f"{_fmt(old_a2_in)}→{_fmt(new_in)} early; {a2.id} in {_fmt(old_a2_in)}→"
+                f"{_fmt(new_in)} — the thought finishes, then the next starts clean under "
+                "the cutaway"
+            )
+        mutations += 1
+        i = j + (1 if id(a2) in dropped else 0)
+
+    if mutations:
+        # Same edit-API pattern as ``overlay_cutaways`` — see its own comment
+        # on this: run unconditionally (even when nothing was dropped) so
+        # every mutation gets a proper before/after re-time and every anchor
+        # is re-resolved.
+        dropped_uids = {s.uid for s in video if id(s) in dropped}
+        timeline.remove_segments(
+            lambda s: s.uid in dropped_uids, before=before_positions, renumber=False,
+        )
+        log.info("closed %d silent-interruption pattern(s)", mutations)
+
+    return timeline, changes
+
+
+def find_silent_interruptions(
+    timeline: Timeline, project: Project, settings: Settings | None = None
+) -> list[str]:
+    """Report every silent ``A -> muted cutaway(s) -> A2`` pattern, unfixed.
+
+    The read-only counterpart to :func:`close_silent_interruptions` — the
+    exact defect it exists to fix (``ytedit qc`` rule 36). A finding here
+    after a fresh ``ytedit tidy`` means the pattern could not be closed (a
+    voice pickup covers it, or the ledger already claims the range) rather
+    than that the pass was never run.
+
+    Args:
+        timeline: The EDL to scan.
+        project: Project supplying transcripts.
+        settings: Unused; accepted for symmetry with the other rule scanners.
+
+    Returns:
+        One message per pattern found; empty when the timeline is clean.
+    """
+    words_cache: dict[str, list[Word]] = {}
+    video = timeline.tracks.video
+    issues: list[str] = []
+
+    i = 0
+    while i < len(video) - 1:
+        a = video[i]
+        if a.mute_source or not _has_speech(project, a, words_cache):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(video) and _is_silent_cutaway(video[j], a.clip):
+            j += 1
+        if j == i + 1 or j >= len(video):
+            i += 1
+            continue
+        a2 = video[j]
+        if a2.clip != a.clip or a2.mute_source or not _has_speech(project, a2, words_cache):
+            i = j
+            continue
+        run_ids = ", ".join(s.id for s in video[i + 1:j])
+        issues.append(
+            f"silent interruption of a take: {a.id} ({a.clip}) is followed by "
+            f"{j - i - 1} muted cutaway(s) [{run_ids}] with no audio, then {a2.id} resumes "
+            f"{a.clip} — the narrator goes silent for the length of the cutaway"
+        )
+        i = j
+
+    return issues
+
+
+__all__ = [
+    "CUTAWAY_ROLE_RE",
+    "FILL_TAG",
+    "JCUT_TAG",
+    "close_silent_interruptions",
+    "find_silent_interruptions",
+    "overlay_cutaways",
+]

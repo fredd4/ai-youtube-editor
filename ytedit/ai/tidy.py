@@ -889,6 +889,12 @@ def _tidy_invariant_issues(timeline: Timeline, project: Project) -> list[str]:
       :mod:`ytedit.ai.ledger` exists to fix. A hit here means the
       convergence loop gave up (round cap or an oscillation) with a real
       duplicate still standing.
+    * No muted cutaway run may sit between two speech pieces of the same
+      clip with no ``audio_from`` — the exact defect
+      :func:`ytedit.ai.overlay.close_silent_interruptions` exists to fix
+      (``ytedit qc`` rule 36). A hit here means a voice pickup or an
+      already-claimed audio range blocked the fix, not that the pass never
+      ran.
     * Every ``audio_from`` range must stay inside its source clip's own
       duration (and be non-empty) — a range reaching past the clip's edges
       would ask the render for audio that clip does not have.
@@ -899,8 +905,10 @@ def _tidy_invariant_issues(timeline: Timeline, project: Project) -> list[str]:
       ``ytedit qc`` rule 32 does; a break the fallback *could* fix is already
       handled and never reaches this point.
     """
-    # Imported lazily: ytedit.ai.ledger imports this module at load time.
+    # Imported lazily: ytedit.ai.ledger and ytedit.ai.overlay import this
+    # module at load time.
     from ytedit.ai.ledger import find_duplicate_audio
+    from ytedit.ai.overlay import find_silent_interruptions
 
     issues: list[str] = []
 
@@ -910,6 +918,8 @@ def _tidy_invariant_issues(timeline: Timeline, project: Project) -> list[str]:
                 f"duplicate speech audio: {dup.clip} {_fmt(dup.start)}-{_fmt(dup.end)}s "
                 f"({dup.duration:.2f}s) plays twice — {' / '.join(dup.ids)}"
             )
+
+    issues.extend(find_silent_interruptions(timeline, project))
 
     clips = project.load_state().get("clips", {})
     for seg in timeline.tracks.video:
@@ -969,9 +979,10 @@ def _tidy_invariant_issues(timeline: Timeline, project: Project) -> list[str]:
 def tidy(
     project: Project, dry_run: bool = False, force: bool = False
 ) -> dict[str, Any]:
-    """Run pad/snap → overlay → dedupe → anchors to a fixed point.
+    """Run pad/snap → overlay → close-silent-interruptions → dedupe → anchors
+    to a fixed point.
 
-    The four passes can each undo a little of what another just did — padding
+    The five passes can each undo a little of what another just did — padding
     reaches a cut back to a sentence boundary, overlay hands that same
     stretch to a cutaway and moves the cut forward again, the ledger then
     finds the stretch already used and mutes the hand-off, which makes the
@@ -992,7 +1003,8 @@ def tidy(
     Returns:
         ``{"changes", "written", "backup", "dry_run", "edited_by_human",
         "duration_before", "duration_after", "issues", "sentence_snapped",
-        "overlaid", "deduped", "ambient_repeats", "rounds", "converged"}``.
+        "overlaid", "silent_interruptions_closed", "deduped", "ambient_repeats",
+        "rounds", "converged"}``.
         ``changes`` carries every round's change lines in order, plus one
         final summary line (``"converged in N round(s)"`` or
         ``"stopped: oscillation between …"`` / ``"stopped: pacing.tidy_max_rounds
@@ -1007,7 +1019,7 @@ def tidy(
     """
     # Imported lazily: both modules import this one for their re-timing helpers.
     from ytedit.ai.ledger import ambient_repeat_count, dedupe_audio
-    from ytedit.ai.overlay import overlay_cutaways
+    from ytedit.ai.overlay import close_silent_interruptions, overlay_cutaways
 
     if not project.timeline_file.exists():
         raise TidyError(
@@ -1022,6 +1034,7 @@ def tidy(
     changes_by_round: list[list[str]] = []
     total_snapped = 0
     total_overlaid = 0
+    total_closed = 0
     total_deduped = 0
 
     states = [_canonical_state(timeline)]
@@ -1032,26 +1045,32 @@ def tidy(
         timeline, padded = pad_segments_to_speech(timeline, project)
         snapped = sentence_snap_count(padded)
         timeline, overlaid = overlay_cutaways(timeline, project)
-        # The audio ledger dedupe pass runs last: padding and overlay can both
-        # move segments around, so only once the cuts have settled can "does
-        # this overlap audio already used" be checked without chasing a
-        # moving target.
+        # Closes the pattern overlay_cutaways deliberately leaves alone: a
+        # deliberate skip within one take that left a muted cutaway run with
+        # nothing to say. Runs right after it, on the same settled cuts, so
+        # only a genuinely still-silent run reaches this pass.
+        timeline, closed = close_silent_interruptions(timeline, project)
+        # The audio ledger dedupe pass runs last: padding, overlay and the
+        # silent-interruption close can all move segments around, so only
+        # once the cuts have settled can "does this overlap audio already
+        # used" be checked without chasing a moving target.
         timeline, deduped = dedupe_audio(timeline, project)
         # Anchored voice pickups and captions are skipped by every
         # _retime_absolute_tracks() call above; resolve them now that this
-        # round's padding/overlay/dedupe have all settled the segments they
-        # follow — part of the state the fixed point below is measured on.
+        # round's padding/overlay/close/dedupe have all settled the segments
+        # they follow — part of the state the fixed point below is measured on.
         timeline.resolve_anchors()
         # End-relative structural markers (``pacing.markers`` with a negative
         # ``at``, e.g. payoff-cta = end - 20 s) follow the programme's new
         # length; a marker left past the end is a QC error that blocks renders.
         _retime_end_relative_markers(timeline, project.settings)
 
-        round_changes = padded + overlaid + deduped
+        round_changes = padded + overlaid + closed + deduped
         changes_by_round.append(round_changes)
         all_changes.extend(round_changes)
         total_snapped += snapped
         total_overlaid += len(overlaid)
+        total_closed += len(closed)
         total_deduped += len(deduped)
 
         new_state = _canonical_state(timeline)
@@ -1096,6 +1115,7 @@ def tidy(
         "issues": [],
         "sentence_snapped": total_snapped,
         "overlaid": total_overlaid,
+        "silent_interruptions_closed": total_closed,
         "deduped": total_deduped,
         "ambient_repeats": ambient_repeat_count(all_changes),
         "rounds": rounds_run,

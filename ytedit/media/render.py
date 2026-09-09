@@ -1125,16 +1125,25 @@ def preflight(
     """
     issues = timeline.validate(project, skip_music=no_music, skip_voice=no_voice)
 
-    # Same checks as ``ytedit qc`` rules 33/34 (not a copy): an anchor that
+    # Same checks as ``ytedit qc`` rules 33/34/36 (not a copy): an anchor that
     # never resolved to a stable segment (rule 34, whatever track it is on),
-    # and — unless this render ignores the voice track entirely — a voice
-    # pickup sitting over a segment's own narration (rule 33). Better to
-    # catch the Chinchero-street party-over-the-pole-raising class of bug before
-    # rendering than after.
-    from ..qc import anchor_issue_messages, voice_pickup_overlap_issues
+    # a voice pickup sitting over a segment's own narration unless this render
+    # ignores the voice track entirely (rule 33), and a muted cutaway run
+    # stranding the narrator mid-take with no audio at all (rule 36) — a
+    # silent interruption is exactly the defect ``ytedit tidy`` is supposed to
+    # have already closed, so refusing to render it forces a re-tidy rather
+    # than shipping the mute. Better to catch the
+    # Chinchero-street party-over-the-pole-raising class of bug before rendering
+    # than after.
+    from ..qc import (
+        anchor_issue_messages,
+        silent_interruption_issues,
+        voice_pickup_overlap_issues,
+    )
 
     timeline.resolve_anchors()
     issues += anchor_issue_messages(timeline)
+    issues += silent_interruption_issues(project, timeline)
     if not no_voice:
         issues += voice_pickup_overlap_issues(project, timeline)
 

@@ -186,15 +186,26 @@ scale these timecodes proportionally but keep every beat):
 - Keep the final 5-20 s clean of burned-in text (YouTube's end screen sits there).
 
 PACING
-- Rolling average shot length at most 4 s before 6:00, 7 s after; flag any segment
-  that breaks this in risks[] instead of allowing it silently.
-- Never more than ~12 s without a visual change (cut, push-in, caption, scale).
+- The story comes first. Never cut away from a take in the middle of a thought: a
+  cutaway either keeps the narration running underneath (contiguous pieces of the
+  take around it) or comes after the sentence that closes the thought. Shot-length
+  targets below are soft; a 12 s take that finishes a thought beats a 4 s cut that
+  interrupts it. Compress by dropping whole thoughts (sentences), never by muting
+  the narrator.
+- Rolling average shot length at most 4 s before 6:00, 7 s after, as a target, not
+  a hard ceiling; flag any segment that breaks this by a wide margin in risks[]
+  instead of allowing it silently.
+- Never more than ~12 s without a visual change (cut, push-in, caption, scale),
+  unless the take is finishing a thought — see above.
 - An A-roll run longer than 10 s needs a cutaway; aim at roughly 60/40 B-roll/A-roll.
 - Air around speech (~0.3 s before the first word, ~0.5 s after the last) is added
   automatically from the sentence boundaries — never something you compute.
 - Cut narration only at sentence boundaries (guaranteed when you reference whole
   sentence ids). Want a cutaway mid-take? Use cutaways[] with "after_sentence" —
-  never split one take into two segments with a manual seconds gap.
+  never split one take into two segments with a manual seconds gap. Skipping a
+  sentence inside one take is fine; the post-processor keeps it audible under the
+  cutaway or moves the cut to the sentence boundary either side of it — you never
+  need to silence the narrator to make a cutaway fit.
 
 ALSO PRODUCE
 - cold_open: 2-4 visually distinct picks from anywhere in the log, ~10 s total.

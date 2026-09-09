@@ -328,6 +328,116 @@ def test_a_true_mid_sentence_cut_warns(project: Project) -> None:
     )
 
 
+def test_a_silent_cutaway_between_two_speech_pieces_is_a_rule_36_error(
+    project: Project,
+) -> None:
+    """A muted cutaway stranding one take between two speech pieces of the
+    same clip, with no ``audio_from`` — the exact defect ``ytedit tidy``'s
+    ``close_silent_interruptions`` fixes — is a hard error: it means the
+    timeline was never (re-)tidied.
+    """
+    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
+    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(json.dumps({
+        "clip": "c001", "language": "pl",
+        "words": [
+            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
+            {"t": "Gamma", "s": 4.0, "e": 4.4}, {"t": "Delta.", "s": 4.6, "e": 6.0},
+        ],
+    }), encoding="utf-8")
+    write_timeline(project, minimal(tracks={
+        "video": [
+            {"id": "s001", "clip": "c001", "in": 0.7, "out": 3.45, "role": "a-roll"},
+            {"id": "s002", "clip": "c002", "in": 0.0, "out": 0.55, "role": "cutaway",
+             "mute_source": True},
+            {"id": "s003", "clip": "c001", "in": 4.4, "out": 6.45, "role": "a-roll"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert report["ok"] is False
+    assert any(
+        e.startswith("rule 36") and "s001" in e and "s003" in e
+        for e in report["errors"]
+    )
+
+
+def test_a_cutaway_already_carrying_audio_is_not_a_rule_36_error(project: Project) -> None:
+    """A cutaway that already has ``audio_from`` (or is not muted) is not a
+    silent interruption — rule 36 must stay quiet."""
+    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
+    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(json.dumps({
+        "clip": "c001", "language": "pl",
+        "words": [
+            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
+            {"t": "Gamma", "s": 4.0, "e": 4.4}, {"t": "Delta.", "s": 4.6, "e": 6.0},
+        ],
+    }), encoding="utf-8")
+    write_timeline(project, minimal(tracks={
+        "video": [
+            {"id": "s001", "clip": "c001", "in": 0.7, "out": 3.45, "role": "a-roll"},
+            {"id": "s002", "clip": "c002", "in": 0.0, "out": 1.0, "role": "cutaway",
+             "audio_from": {"clip": "c001", "in": 3.45, "out": 4.45}},
+            {"id": "s003", "clip": "c001", "in": 4.45, "out": 6.45, "role": "a-roll"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert not any(e.startswith("rule 36") for e in report["errors"])
+
+
+def test_a_speech_segment_cut_off_far_from_its_sentence_end_is_a_rule_37_warning(
+    project: Project,
+) -> None:
+    """Rule 37 fires even when the rest of the sentence is too far away for
+    rule 32's narrower "true break" check to ever complete it — the broader,
+    story-continuity rule from the fourth review round.
+    """
+    project.add_clip({"id": "c001", "duration": 60.0, "orientation": "horizontal"})
+    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(json.dumps({
+        "clip": "c001", "language": "pl",
+        "words": [
+            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
+        ],
+    }), encoding="utf-8")
+    write_timeline(project, minimal(tracks={
+        "video": [
+            # stops right after 'Alfa' — 'Beta.' is 0.2 s away but the next
+            # segment is a different clip entirely, so it is unreachable.
+            {"id": "s001", "clip": "c001", "in": 0.9, "out": 1.5, "role": "a-roll"},
+            {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0, "role": "cutaway"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert any(
+        w.startswith("rule 37") and "s001" in w and "mid-thought" in w
+        for w in report["warnings"]
+    )
+
+
+def test_a_sentence_ended_out_is_not_a_rule_37_warning(project: Project) -> None:
+    project.add_clip({"id": "c001", "duration": 60.0, "orientation": "horizontal"})
+    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(json.dumps({
+        "clip": "c001", "language": "pl",
+        "words": [
+            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
+        ],
+    }), encoding="utf-8")
+    write_timeline(project, minimal(tracks={
+        "video": [
+            {"id": "s001", "clip": "c001", "in": 0.9, "out": 3.0, "role": "a-roll"},
+            {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0, "role": "cutaway"},
+        ],
+        "voice": [], "music": [], "captions": [], "sfx": [],
+    }))
+    report = Q.qc(project, show_table=False)
+    assert not any(w.startswith("rule 37") for w in report["warnings"])
+
+
 # ----------------------------------------------------------------------
 # the rendered master
 # ----------------------------------------------------------------------

@@ -274,6 +274,14 @@ pacing:
   sentence_extend_max: 8.0     # most a sentence snap may add to one side of a cut
   # Audio ledger dedupe (ytedit/ai/ledger.py): no audio may ever play twice.
   audio_dupe_tolerance: 0.25   # overlap under this is not worth fixing
+  # Story-continuity cutaways (ytedit/ai/overlay.py: close_silent_interruptions).
+  # A muted cutaway run stranded between two speech pieces of the same take is
+  # never left silent: within this many seconds it is "filled" (the cutaways
+  # carry the narrator's own voice continuously); beyond it, a "J-cut" — the
+  # take is extended to the end of its sentence, then the cutaways carry the
+  # NEXT segment's opening words instead, so the thought always finishes
+  # before the picture cuts away.
+  story_fill_max_s: 10.0
   # `ytedit tidy` (ytedit/ai/tidy.py) re-runs pad/snap -> overlay -> dedupe ->
   # anchors until a full round changes nothing, up to this many rounds, then
   # stops and reports whichever changes are still oscillating.
