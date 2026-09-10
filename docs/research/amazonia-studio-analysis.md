@@ -1,6 +1,6 @@
 # Amazonia Studio — Technical Report for Reuse
 
-Source project: `a separate local codebase` (symlinked at `other_projects/amazonia-studio`).
+Source project: a separate local codebase, read here through the `other_projects/amazonia-studio` symlink.
 Stack: Python 3.10+, Flask editor (all HTML inline), httpx for all HTTP, `fal_client`, asyncio + `asyncio.to_thread`, PyYAML, Pillow, ffmpeg/ffprobe via subprocess. No `elevenlabs`/`openai`/whisper deps — all raw REST.
 
 | File | Lines | Role |

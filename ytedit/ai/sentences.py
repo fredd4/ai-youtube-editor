@@ -62,8 +62,8 @@ DUPLICATE_JACCARD: float = 0.7
 #: duplicate (on *both* sides of the pair). Below this the overlap measure is
 #: meaningless: "Zobaczcie." matches every other "Zobaczcie." in the trip, and
 #: two three-word remarks sharing two words already clear the Jaccard bar. The
-#: the reference project run produced four such false positives, each of them a real sentence
-#: the planner was then told to skip.
+#: first full-length run produced four such false positives, each of them a real
+#: sentence the planner was then told to skip.
 DUPLICATE_MIN_WORDS: int = 4
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
@@ -249,8 +249,8 @@ def flag_duplicates(ordered_sentences: list[dict[str, Any]]) -> None:
     normalized words take part, on both sides of the pair. A short phrase
     ("Zobaczcie.", "Jest bardzo dobre.") is a thing people say twice in a trip
     without meaning it as a retake, and at three words or fewer the Jaccard
-    measure cannot tell the two cases apart — flagging them cost the reference project four
-    perfectly good sentences.
+    measure cannot tell the two cases apart — flagging them cost the first
+    full-length run four perfectly good sentences.
 
     Args:
         ordered_sentences: Every sentence in the project, in chronological

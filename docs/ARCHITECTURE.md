@@ -163,10 +163,10 @@ The decision is visible in four places: `state.json.clips[<id>].mezzanine`/`.mez
 ### state.json
 ```json
 {
-  "project": "my-video",
+  "project": "lisbon-day-1",
   "clips": {
     "c001": {
-      "id": "c001", "source_file": "input/a clip.MOV", "recorded_at": "2026-08-12T10:31:05",
+      "id": "c001", "source_file": "input/VID_1234.MOV", "recorded_at": "2026-08-12T10:31:05",
       "order": 1, "duration": 42.3, "width": 3840, "height": 2160, "fps": 29.97, "vfr": true,
       "rotation": 90, "orientation": "vertical", "hdr": "hlg", "has_audio": true,
       "mezzanine": "encode", "mezzanine_reason": "rotation 90",
@@ -209,7 +209,7 @@ Clip ids are `c` + zero-padded index in **recording order** (from `creation_time
 A pre-pass over every clip's transcript, run automatically at the start of `plan` (also `ytedit sentences <slug>` on its own): splits words into sentences — ending at a word whose text ends in `.?!…`, at a pause longer than 1.2 s, or at the clip's last word — and numbers them `<clip>#<n>` (1-based) so the planner can reference dialogue by id instead of picking raw seconds.
 ```json
 {
-  "project": "the reference project", "language": "pl", "generated": "2026-09-06T12:00:00+00:00",
+  "project": "lisbon-day-1", "language": "pl", "generated": "2026-09-06T12:00:00+00:00",
   "clips_count": 218, "sentences_count": 803,
   "clips": [
     {"id": "c001", "sentences": [
@@ -226,21 +226,21 @@ A pre-pass over every clip's transcript, run automatically at the start of `plan
   ]
 }
 ```
-This catalogue is what a `speech` beat's `sentences` ids point into, and `ytedit.cut` validates every one of them against it (unknown, belonging to another clip, already used by another beat, a spoken instruction, or non-contiguous → an error; a `retake_of`/`duplicate_of` flag → a warning) before deriving any seconds from it. A clip with no transcribed speech gets `{"id": "<clip>", "sentences": []}`. Before it reaches the planner prompt, `ytedit.ai.sentences.compact_footage_log_for_planner` replaces each clip's footage-log `segments[]`/`takes[]` with this sentence list (instruction sentences omitted outright; retake/duplicate ones kept but marked `"skip": "retake, use ..."` / `"skip": "duplicate, use ..."`) — measured on the 218-clip `projects/the reference project` footage log, this shrinks the compact-JSON prompt payload by about 5% even though it adds structured per-sentence metadata, because it replaces the old free-text segment/take detail for every clip that has transcribed speech.
+This catalogue is what a `speech` beat's `sentences` ids point into, and `ytedit.cut` validates every one of them against it (unknown, belonging to another clip, already used by another beat, a spoken instruction, or non-contiguous → an error; a `retake_of`/`duplicate_of` flag → a warning) before deriving any seconds from it. A clip with no transcribed speech gets `{"id": "<clip>", "sentences": []}`. Before it reaches the planner prompt, `ytedit.ai.sentences.compact_footage_log_for_planner` replaces each clip's footage-log `segments[]`/`takes[]` with this sentence list (instruction sentences omitted outright; retake/duplicate ones kept but marked `"skip": "retake, use ..."` / `"skip": "duplicate, use ..."`) — measured on a 218-clip footage log, this shrinks the compact-JSON prompt payload by about 5% even though it adds structured per-sentence metadata, because it replaces the old free-text segment/take detail for every clip that has transcribed speech.
 
 ### analysis/places.json (deterministic + one writer call, `ytedit/ai/locations.py`)
 Canonicalizes every clip's free-text `analysis/<clip>.json: location` into a stable place, so `ytedit captions` can tell "new place" from "same place, different wording" without asking a model per clip. Built by `ytedit captions <slug>` (cached; `--force` re-asks the writer):
 ```json
 {
-  "project": "the reference project", "language": "pl", "generated": "2026-09-07T12:00:00+00:00",
+  "project": "lisbon-day-1", "language": "pl", "generated": "2026-09-07T12:00:00+00:00",
   "model": "anthropic/claude-sonnet-5", "cost_usd": 0.004,
   "clips": [
-    {"clip": "c001", "place_id": "alfama", "label": "Alfama · Lisboa", "region": "Lisboa",
+    {"clip": "c001", "place_id": "alfama", "label": "Alfama · Lizbona", "region": "Lizbona",
      "source_name": "Alfama", "confidence": 0.85, "inherited": false}
   ]
 }
 ```
-Distinct raw `(name, city, country)` strings are grouped once (exact match only) and sent to the writer model (`captions.places.system`/`.user` in `docs/playbook/prompts.md`) in a single call per project; the model merges near-duplicates ("Belém (prawdopodobnie)" == "Belém") into one `place_id`/`label`/`region`. A clip with no location name and confidence below 0.5 has nothing to normalize, so it instead inherits the place of its nearest chronological neighbour (by clip order, `inherited: true`) that has one; a clip with no place at all (nothing named anywhere nearby) gets `place_id: ""` and is skipped when placing cards.
+Distinct raw `(name, city, country)` strings are grouped once (exact match only) and sent to the writer model (`captions.places.system`/`.user` in `docs/playbook/prompts.md`) in a single call per project; the model merges near-duplicates ("Alfama (prawdopodobnie)" == "Alfama") into one `place_id`/`label`/`region`. A clip with no location name and confidence below 0.5 has nothing to normalize, so it instead inherits the place of its nearest chronological neighbour (by clip order, `inherited: true`) that has one; a clip with no place at all (nothing named anywhere nearby) gets `place_id: ""` and is skipped when placing cards.
 
 ### plan/cut.json — the edit (source of truth)
 The cut is a list of **beats** in screen order. Speech is addressed by sentence (or word) ids, never by seconds; seconds are produced in exactly one place, the resolver. `plan/cut.json` is what `plan` writes, what `voice` / `captions` / `music` update, what the web editor edits, and what `ytedit migrate` produces from a v1 timeline.
@@ -277,9 +277,9 @@ The cut is a list of **beats** in screen order. Speech is addressed by sentence 
   ],
   "captions": [
     {"id": "t001", "beat": "b002", "offset": 0.3, "duration": 3.0,
-     "text": "LISBOA, PORTUGAL", "style": "location", "position": "lower-left"}
+     "text": "LIZBONA, PORTUGALIA", "style": "location", "position": "lower-left"}
   ],
-  "chapters": [{"beat": "b001", "title": "Portugal, którego nie planowałem"}],
+  "chapters": [{"beat": "b001", "title": "Miasto, którego nie planowałem"}],
   "markers": [{"beat": "b001", "label": "hook"}],
   "mute_ranges": [{"clip": "c027", "s": 0.1, "e": 3.0, "gain_db": -60.0, "reason": "car radio"}],
   "meta": {"title_candidates": [], "generated_by": "plan@…", "edited_by_human": false, "notes": ""}
@@ -345,7 +345,7 @@ Compared with v1 the segment shape gains two fields and loses several:
 
 Settings (`config/defaults.yaml.pacing`): `speech_pad_before` (0.30), `speech_pad_after` (0.45), `word_guard` (0.05, the minimum clearance from a neighbouring word), `min_shot_seconds` (0.8), `air_warn_below` (0.35).
 
-**Why the previous design failed.** v1 stored the edit as an EDL in seconds and made that file the source of truth. Every producer and every fixer — the planner, the speech pad, the sentence snap, overlay cutaways, the audio ledger, the anchors, the web editor — had to re-derive from the transcript where a word starts and ends in order not to chop it, and they moved each other's boundaries. Roughly 4 000 lines existed only to police cuts given in seconds (2 325 of `ai/tidy.py` + `ai/overlay.py` + `ai/ledger.py`, plus their 1 686 lines of tests, plus the timeline edit API and the anchors), and the audible defects in the the reference project draft (a cutaway hand-off replaying 0.05–0.15 s of a word, a cut landing on the last syllable, a voice-over ending inside a word) all came from those passes disagreeing. The v2 rule is the fix: **speech is addressed by sentence (or word) ids, never by seconds, and seconds are produced in exactly one place.**
+**Why the previous design failed.** v1 stored the edit as an EDL in seconds and made that file the source of truth. Every producer and every fixer — the planner, the speech pad, the sentence snap, overlay cutaways, the audio ledger, the anchors, the web editor — had to re-derive from the transcript where a word starts and ends in order not to chop it, and they moved each other's boundaries. Roughly 4 000 lines existed only to police cuts given in seconds (2 325 of `ai/tidy.py` + `ai/overlay.py` + `ai/ledger.py`, plus their 1 686 lines of tests, plus the timeline edit API and the anchors), and the audible defects in the first full-length draft (a cutaway hand-off replaying 0.05–0.15 s of a word, a cut landing on the last syllable, a voice-over ending inside a word) all came from those passes disagreeing. The v2 rule is the fix: **speech is addressed by sentence (or word) ids, never by seconds, and seconds are produced in exactly one place.**
 
 **Speech beat → segments.**
 1. Resolve the word range: `sentences` → `[first.s, last.e]` from the catalogue; `words` → the transcript word indices. An unknown id, an id belonging to another clip, an id already used by another beat, a spoken editor instruction, or a non-contiguous run is an **error**. A `retake_of`/`duplicate_of` flag only warns — the catalogue's detection is heuristic (a short "Zobaczcie." or a song chorus trips it), so using such a sentence is the editor's call.
@@ -356,7 +356,7 @@ Settings (`config/defaults.yaml.pacing`): `speech_pad_before` (0.30), `speech_pa
 
 A **broll** beat resolves to one segment (`mute_source` when `audio: mute`); an ambient range that contains transcript words warns `speech_in_broll` — make it a speech beat or mute it. A **voice** beat resolves to its shot segments plus one `tracks.voice` item `{id, file, at, end, gain_db}`.
 
-Picture ranges are clamped to the clip's **last whole frame** (registry duration minus one frame), not to the raw container duration: the reference project's `c077` registers 15.806 s but holds 474 frames = 15.800 s, and a cut reaching past that renders one frame short.
+Picture ranges are clamped to the clip's **last whole frame** (registry duration minus one frame), not to the raw container duration: one measured clip registers 15.806 s but holds 474 frames = 15.800 s, and a cut reaching past that renders one frame short.
 
 After the segments are placed (`Timeline.segment_positions()`, frame-exact), music, captions, chapters and markers are converted from beat references to absolute seconds. A caption's `offset` is relative to its beat's start and its end is clamped to the beat end + 0.5 s. Music beds never overlap: when two cues meet inside one beat the later cue's start wins and the earlier one ends there.
 
@@ -371,24 +371,24 @@ Because each sentence/word range is claimed at most once (a `sentences` beat als
 
 Per video segment, in order: muted or wordless segments become `broll` beats (`audio: mute` when muted, else `ambient`), and a run of consecutive broll segments under one voice item becomes that voice beat's shots. A segment with words becomes a `speech` beat whose sentences are those of its audio clip overlapping the audio range by at least 50 % of the sentence; consecutive segments of the same clip whose audio ranges abut merge into one beat, and a segment with an `audio_from` of that clip in between becomes a `shot` with `after` = the sentence ending at `audio_from.in`. A `voice/vo_<clip>_<in>_<out>.wav` item (v1 cut the narrator's own audio out to a WAV) becomes an off-camera `speech` beat of that clip; any other voice item becomes a `voice` beat with those shots. Captions/music/chapters/markers move onto the beat under their absolute time; `mute_ranges` are copied; `meta` is copied with `generated_by += " + migrate@<date>"`. Then `validate` + `resolve`, and the report ends with the validator's output and a duration comparison.
 
-**Decisions taken while implementing this** — the rules above leave real choices open; each of these carries the issue code the report uses, so the user can find them in `migrate_report.md`.
+**Decisions taken while implementing this** — the rules above leave real choices open; each of these carries the issue code the report uses, so they can be found in `migrate_report.md`. The counts quoted below are from the reference run — the migration of the first full-length project, measured at the end of this section.
 
 1. **Abutting** (`MAX_HANDOFF_OVERLAP = 0.25`): two audio ranges of the same clip continue one take when the second starts no later than one frame after the first ends *and* overlaps it by less than 0.25 s. v1's cutaway hand-offs habitually replayed 0.05–0.15 s (`s124` audio `c141 7.00–11.00` → `s125` `c141 10.91–12.00`); that is drift, not a second reading.
 2. **Chained cutaways share one `after`.** A run of back-to-back cutaways over one continuous take (`s019 s020 s021` over `c075`) is exactly what v2 chaining produces, so only the first names a sentence; the rest carry the same `after` and chain in list order. Measuring each one's own start against the nearest sentence end would have reported three false `shot_after_approx` for one correct hand-off.
-3. **`after = None`** when the cutaway's borrowed audio starts at or before the first kept sentence's start. If the beat also has its own picture, the picture order changes (v2 plays the beat's own picture first) — reported `shot_leads_beat`, 3 cases in the reference project.
+3. **`after = None`** when the cutaway's borrowed audio starts at or before the first kept sentence's start. If the beat also has its own picture, the picture order changes (v2 plays the beat's own picture first) — reported `shot_leads_beat`, 3 cases in the reference run.
 4. **A run with no sentence at ≥ 50 %** is not a speech beat: each of its segments becomes an ambient `broll` beat, and the v2 validator's `speech_in_broll` warning is what flags the leftover words. This is what keeps a two-word tail such as `s045` from becoming a speech beat with an empty `sentences` list.
-5. **Roles.** A beat takes the role of its first own-picture segment (or `a-roll`/`b-roll` when every segment was a `cutaway`, since that role describes a segment that no longer exists in v2). A segment v1 called `b-roll`/`cold-open`/`outro` whose own sound carries whole sentences still becomes a speech beat (the rule is about words, not roles) but is reported `broll_became_speech` — 29 in the reference project — because v2 will snap and pad that range to the sentence, and background chatter should be muted instead.
-6. **Voice items are trimmed at both edges**, not only at the start: the picture after the pickup ends stays `broll` too. Without the trailing split the resolver would trim the last shot to the WAV length and the programme would lose that picture. A leftover under 0.5 s is reported `short_remainder` (3 in the reference project) so it can be deleted rather than shipped.
+5. **Roles.** A beat takes the role of its first own-picture segment (or `a-roll`/`b-roll` when every segment was a `cutaway`, since that role describes a segment that no longer exists in v2). A segment v1 called `b-roll`/`cold-open`/`outro` whose own sound carries whole sentences still becomes a speech beat (the rule is about words, not roles) but is reported `broll_became_speech` — 29 in the reference run — because v2 will snap and pad that range to the sentence, and background chatter should be muted instead.
+6. **Voice items are trimmed at both edges**, not only at the start: the picture after the pickup ends stays `broll` too. Without the trailing split the resolver would trim the last shot to the WAV length and the programme would lose that picture. A leftover under 0.5 s is reported `short_remainder` (3 in the reference run) so it can be deleted rather than shipped.
 7. **Ambient under a pickup is lost.** A segment that played its own sound under a v1 pickup is reported `voice_ambient_lost` (or `voice_over_speech` when the lost audio contained whole sentences).
 8. **Music range edges snap** (`MIN_CUE_OVERLAP = 0.5`): a beat a v1 cue covers for less than 0.5 s is dropped from the cue's beat range in favour of its neighbour, reported `music_range_approx`. v1 cues ended on chapter times that land a few tenths inside the beat opening the next chapter; taking `end − ε` literally handed a whole 26 s beat to the outgoing cue.
-9. **Flagged sentences are kept, not dropped.** A sentence the catalogue marks `instruction`/`retake_of`/`duplicate_of` that the v1 cut actually played stays in the beat and is reported `flagged_sentence` (7 in the reference project). The v2 validator errors on an instruction, so migration can legitimately produce a cut that does not resolve yet — the alternative, silently deleting narration the user approved in the v1 draft, is worse. A failing `resolve` is recorded in the report's Notes and leaves `duration_v2` unset.
+9. **Flagged sentences are kept, not dropped.** A sentence the catalogue marks `instruction`/`retake_of`/`duplicate_of` that the v1 cut actually played stays in the beat and is reported `flagged_sentence` (7 in the reference run). The v2 validator errors on an instruction, so migration can legitimately produce a cut that does not resolve yet — the alternative, silently deleting narration the user approved in the v1 draft, is worse. A failing `resolve` is recorded in the report's Notes and leaves `duration_v2` unset.
 10. **Sentences that reach outside the v1 cut** by more than 0.5 s in total are reported `sentence_extends`: a sentence kept at 50–99 % coverage brings its missing head or tail back, so v2 plays words the v1 draft cut off.
 11. **A dry run never writes into the project.** When `analysis/sentences.json` is missing it is built in memory, and `validate`/`resolve` are handed a project view whose `analysis/` is a temporary directory of symlinks plus that catalogue — otherwise every beat would come back `unknown_sentence` and the validator section of the report would be pure noise.
 12. **`vo_<clip>_<in>_<out>.wav` files are dead after migration**: the beat reads the clip's own audio through the resolver instead. They are left on disk (nothing under a project is ever deleted) and each is reported `vo_extract`.
 
 The report also uses `edge_trimmed` (a partial sentence dropped at a run's edge), `shot_after_approx`, `cutaway_orphan`, `vo_no_sentences`, `voice_pickup`, `voice_overlap`, `voice_no_end`, `voice_no_picture`, `voice_unplaced`, and `caption_dropped`/`music_dropped`/`chapter_dropped`/`marker_dropped`.
 
-**Measured on the reference project** (dry run, 2026-09-09): 186 v1 segments → **121 beats** (73 speech, 40 broll, 8 voice) with 73 shots, 19 captions, 10 music cues, 10 chapters, 7 markers; 85 issues and 20 validator findings (6 errors, all `flagged_sentence` fallout). Resolving with the errors bypassed gives 1017.4 s against v1's 1114.2 s — and the whole 96.8 s of that gap is the six erroring beats producing no picture at all. Only 7 of the other 115 beats drift by more than 0.5 s, the largest by 2.5 s. The reconstruction is faithful; the six flagged sentences are the whole of the manual work.
+**Measured on the reference run** (dry run, 2026-09-09): 186 v1 segments → **121 beats** (73 speech, 40 broll, 8 voice) with 73 shots, 19 captions, 10 music cues, 10 chapters, 7 markers; 85 issues and 20 validator findings (6 errors, all `flagged_sentence` fallout). Resolving with the errors bypassed gives 1017.4 s against v1's 1114.2 s — and the whole 96.8 s of that gap is the six erroring beats producing no picture at all. Only 7 of the other 115 beats drift by more than 0.5 s, the largest by 2.5 s. The reconstruction is faithful; the six flagged sentences are the whole of the manual work.
 
 ### plan/edit_plan.json (LLM reasoning, human-readable)
 Story outline (beats with target timecodes per playbook: 0:00 hook, 0:07 promise, 0:30 interrupt, 3:00/6:00 re-engagements, end payoff), which clips serve which beat, cold-open montage picks, subscribe-CTA placement, music cue sheet with mood per section, list of **narration requests** (what the user should record for intro/outro/bridges, with suggested scripts in the project language), risk flags (copyright music, missing footage), title candidates, thumbnail concepts. Written also as `plan/edit_plan.md`.

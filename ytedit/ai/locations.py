@@ -10,8 +10,8 @@ to the *beat* it belongs to and follows that beat wherever it ends up. Two
 things happen here:
 
 1. **Normalize places once per project.** The per-clip footage log carries
-   free-text, sometimes-hedged location strings ("Belém
-   (prawdopodobnie)", "Vila d'Ouro / Belém", "Lisboa region"). A single
+   free-text, sometimes-hedged location strings ("Stare Miasto
+   (prawdopodobnie)", "Rynek / Stare Miasto", "okolice miasta"). A single
    writer-model call (see ``docs/playbook/prompts.md``
    ``captions.places.system``/``.user``) turns the distinct raw strings into
    canonical ``place_id``/``label``/``region`` triples, merging near-duplicates.

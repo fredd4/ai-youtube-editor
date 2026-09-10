@@ -338,7 +338,7 @@ def test_absolute_tracks_move_onto_beats(project: Project, tmp_path: Path) -> No
             seg("s001", "c003", 0.0, 4.0, role="b-roll", mute=True),
             seg("s002", "c001", 0.8, 5.7),
         ],
-        captions=[Caption(id="t001", at=4.3, end=6.3, text="LISBOA", style="location")],
+        captions=[Caption(id="t001", at=4.3, end=6.3, text="LIZBONA", style="location")],
         music=[MusicCue(id="m001", file="music/m001.mp3", at=0.0, end=8.9)],
         chapters=[Chapter(at=0.0, title="Start")],
         markers=[Marker(at=4.0, label="hook")],

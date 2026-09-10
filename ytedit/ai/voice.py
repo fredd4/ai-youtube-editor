@@ -1,6 +1,6 @@
-"""Stage: ``voice`` — clean up the user's home-recorded narration pickups.
+"""Stage: ``voice`` — clean up home-recorded narration pickups.
 
-the user records narration requests (``n001``...) and extra "gap pickups" on his
+The user records narration requests (``n001``...) and extra "gap pickups" on a
 phone at home and drops the WAVs into ``voice/incoming/``. This module turns
 each one into a ``voice`` beat of ``plan/cut.json``, doing by machine what the
 editor-in-chief was doing by hand with scratch scripts:
@@ -66,7 +66,7 @@ _EPS = 1e-6
 #: count as one retaken twice — the earlier (or later, with ``keep_takes:
 #: first``) is dropped. Looser than ``sentences.DUPLICATE_JACCARD`` (0.7)
 #: because a home pickup re-does a line with more variation than an on-camera
-#: retake ("zaczyna się tam street party" / "zaczyna się święto, które...").
+#: retake ("zaczyna się tam koncert" / "zaczyna się występ, który...").
 RETAKE_JACCARD: float = 0.6
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
@@ -145,7 +145,7 @@ def _draft_manifest_entries(project: Project) -> list[dict[str, Any]]:
 def _beat_catalogue_lines(project: Project, cut: Cut) -> list[str]:
     """One readable line per beat, for the draft manifest's comment block.
 
-    the user fills ``after:`` in by hand, so the draft has to tell him what the
+    The user fills ``after:`` in by hand, so the draft has to say what the
     beats *are* — a bare ``b047`` is unanswerable without opening the editor.
     A speech beat is named by the text of its first sentence, a B-roll beat by
     its clip range, a pickup by its file.
@@ -613,8 +613,8 @@ def resolve_beat(
 ) -> tuple[Beat | None, str]:
     """Resolve one manifest entry's placement to the beat the pickup follows.
 
-    An explicit ``after`` wins over a ``request``: it is what the user wrote by
-    hand after reading the report, and it must not be second-guessed by a
+    An explicit ``after`` wins over a ``request``: it is what the user wrote
+    by hand after reading the report, and it must not be second-guessed by a
     text match.
 
     Args:

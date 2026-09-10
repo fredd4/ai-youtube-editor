@@ -46,7 +46,7 @@ from ytedit.project import Project
 
 WORDS: dict[str, list[tuple[float, float, str]]] = {
     "c001": [
-        (1.0, 1.4, "Cześć"), (1.45, 1.55, "z"), (1.6, 2.2, "Lisboa."),        # c001#1
+        (1.0, 1.4, "Cześć"), (1.45, 1.55, "z"), (1.6, 2.2, "Lizbony."),        # c001#1
         (3.0, 3.3, "Jest"), (3.35, 3.9, "pięknie."),                          # c001#2
         (4.1, 4.5, "Idziemy"), (4.55, 5.0, "dalej."),                         # c001#3
         (6.0, 6.4, "Wytnij"), (6.45, 6.9, "to."),                             # c001#4 (instruction)
@@ -465,7 +465,7 @@ def test_music_captions_chapters_and_markers_land_on_their_beats(
     second = speech("c001", ["c001#1"])
     cut = cut_of(first, second)
     cut.music = [MusicCue(id="m001", file="music/bed.mp3", **{"from": "b001"}, to="b002")]
-    cut.captions = [Caption(id="t001", beat="b002", offset=0.3, duration=3.0, text="LISBOA")]
+    cut.captions = [Caption(id="t001", beat="b002", offset=0.3, duration=3.0, text="LIZBONA")]
     cut.chapters = [Chapter(beat="b001", title="Portugal")]
     cut.markers = [Marker(beat="b002", label="hook")]
 
@@ -560,7 +560,7 @@ def test_save_and_load_round_trip_renumbers_and_keeps_uids(
     beat_a = broll("c003", 5.0, 8.0)
     beat_b = speech("c001", ["c001#1"])
     cut = Cut(beats=[beat_a, beat_b])
-    cut.captions = [Caption(id="t001", beat=beat_b.uid, text="LISBOA")]
+    cut.captions = [Caption(id="t001", beat=beat_b.uid, text="LIZBONA")]
     path = tmp_path / "cut.json"
 
     save_cut(cut, path)
@@ -581,7 +581,7 @@ def test_a_reference_written_as_a_display_id_resolves_to_the_uid(
 ) -> None:
     beat = speech("c001", ["c001#1"])
     cut = cut_of(broll("c003", 5.0, 8.0), beat)
-    cut.captions = [Caption(id="t001", beat="b002", text="LISBOA")]
+    cut.captions = [Caption(id="t001", beat="b002", text="LIZBONA")]
     path = tmp_path / "cut.json"
     path.write_text(
         json.dumps(cut.model_dump(by_alias=True, mode="json", exclude_none=True)),

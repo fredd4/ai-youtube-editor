@@ -550,7 +550,7 @@ class _Resolver:
         """The last clip time a cut may end at, ``None`` when unknown.
 
         The registry duration is the container's; the last decodable frame
-        ends one frame earlier (the reference project c077: 15.806 s registered, 474 frames
+        ends one frame earlier (one measured clip: 15.806 s registered, 474 frames
         = 15.800 s), and a cut reaching past it renders one frame short and
         is refused by the segment check. Every picture range is clamped to
         this, not to the raw duration.

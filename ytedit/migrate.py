@@ -19,8 +19,8 @@ reconstructs the editorial intent behind it:
 
 Nothing here is lossless by construction — v1 boundaries drifted, cutaway
 hand-offs overlapped by a few frames, and a v1 cut could end mid-sentence.
-Every such decision is recorded in :attr:`MigrationReport.issues` so the user can
-review it in the editor rather than discover it in the render.
+Every such decision is recorded in :attr:`MigrationReport.issues` so the user
+can review it in the editor rather than discover it in the render.
 """
 
 from __future__ import annotations
@@ -250,7 +250,7 @@ class MigrationReport:
     """Everything one ``ytedit migrate`` run produced and decided."""
 
     cut: Cut
-    #: Decisions and ambiguities that need the user's eye, in beat order.
+    #: Decisions and ambiguities that need the editor's eye, in beat order.
     issues: list[str]
     #: Informational log lines (what was read, what was written).
     notes: list[str]
@@ -638,7 +638,7 @@ class _Migrator:
 
         A sentence kept at 50–99 % coverage brings its missing head or tail
         back with it: v2 plays the whole sentence, so the beat gets longer and
-        the user hears words the v1 draft never contained.
+        the viewer hears words the v1 draft never contained.
         """
         if not kept:
             return

@@ -3,7 +3,7 @@
 Transcribes the *finished* video's audio and lines every word up against the
 timeline, so a cut can be judged by what it actually sounds like rather than by
 what the EDL claims. This is the productised version of the hand-rolled pass
-that found the the reference project pickup ending inside "początkowo": the plan was internally
+that found a voice pickup ending inside a word: the plan was internally
 consistent, the render was not.
 
 What it checks, for every place where the audio really changes source:
@@ -391,7 +391,7 @@ def _render_context(report: BoundaryReport, render_words: Sequence[Word]) -> Non
 
 
 def _flags(report: BoundaryReport) -> list[str]:
-    """Everything worth the user's attention at this boundary."""
+    """Everything worth the editor's attention at this boundary."""
     flags: list[str] = []
     if report.straddle is not None:
         flags.append("chopped word")

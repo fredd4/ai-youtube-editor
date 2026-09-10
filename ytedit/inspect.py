@@ -16,7 +16,7 @@ simply absent and everything else still works.
 Times are in **render** time — the position in the actual rendered file
 (:meth:`~ytedit.timeline.Timeline.segment_positions` with
 ``fade_overlaps=True``, exactly what :func:`ytedit.media.render.render_positions`
-uses) — since that is what the user is looking at when he timestamps feedback
+uses) — since that is what the user is looking at when they timestamp feedback
 against a preview/master/draft. Captions, voice pickups, music cues and
 chapters are stored in *timeline* time (pre-transition-remap) and are mapped
 forward through :func:`ytedit.media.render.build_time_map` to compare against

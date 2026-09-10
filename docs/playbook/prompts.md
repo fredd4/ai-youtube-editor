@@ -360,23 +360,23 @@ themselves.
 
 Your job for each entry:
 - Decide a short, stable `place_id`: lowercase ASCII slug, letters/digits/
-  hyphens only (e.g. "belem", "salineras-de-maras").
+  hyphens only (e.g. "stare-miasto", "blekitna-laguna").
 - Write a short on-screen `label` in {project_language}, natural phrasing, at
   most two short lines' worth of text (see the playbook: name + notable
-  context, e.g. "Belém · Lisboa", "Salineras de Maras · a valley").
+  context, e.g. "Stare Miasto · Zatoka Południowa", "Błękitna Laguna · Wyspa Zachodnia").
   Verify every place name renders with the target language's full diacritic
   set (for Polish: ą ć ę ł ń ó ś ź ż) — do not simplify or drop diacritics.
-- Assign a `region`: the broader area a viewer would recognize (e.g. "Lisboa",
-  "a valley", "a location", "a landmark").
+- Assign a `region`: the broader area a viewer would recognize (e.g. "Zatoka
+  Południowa", "Wyspa Zachodnia", "Wybrzeże Północne", "Przełęcz Wschodnia").
 
 MERGE near-duplicates that are clearly the same physical place, however the
 per-clip analysis phrased it — hedges ("prawdopodobnie", "possible", "?"),
-partial names, alternate spellings, a place name plus a qualifier ("Vila d'Ouro /
-Belém" when Belém already has its own entry). When several input
+partial names, alternate spellings, a place name plus a qualifier ("Rynek /
+Stare Miasto" when Stare Miasto already has its own entry). When several input
 entries are the same place, give them the SAME `place_id`/`label`/`region` and
 list every one of their `group_id`s together in one output object's
 `group_ids` array — do not invent a separate place per input string. When an
-entry is too vague to be a real place (e.g. "Lisboa region", "Andes" as a bare
+entry is too vague to be a real place (e.g. "okolice miasta", "góry" as a bare
 region label with nothing more specific, "prawdopodobnie inne miasteczko")
 still give it a sensible place_id/label — the editor will decide separately
 whether it's a location the viewer needs another card for — but never leave
@@ -385,8 +385,8 @@ whether it's a location the viewer needs another card for — but never leave
 Return STRICT JSON:
 {
   "places": [
-    {"group_ids": [0, 4], "place_id": "belem", "label": "Belém · Lisboa",
-     "region": "Lisboa"}
+    {"group_ids": [0, 4], "place_id": "stare-miasto", "label": "Stare Miasto · Zatoka Południowa",
+     "region": "Zatoka Południowa"}
   ]
 }
 ```

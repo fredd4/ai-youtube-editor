@@ -34,7 +34,7 @@ from ytedit.words import Word
 
 WORDS: dict[str, list[tuple[float, float, str]]] = {
     "c001": [
-        (1.0, 1.4, "Cześć"), (1.45, 1.55, "z"), (1.6, 2.2, "Lisboa."),        # c001#1
+        (1.0, 1.4, "Cześć"), (1.45, 1.55, "z"), (1.6, 2.2, "Lizbony."),        # c001#1
         (3.0, 3.3, "Jest"), (3.35, 3.9, "pięknie."),                          # c001#2
     ],
 }
@@ -149,7 +149,7 @@ def kinds(cut: Cut) -> list[str]:
 #: to count as a retake of each other.
 RETAKE_WORDS = [
     Word(0.0, 0.5, "Zaczyna"), Word(0.6, 0.9, "się"), Word(1.0, 1.4, "tutaj"),
-    Word(1.5, 1.9, "wielka"), Word(2.0, 2.5, "street party."),
+    Word(1.5, 1.9, "wielka"), Word(2.0, 2.5, "impreza."),
     Word(3.0, 3.5, "Zaczyna"), Word(3.6, 3.9, "się"), Word(4.0, 4.4, "tutaj"),
     Word(4.5, 4.9, "wielka"), Word(5.0, 5.5, "feta."),
 ]
@@ -572,7 +572,7 @@ def test_missing_manifest_writes_a_draft_listing_the_beats(cut_project: Project)
     text = V.manifest_path(cut_project).read_text(encoding="utf-8")
     assert "# Beats of plan/cut.json:" in text
     assert "b001  speech c001" in text
-    assert '"Cześć z Lisboa."' in text
+    assert '"Cześć z Lizbony."' in text
     assert "b002  broll  c010   0.00-6.00s" in text
     assert "voice/old.wav" in text
     rows = yaml.safe_load(text)

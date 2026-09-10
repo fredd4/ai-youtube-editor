@@ -2,7 +2,7 @@
 
 This is the standing operating manual for the agent (Claude) acting as **editor-in-chief** on this project. It is the "how to think" document; `docs/ARCHITECTURE.md` is the "how it's built" document and `docs/research/youtube-production-playbook.md` is the underlying research this playbook distills into rules. Read this file before touching any project under `projects/<slug>/`.
 
-The agent does not hand-edit media. It reads state, makes editorial judgment calls, writes/edits JSON (`edit_plan.json`, `cut.json`), tells the user what to do, and delegates deterministic work to the `ytedit` CLI / ffmpeg pipeline. The human (the user) is the final approver of the timeline, the narration, and the publish pack.
+The agent does not hand-edit media. It reads state, makes editorial judgment calls, writes/edits JSON (`edit_plan.json`, `cut.json`), tells the user what to do, and delegates deterministic work to the `ytedit` CLI / ffmpeg pipeline. The human user is the final approver of the timeline, the narration, and the publish pack.
 
 ---
 
@@ -65,16 +65,16 @@ Point him at `http://localhost:8765` to adjust in/out points, reorder, set verti
 `ytedit music <slug>` generates tracks for the cue sheet (ElevenLabs Music, instrumental, loop mode). Confirm the mood/length list with the user before generating more than 1-2 tracks (§11 cost gate). Check each track matches its intended mood/length and leaves headroom for ducking.
 
 ### 2.6 Draft render — the review gate
-`ytedit render <slug> --draft`: 720p cut from the proxies where they exist (else from the mezzanine, with a warning — see §2.0; `ytedit ingest <slug> --proxies` if drafts feel slow) with hardware encoding, the same audio chain as the master (denoised sources, speech leveling, ducking, single-pass loudnorm), captions burned. Minutes, not an hour, and no 1080p segment cache. **This is what the user reviews, every round.** Before sending a draft: `ytedit validate <slug>` and `ytedit qc <slug>` must show zero errors, and you have read `edit_plan.md`'s script check, the captions report and the voice report yourself. Send the draft with a short Polish note of what changed since the last one. Then wait: no music generation beyond the first beds, no master, no publish until he answers. `--preview` (720p from the mezzanine) still exists for the rare case where picture quality itself is under review.
+`ytedit render <slug> --draft`: 720p cut from the proxies where they exist (else from the mezzanine, with a warning — see §2.0; `ytedit ingest <slug> --proxies` if drafts feel slow) with hardware encoding, the same audio chain as the master (denoised sources, speech leveling, ducking, single-pass loudnorm), captions burned. Minutes, not an hour, and no 1080p segment cache. **This is what the user reviews, every round.** Before sending a draft: `ytedit validate <slug>` and `ytedit qc <slug>` must show zero errors, and you have read `edit_plan.md`'s script check, the captions report and the voice report yourself. Send the draft with a short Polish note of what changed since the last one. Then wait: no music generation beyond the first beds, no master, no publish until they answer. `--preview` (720p from the mezzanine) still exists for the rare case where picture quality itself is under review.
 
 ### 2.7 QC
 `ytedit qc <slug>` → `qc_report.json/md`: rule checker (§10) plus measured loudness. Triage, don't just relay: separate real problems from acceptable exceptions (a long reflective A-roll near the end is fine; one at 0:40 isn't). Fix what you can directly (through the CLI stages or by editing `plan/cut.json`) before asking the user to re-review. A validator error blocks the resolve, and therefore the render, by design.
 
 ### 2.7b Correction rounds
-the user's notes come as timecodes and sentences ("at 4:27 the story is cut", "the street party narration is early"). `ytedit at <slug> 4:27` shows the **beat** (id, kind, clip, its sentences, and which of its shots is on screen), then the resolved segment, the words heard, the pickup and the captions playing at that moment — use it before touching anything, and quote the beat and sentence ids back in your reply so both of you talk about the same cut. Segment ids are renumbered on every resolve; the beat id is what an edit is expressed against. `ytedit check-render` labels every boundary the same way (`b012 (own picture) -> b013 (shot 1)`). Apply → `validate` → `resolve` → `qc` → `render --draft` → send → wait. Moving a beat cannot strand a pickup or a caption any more — both are attached to a beat, not to a second — but a beat you delete takes its captions and markers with it, which the resolve reports as a dropped-caption warning.
+The user's notes come as timecodes and sentences ("at 4:27 the story is cut", "the market narration is early"). `ytedit at <slug> 4:27` shows the **beat** (id, kind, clip, its sentences, and which of its shots is on screen), then the resolved segment, the words heard, the pickup and the captions playing at that moment — use it before touching anything, and quote the beat and sentence ids back in your reply so both of you talk about the same cut. Segment ids are renumbered on every resolve; the beat id is what an edit is expressed against. `ytedit check-render` labels every boundary the same way (`b012 (own picture) -> b013 (shot 1)`). Apply → `validate` → `resolve` → `qc` → `render --draft` → send → wait. Moving a beat cannot strand a pickup or a caption any more — both are attached to a beat, not to a second — but a beat you delete takes its captions and markers with it, which the resolve reports as a dropped-caption warning.
 
 ### 2.8 Render master
-`ytedit render <slug> --master`: two-pass loudnorm, native resolution, hardware H.264 tier by default (YouTube re-encodes; visually equivalent and ten times faster); `--x264` for the slow software tier when the user explicitly wants it. Only once the user has accepted the latest draft and QC is clean or he has explicitly accepted known exceptions. Run it in the background, then `qc` again on the file, then `ytedit clean <slug>`.
+`ytedit render <slug> --master`: two-pass loudnorm, native resolution, hardware H.264 tier by default (YouTube re-encodes; visually equivalent and ten times faster); `--x264` for the slow software tier when the user explicitly wants it. Only once the user has accepted the latest draft and QC is clean or they have explicitly accepted known exceptions. Run it in the background, then `qc` again on the file, then `ytedit clean <slug>`.
 
 ### 2.9 Publish pack
 `ytedit publish <slug>`: titles, description, chapters, thumbnail prompts/images (fal nano-banana-pro). Apply the §8 validators before presenting candidates — never show the user a title that fails character-count or keyword-position.
@@ -95,7 +95,7 @@ This is the part specific to how the user shoots, and it needs the most editoria
 
 **Vertical clips.** Default per `config/defaults.yaml.fit.default_mode: blur-fill` (blurred, dimmed background + centered sharp foreground). Use crop-and-pan when the source is ≥2160 px tall and the subject leaves room to pan. Reserve side-by-side framing for the rare case of two simultaneously interesting vertical shots. Always confirm the crop/blur choice doesn't cut off the point of the shot (a sign, a face).
 
-**Language mismatch.** If `transcripts/<clip>.json.language_mismatch` is true (the user used a different language than `project.yaml.language`, e.g. English with a local), keep the original audio but flag it for a translated caption or SRT note. Don't auto-translate the narration itself — ask the user whether he wants a dub or just a subtitle.
+**Language mismatch.** If `transcripts/<clip>.json.language_mismatch` is true (the user spoke a different language than `project.yaml.language`, e.g. English with a local), keep the original audio but flag it for a translated caption or SRT note. Don't auto-translate the narration itself — ask the user whether they want a dub or just a subtitle.
 
 **Post-trip narration clips.** Clips recorded at home after the trip (source file or editor notes marked "post recording" / studio narration) exist to be heard, not watched: the planner should route their audio as `voice_over` narration under trip B-roll rather than defaulting to the talking head on screen. Reserve an on-camera appearance of the narrator for where it earns its place — typically the first time he appears (early on) and the ending — everywhere else, cut to the B-roll the narration describes. As with any clip, the opening sentence addressed to the editor is an instruction, not narration content.
 
@@ -135,7 +135,7 @@ After analysis and plan, some beats have no usable audio — an intro line, an o
 - **Where it goes** — timeline position/beat (e.g. "cold open, under the drone shot" or "bridge between Lisbon and Porto sections, ~9:40").
 - **Why** — one line on the gap it fills ("no clip states departure city; needed for the promise beat").
 - **Target length** — in seconds, matched to the visual it will sit under (don't ask for 20 s of narration over an 8 s shot).
-- **Suggested script** — a full, ready-to-read line in the project language, not just a topic. the user should be able to read it as-is or riff on it.
+- **Suggested script** — a full, ready-to-read line in the project language, not just a topic. The user should be able to read it as-is or riff on it.
 - **Delivery note** — energy/pace ("szybko, entuzjastycznie" vs. "spokojnie, refleksyjnie").
 
 **Template (Polish example, project language = pl):**
@@ -156,11 +156,11 @@ Ton: spokojnie, jak pointa.
 Propozycja: "Trzy godziny pociągiem później byłem już w zupełnie innym mieście — i zupełnie innym klimacie."
 ```
 
-the user records these himself (phone/mic, whatever he already uses for on-camera audio) and drops the files into `voice/`. **ElevenLabs voice clone is reserved for small pickups only** (a missed word, a re-recorded line that must match an existing take exactly) — never generate a synthetic version of a request the user hasn't recorded, and never substitute a full synthetic narration track for his own voice without asking first (see AI disclosure policy, §8, and the cost gate, §9).
+The user records these themselves (phone/mic, whatever they already use for on-camera audio) and drops the files into `voice/`. **ElevenLabs voice clone is reserved for small pickups only** (a missed word, a re-recorded line that must match an existing take exactly) — never generate a synthetic version of a request the user hasn't recorded, and never substitute a full synthetic narration track for their own voice without asking first (see AI disclosure policy, §8, and the cost gate, §9).
 
 ### 5.1 Turning a recorded pickup into a placed cut (`ytedit voice`)
 
-the user doesn't drop his recordings straight into `voice/` — he records narration requests and any extra "gap pickups" on his phone at home and drops the raw WAVs into **`voice/incoming/`**. `ytedit voice <slug>` transcribes each one, cuts it down to the usable take, and places it on the timeline; this replaces what used to be scratch-script work.
+The user doesn't drop these recordings straight into `voice/` — narration requests and any extra "gap pickups" are recorded on a phone at home and the raw WAVs go into **`voice/incoming/`**. `ytedit voice <slug>` transcribes each one, cuts it down to the usable take, and places it on the timeline; this replaces what used to be scratch-script work.
 
 **Manifest** (`voice/incoming/manifest.yaml`) maps each WAV to where it goes. If the file is missing, `ytedit voice` writes a draft listing every WAV in `voice/incoming/` with `request: null` and stops — fill it in, then re-run. One entry per file:
 
@@ -169,7 +169,7 @@ the user doesn't drop his recordings straight into `voice/` — he records narra
   request: n001                # a narration request id from plan/edit_plan.json
 - file: 20260906-081902.wav
   after: b073                  # explicit beat id instead of a request: the pickup goes after this beat
-  label: chinchero-street party      # output basename -> voice/chinchero-street party.wav
+  label: market-square         # output basename -> voice/market-square.wav
   cuts: [[2.98, 7.16]]         # manual extra cuts, source seconds (retakes the automatic pass missed)
   keep_takes: last             # or `first`, when the better attempt was recorded first
 ```
@@ -189,7 +189,7 @@ That is the whole schema: `file`, and then `request` **or** `after`, plus the op
 - **Loudness target:** −14 LUFS integrated, −1 dBTP, two-pass `loudnorm` on the final mix (`config/defaults.yaml.audio.loudnorm`). YouTube never boosts a quiet master, so don't undershoot.
 - **Ducking:** music sits 14-18 LU under narration in the clear, drops 8-12 dB under speech via transcript-driven `sendcmd` automation (attack ~0.15 s, release ~0.6 s) rather than blind sidechain — speech ranges are already known from the transcript, so use them.
 - **Mute ranges:** any `background_music` flag with meaningful confidence becomes an explicit `mute_ranges` entry (mute or heavy duck), or is explicitly waived with a reason. Default to muting bar/shop music entirely — ducking still leaves an audible, claimable bed.
-- **Content ID pre-flight:** pre-flag candidates from `audio_event: music` tags and `analysis.background_music[]`; the user has final say in the web editor's waveform tool. Always run this before render — don't let him discover a bar's music track in the master.
+- **Content ID pre-flight:** pre-flag candidates from `audio_event: music` tags and `analysis.background_music[]`; the user has final say in the web editor's waveform tool. Always run this before render — don't let them discover a bar's music track in the master.
 - **Room tone:** don't leave hard digital silence when trimming — carry a touch of the clip's own ambient noise under the cut.
 - **Air around speech:** never cut on the first or last syllable — the resolver gives every speech beat ~0.3 s before its first word and ~0.45 s after its last, with the audio held back off a neighbouring word (§4).
 - **Wind/noise:** a clip whose noise floor drowns the voice goes through `ytedit denoise` (§2.0b) before the preview render, not through more compression in the mix.

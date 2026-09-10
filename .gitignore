@@ -14,16 +14,11 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Project working data (everything heavy stays out of git)
-projects/*/input/*
-!projects/*/input/README.txt
-projects/*/media
-projects/*/renders
-projects/*/exports
-projects/*/jobs
-projects/*/music/*.mp3
-projects/*/voice/*.wav
-projects/*/voice/*.mp3
+# Project working data: a project is the user's own footage, transcripts and
+# cut — none of it belongs in the tool's repository. Nothing under projects/
+# is tracked except the directory itself.
+projects/*
+!projects/.gitkeep
 
 # Media files anywhere
 *.mp4
@@ -43,7 +38,3 @@ other_projects/
 .DS_Store
 
 # Runtime state
-projects/*/.state.lock
-projects/*/plan/history/
-projects/*/plan/timeline.draft.json
-projects/*/plan/planner_response.truncated.*.txt
