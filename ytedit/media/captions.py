@@ -310,8 +310,8 @@ def build_ass(
     lines += ["", "[Events]", f"Format: {_ASS_EVENT_FORMAT}"]
 
     # Two burned-in cards must never overlap on screen: a location card and a
-    # hook line anchored to nearby segments can land a few frames apart once
-    # anchors are resolved, and the timeline's own overlap check
+    # hook line attached to neighbouring beats can land a few frames apart
+    # once the cut is resolved, and the timeline's own overlap check
     # (Timeline.validate) already treats "subtitle"-style cues as exempt (they
     # are dense, transcript-driven, and never actually burned in — see the
     # module docstring), so the same exemption applies here: only cards

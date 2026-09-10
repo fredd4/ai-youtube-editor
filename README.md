@@ -51,10 +51,12 @@ ytedit publish    lisbon-day-1          # titles, description, chapters, thumbna
 make serve                              # web editor on http://localhost:8765
 ```
 
-Review and adjust the cut in the web editor's **Program** view (final-cut strip,
-segment inspector, "Save & render preview"); `ytedit tidy <slug>` re-applies the
-air-around-speech rule after manual edits. Every stage also has a `make` target
-(`make help`).
+Review and adjust the cut in the web editor's **Program** view (a strip of
+beats, "Save & render preview"). The edit lives in `plan/cut.json`, where
+speech is addressed by sentence id and never by seconds; `ytedit resolve
+<slug>` turns it into the `plan/timeline.json` the renderer reads, and every
+stage that writes the cut re-resolves it for you. Every stage also has a
+`make` target (`make help`).
 
 ## Repository layout
 
@@ -64,7 +66,9 @@ docs/            ARCHITECTURE.md, research/, playbook/
 ytedit/          the package
   config.py      .env + defaults.yaml + project.yaml -> Settings
   project.py     project paths, state.json (atomic + locked), clip registry
-  timeline.py    the EDL model (pydantic) + validation + speech ranges
+  cut.py         plan/cut.json: the edit model (beats), its validator and the resolver
+  timeline.py    the resolved EDL model (pydantic) + validation + speech ranges
+  words.py       transcript word spans, shared by everything that must not chop a word
   costs.py       price table, estimates, ledger, budget cap
   media/         ffmpeg runner, probe, colour/fit filter builders, ingest, frames
   ai/            OpenRouter / ElevenLabs / fal clients and the LLM stages
@@ -89,7 +93,7 @@ falling back to file mtime, then name) and writes:
 | `media/thumbs/<id>.jpg` | poster frame |
 | `media/thumbs/frames/<id>/NNN.jpg` | frames sampled every 3 s for the vision model |
 
-`plan/timeline.json` is the single source of truth for rendering.
+`plan/cut.json` is the single source of truth for the edit; `plan/timeline.json` is derived from it by `ytedit resolve` and is safe to delete.
 
 ## Tests
 

@@ -23,7 +23,7 @@ from ytedit.media import audio as A
 from ytedit.media import render as R
 from ytedit.media.ingest import ingest
 from ytedit.project import Project
-from ytedit.timeline import AudioFrom, Timeline, VoiceItem
+from ytedit.timeline import AudioFrom, AudioWindow, Timeline, VoiceItem
 
 #: Programme length of :func:`timeline_document` (3.0 + 3.0 − 0.5 xfade + 2.0).
 EXPECTED_DURATION: float = 7.5
@@ -35,18 +35,29 @@ LOCATION_TEXT = "LIZBONA, PORTUGALIA — ŁÓDŹ"
 # the test project
 # ----------------------------------------------------------------------
 def timeline_document() -> dict:
-    """The three-segment timeline used by the render and QC tests."""
+    """The three-segment timeline used by the render and QC tests.
+
+    The segment ``uid``s are spelled out because a v2 timeline is normally the
+    resolver's output, where they are derived (``sha1(beat uid + index)``) and
+    therefore stable across loads. A hand-written one has to supply them: the
+    model would otherwise mint a fresh random uid on every ``Timeline.load``,
+    and the uid is part of the render's per-segment cache key — so the same
+    file would key differently each time it was read.
+    """
     return {
-        "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
+        "version": 2, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
         "tracks": {
             "video": [
-                {"id": "s001", "clip": "c001", "in": 0.5, "out": 3.5, "role": "cold-open",
+                {"id": "s001", "uid": "0000000000000001", "clip": "c001",
+                 "in": 0.5, "out": 3.5, "role": "cold-open",
                  "transform": {"fit": "cover", "zoom": 1.0}, "grade": "default",
                  "transition_in": {"type": "cut", "duration": 0.0}},
-                {"id": "s002", "clip": "c002", "in": 1.0, "out": 4.0, "role": "b-roll",
+                {"id": "s002", "uid": "0000000000000002", "clip": "c002",
+                 "in": 1.0, "out": 4.0, "role": "b-roll",
                  "transform": {"fit": "blur-fill", "zoom": 1.0}, "grade": "default",
                  "transition_in": {"type": "xfade", "duration": 0.5, "name": "fade"}},
-                {"id": "s003", "clip": "c003", "in": 0.0, "out": 2.0, "role": "b-roll",
+                {"id": "s003", "uid": "0000000000000003", "clip": "c003",
+                 "in": 0.0, "out": 2.0, "role": "b-roll",
                  "transform": {"fit": "cover", "zoom": 1.0}, "grade": "default",
                  "transition_in": {"type": "cut", "duration": 0.0}},
             ],
@@ -110,11 +121,44 @@ def build_render_project(
         }, ensure_ascii=False),
         encoding="utf-8",
     )
+    doc = document or timeline_document()
+    write_placeholder_cut(project, doc)
     project.timeline_file.write_text(
-        json.dumps(document or timeline_document(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return project
+
+
+def write_placeholder_cut(project: Project, document: dict) -> None:
+    """Write a ``plan/cut.json`` covering the same picture as ``document``.
+
+    Since cut v2 the cut is the source of truth and ``ytedit qc`` refuses a
+    project without one. The renderer, though, consumes a *timeline*, and
+    these tests exercise geometry a hand-written timeline states far more
+    directly than a cut would (fractional in/out points, an `audio_window`,
+    an `xfade` overlap). So the timeline stays hand-written and the cut here
+    is a stand-in: one ``broll`` beat per video segment, same clip and range,
+    which validates cleanly and lets the cut-level checks run.
+
+    It is written *before* the timeline on purpose — ``ensure_resolved`` only
+    re-resolves when the cut is the newer of the two, so the hand-written
+    timeline is never silently replaced.
+    """
+    from ytedit.cut import Beat, Cut, MuteRange, cut_path, save_cut
+
+    beats = [
+        Beat(
+            kind="broll",
+            clip=str(seg["clip"]),
+            **{"in": float(seg.get("in", 0.0))},
+            out=float(seg.get("out", 0.0)),
+            audio="mute" if seg.get("mute_source") else "ambient",
+            role=str(seg.get("role", "")),
+        )
+        for seg in document.get("tracks", {}).get("video", [])
+    ]
+    mutes = [MuteRange.model_validate(m) for m in document.get("mute_ranges", [])]
+    save_cut(Cut(beats=beats, mute_ranges=mutes), cut_path(project))
 
 
 # ----------------------------------------------------------------------
@@ -134,21 +178,26 @@ def fractional_document() -> dict:
 
     Every source is muted so the only audio in the programme is the voice pickup
     placed at the third segment's first frame; a location card starts on the
-    same frame.
+    same frame. The ``uid``s are spelled out for the reason
+    :func:`timeline_document` gives.
     """
     at = round(THIRD_SEGMENT_AT, 6)
     return {
-        "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
+        "version": 2, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
         "tracks": {
             "video": [
-                {"id": "s001", "clip": "c001", "in": 0.51, "out": 2.13, "role": "cold-open",
+                {"id": "s001", "uid": "0000000000000011", "clip": "c001",
+                 "in": 0.51, "out": 2.13, "role": "cold-open",
                  "mute_source": True, "transition_in": {"type": "cut", "duration": 0.0}},
-                {"id": "s002", "clip": "c002", "in": 1.07, "out": 2.71, "role": "b-roll",
+                {"id": "s002", "uid": "0000000000000012", "clip": "c002",
+                 "in": 1.07, "out": 2.71, "role": "b-roll",
                  "mute_source": True, "transform": {"fit": "blur-fill", "zoom": 1.0},
                  "transition_in": {"type": "cut", "duration": 0.0}},
-                {"id": "s003", "clip": "c003", "in": 0.33, "out": 1.5, "role": "b-roll",
+                {"id": "s003", "uid": "0000000000000013", "clip": "c003",
+                 "in": 0.33, "out": 1.5, "role": "b-roll",
                  "mute_source": True, "transition_in": {"type": "cut", "duration": 0.0}},
-                {"id": "s004", "clip": "c001", "in": 2.005, "out": 3.0, "role": "outro",
+                {"id": "s004", "uid": "0000000000000014", "clip": "c001",
+                 "in": 2.005, "out": 3.0, "role": "outro",
                  "mute_source": True, "transition_in": {"type": "cut", "duration": 0.0}},
             ],
             "voice": [{"id": "v001", "file": "voice/v001.wav", "at": at, "gain_db": 0.0}],
@@ -342,6 +391,7 @@ def test_render_refuses_a_project_without_a_timeline(project: Project) -> None:
 
 def test_render_refuses_an_invalid_timeline(project: Project) -> None:
     project.timeline_file.write_text(json.dumps({
+        "version": 2,
         "tracks": {"video": [{"id": "s1", "clip": "c1", "in": 5.0, "out": 1.0}]},
     }), encoding="utf-8")
     with pytest.raises(R.RenderError, match="issue"):
@@ -752,6 +802,96 @@ def test_a_missing_audio_from_source_is_a_render_error(project: Project) -> None
     with pytest.raises(R.RenderError, match="audio_from clip 'c999'"):
         R.render_segment(project, timeline, timeline.tracks.video[0], R.Canvas(1920, 1080, 30),
                          "preview")
+
+
+# ----------------------------------------------------------------------
+# audio_window: the picture runs on, the sound does not (cut v2)
+# ----------------------------------------------------------------------
+def test_audio_window_renders_silence_outside_the_window(
+    rendered: tuple[Project, Path],
+) -> None:
+    """3 s of c001's 440 Hz tone, of which only 1.0-2.0 s may be heard."""
+    project, _out = rendered
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {"video": [
+            {"id": "s001", "clip": "c001", "in": 0.0, "out": 3.0, "role": "a-roll",
+             "audio_window": {"in": 1.0, "out": 2.0}},
+        ]},
+    })
+    seg = timeline.tracks.video[0]
+    canvas = R.canvas_for(timeline, preview=True)
+    path = R.render_segment(project, timeline, seg, canvas, "preview")
+
+    # the picture is untouched: all 3 s of it
+    assert int(video_stream(path)["nb_frames"]) == seg.frames(canvas.fps)
+
+    heard = measure_volume(path, 1.1, 0.8)
+    before = measure_volume(path, 0.1, 0.8)
+    after = measure_volume(path, 2.1, 0.8)
+    assert heard > before + 40, (heard, before)
+    assert heard > after + 40, (heard, after)
+
+
+def test_audio_window_silences_a_borrowed_audio_range_too(
+    rendered: tuple[Project, Path],
+) -> None:
+    """Picture c001, sound borrowed from c002 (660 Hz) — window in c002's time."""
+    project, _out = rendered
+    timeline = Timeline.model_validate({
+        "fps": 30, "width": 1920, "height": 1080,
+        "tracks": {"video": [
+            {"id": "s001", "clip": "c001", "in": 0.5, "out": 3.5, "role": "cutaway",
+             "audio_from": {"clip": "c002", "in": 1.0, "out": 4.0},
+             "audio_window": {"in": 2.0, "out": 4.0}},
+        ]},
+    })
+    seg = timeline.tracks.video[0]
+    canvas = R.canvas_for(timeline, preview=True)
+    path = R.render_segment(project, timeline, seg, canvas, "preview")
+
+    # the window opens 1.0 s into the segment (2.0 s of c002, cut in at 1.0 s)
+    assert R.segment_audio_window(seg) == (1.0, 3.0)
+    heard = measure_volume(path, 1.1, 0.8)
+    silent = measure_volume(path, 0.1, 0.8)
+    assert heard > silent + 40, (heard, silent)
+
+
+def test_audio_window_takes_part_in_the_segment_cache_key(
+    rendered: tuple[Project, Path],
+) -> None:
+    project, _out = rendered
+    timeline = Timeline.model_validate({
+        "tracks": {"video": [{"id": "s001", "clip": "c001", "in": 0.0, "out": 3.0}]},
+    })
+    seg = timeline.tracks.video[0]
+    canvas = R.Canvas(1280, 720, 30)
+    plain = R.segment_key(project, timeline, seg, canvas, "preview")
+
+    windowed = seg.model_copy(update={"audio_window": AudioWindow(**{"in": 1.0}, out=2.0)})
+    key = R.segment_key(project, timeline, windowed, canvas, "preview")
+    assert key != plain
+
+    moved = seg.model_copy(update={"audio_window": AudioWindow(**{"in": 1.0}, out=2.5)})
+    assert R.segment_key(project, timeline, moved, canvas, "preview") != key
+
+
+def test_audio_window_hides_a_silenced_word_from_the_speech_ranges(
+    rendered: tuple[Project, Path],
+) -> None:
+    """c001's words run 2.0-3.4 s; a window that stops at 2.5 s keeps only the first."""
+    project, _out = rendered
+    timeline = Timeline.model_validate({
+        "tracks": {"video": [
+            {"id": "s001", "clip": "c001", "in": 1.0, "out": 4.0,
+             "audio_window": {"in": 1.0, "out": 2.5}},
+        ]},
+    })
+    seg = timeline.tracks.video[0]
+    assert R.segment_speech_ranges(project, seg) == [(1.0, 1.3), (1.35, 1.5)]
+    assert R.segment_speech_ranges(
+        project, seg.model_copy(update={"audio_window": None})
+    ) == [(1.0, 1.3), (1.35, 1.7), (1.75, 1.85), (1.9, 2.4)]
 
 
 # ----------------------------------------------------------------------

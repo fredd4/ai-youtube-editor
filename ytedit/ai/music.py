@@ -1,9 +1,16 @@
 """Stage 5: music cue sheet -> ``music/<cue>.mp3`` (+ sidecars, manifest).
 
-Cues come from ``plan/edit_plan.json: music_cues`` when the plan stage has run;
-otherwise from an explicit ``styles`` argument, otherwise from a single default
-style guessed from the footage log's moods/locations against the tags in
+Cues come from ``plan/cut.json: music[]`` when there is a cut; otherwise from
+an explicit ``styles`` argument, otherwise from a single default style guessed
+from the footage log's moods/locations against the tags in
 ``config/music_styles.yaml``.
+
+A cue in the cut is a **beat range** (``from``/``to``, inclusive), not a pair
+of absolute seconds, so a bed is generated exactly as long as the beats it
+covers actually resolve to (:func:`ytedit.cut.beat_spans`). That is the whole
+point of the cut being the source of truth: re-plan, add a narration pickup or
+hand-edit the cut and the next ``ytedit music`` run sizes the bed to the new
+cut instead of to the length some earlier producer wrote down.
 
 Every track is instrumental and generated in ``loop`` mode so a bed can be
 trimmed or extended to any cue length without an audible ending (see
@@ -189,10 +196,12 @@ def _slug(text: str, fallback: str) -> str:
 
 
 def normalize_cue(raw: Mapping[str, Any], index: int, settings: Any) -> MusicCue:
-    """Turn one plan/CLI cue dict into a :class:`MusicCue`.
+    """Turn one cue dict into a :class:`MusicCue`.
 
-    Accepts both the documented ``{id, style, prompt, length_s, mood, section}``
-    shape and the planner's ``{section, s, e, mood}`` cue-sheet shape.
+    Accepts the documented ``{id, style, prompt, length_s, mood, section}``
+    shape — what :func:`cues_from_plan` builds out of the cut — and, for cues
+    typed on the command line or left over in an old plan, the planner's
+    ``{section, s, e, mood}`` cue-sheet shape.
     """
     section = str(raw.get("section") or raw.get("where") or "")
     mood = str(raw.get("mood") or "")
@@ -224,8 +233,19 @@ def normalize_cue(raw: Mapping[str, Any], index: int, settings: Any) -> MusicCue
     )
 
 
-def cues_from_plan(project: Project) -> list[dict[str, Any]]:
-    """Read ``music_cues`` from ``plan/edit_plan.json`` (``[]`` when absent)."""
+#: Cue metadata the planner may have written next to a cut cue. ``MusicCue``
+#: is ``extra="allow"``, so these survive a ``cut.json`` round trip and are the
+#: cue's musical direction; the *length* never comes from here.
+CUE_META_KEYS: tuple[str, ...] = ("style", "mood", "section", "prompt")
+
+
+def _edit_plan_cues(project: Project) -> list[Mapping[str, Any]]:
+    """Raw ``music_cues`` out of ``plan/edit_plan.json`` (``[]`` when absent).
+
+    Only the *style/mood/section* wording is ever taken from here — a cue's
+    length is a fact about the cut, and the edit plan's ``s``/``e`` are the
+    seconds some earlier planning pass guessed at.
+    """
     path = project.edit_plan_file
     if not path.exists():
         return []
@@ -244,13 +264,96 @@ def cues_from_plan(project: Project) -> list[dict[str, Any]]:
     return []
 
 
+def _plan_cue_meta(project: Project) -> dict[str, Mapping[str, Any]]:
+    """``{cue id: edit-plan cue}`` — the fallback source of a cue's wording."""
+    out: dict[str, Mapping[str, Any]] = {}
+    for cue in _edit_plan_cues(project):
+        cue_id = str(cue.get("id") or "").strip()
+        if cue_id:
+            out[cue_id] = cue
+    return out
+
+
+def cues_from_plan(project: Project) -> list[dict[str, Any]]:
+    """Read the cue sheet from ``plan/cut.json``, sized against the cut.
+
+    Each cue's ``length_s`` is the real duration of its beat range — the start
+    of the ``from`` beat to the end of the ``to`` beat (inclusive), as
+    :func:`ytedit.cut.beat_spans` resolves them. A cue whose beats no longer
+    resolve (both ends deleted, or the range collapsed to nothing) is dropped
+    with a warning: an ElevenLabs generation is paid for by the minute, and a
+    bed of the wrong length is worse than no bed at all.
+
+    The musical direction (``style``/``mood``/``section``/``prompt``) rides
+    along on the cut's cue as extra fields; when the cut carries none of them —
+    a cut produced by ``ytedit migrate``, which keeps only file/gain/fades —
+    it falls back to the same-id cue in ``plan/edit_plan.json``.
+
+    Returns:
+        Cue dicts for :func:`normalize_cue`, in cut order (``[]`` when the
+        project has no cut or no cues in it).
+    """
+    from ..cut import beat_spans, cut_path, load_cut
+
+    path = cut_path(project)
+    if not path.exists():
+        return []
+    try:
+        cut = load_cut(path)
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        log.error("unreadable cut %s: %s", path, exc)
+        return []
+    if not cut.music:
+        return []
+
+    spans, _issues = beat_spans(project, cut)
+    plan_meta = _plan_cue_meta(project)
+
+    out: list[dict[str, Any]] = []
+    for cue in cut.music:
+        first = spans.get(cue.from_)
+        last = spans.get(cue.to)
+        if first is None or last is None:
+            log.warning(
+                "music cue %s: beat range %s→%s produces no picture — skipped",
+                cue.id, cue.from_, cue.to,
+            )
+            continue
+        length = round(last[1] - first[0], 3)
+        if length <= 0:
+            log.warning(
+                "music cue %s: beat range %s→%s is %.2f s long — skipped",
+                cue.id, cue.from_, cue.to, length,
+            )
+            continue
+
+        item: dict[str, Any] = {
+            "id": cue.id,
+            "file": cue.file,
+            "gain_db": cue.gain_db,
+            "length_s": length,
+        }
+        extra = cue.model_extra or {}
+        fallback = plan_meta.get(cue.id, {})
+        for key in CUE_META_KEYS:
+            value = extra.get(key) or fallback.get(key)
+            if value:
+                item[key] = str(value)
+        out.append(item)
+    return out
+
+
 def resolve_cues(
     project: Project,
     cues: Sequence[Mapping[str, Any]] | None = None,
     styles: Sequence[str] | None = None,
     length_s: int | float | None = None,
 ) -> list[MusicCue]:
-    """Decide what to generate: explicit cues > plan cues > styles > default."""
+    """Decide what to generate: explicit cues > cut cues > styles > default.
+
+    ``length_s`` overrides every cue's length, whatever its source — the one
+    way to ask for a bed that is not the length of its beat range.
+    """
     settings = project.settings
     default_length = float(
         length_s
@@ -475,7 +578,7 @@ def generate_music(
     Args:
         project: Target project.
         force: Regenerate beds whose mp3 already exists.
-        cues: Explicit cue dicts; defaults to ``plan/edit_plan.json:music_cues``.
+        cues: Explicit cue dicts; defaults to ``plan/cut.json:music[]``.
         styles: Style names to generate when there is no cue sheet.
         length_s: Override every cue's length in seconds.
 

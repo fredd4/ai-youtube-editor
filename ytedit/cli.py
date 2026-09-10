@@ -154,22 +154,111 @@ def ingest(
         raise typer.Exit(code=1)
 
 
+def _print_cut_issues(issues: list[Any]) -> int:
+    """Print ``ytedit.cut`` validation issues; return how many are errors."""
+    from rich.markup import escape
+
+    errors = 0
+    for issue in issues:
+        colour = "red" if issue.severity == "error" else "yellow"
+        if issue.severity == "error":
+            errors += 1
+        where = f" ({escape(issue.beat)})" if issue.beat else ""
+        console.print(
+            f"[{colour}]{issue.severity:<7}[/] {escape(issue.code)}{where}: "
+            f"{escape(issue.message)}"
+        )
+    return errors
+
+
+def _ensure_resolved(project: Project) -> None:
+    """Re-resolve ``plan/timeline.json`` from ``plan/cut.json`` when it is stale.
+
+    A project with no ``cut.json`` yet is left untouched — the command that
+    follows reports the missing file itself. A cut that does not validate
+    stops the command rather than letting it render a stale file.
+    """
+    from .cut import CutError, cut_path, ensure_resolved
+
+    if not cut_path(project).exists():
+        return
+    try:
+        ensure_resolved(project)
+    except CutError as exc:
+        console.print("[bold red]cut.json does not resolve[/] — fix it and try again:")
+        _print_cut_issues(exc.issues)
+        raise typer.Exit(code=1) from exc
+
+
 @app.command()
 def validate(slug: str = typer.Argument(..., help="Project slug.")) -> None:
-    """Validate ``plan/timeline.json`` against the project."""
-    from .timeline import Timeline
+    """Validate ``plan/cut.json`` against the project: every rule, no writes."""
+    from .cut import cut_path, load_cut
+    from .cut import validate as validate_cut
 
     project = _load(slug)
-    if not project.timeline_file.exists():
-        console.print(f"[yellow]no timeline at {project.timeline_file}[/]")
+    source = cut_path(project)
+    if not source.exists():
+        console.print(
+            f"[bold red]no cut at {source}[/] — run 'ytedit plan {slug}', or "
+            f"'ytedit migrate {slug}' on a project that still has a v1 timeline"
+        )
+        raise typer.Exit(code=2)
+    issues = validate_cut(project, load_cut(source))
+    errors = _print_cut_issues(issues)
+    if errors:
+        console.print(f"[bold red]{errors} error(s)[/] in {source}")
         raise typer.Exit(code=1)
-    issues = Timeline.load(project.timeline_file).validate(project)
-    if not issues:
-        console.print("[green]timeline ok[/]")
-        return
-    for issue in issues:
-        console.print(f"[red]-[/] {issue}")
-    raise typer.Exit(code=1)
+    console.print(f"[green]cut ok[/] ({len(issues)} warning(s))")
+
+
+@app.command()
+def resolve(slug: str = typer.Argument(..., help="Project slug.")) -> None:
+    """Resolve ``plan/cut.json`` into the derived ``plan/timeline.json``.
+
+    The cut is the source of truth; the timeline is a render artifact and is
+    overwritten every time. Validation errors stop the write.
+    """
+    from .cut import cut_path, load_cut
+    from .cut import resolve as resolve_cut
+    from .cut import validate as validate_cut
+
+    project = _load(slug)
+    source = cut_path(project)
+    if not source.exists():
+        console.print(f"[bold red]no cut at {source}[/] — run 'ytedit migrate {slug}' "
+                      "on a v1 project")
+        raise typer.Exit(code=2)
+    cut = load_cut(source)
+    errors = _print_cut_issues(validate_cut(project, cut))
+    if errors:
+        console.print(f"[bold red]{errors} error(s)[/] — timeline not written")
+        raise typer.Exit(code=1)
+    timeline = resolve_cut(project, cut)
+    timeline.save(project.timeline_file)
+    console.print(
+        f"[green]resolved[/] {len(cut.beats)} beat(s) -> "
+        f"{len(timeline.tracks.video)} segment(s), {timeline.duration():.2f}s "
+        f"-> {project.timeline_file}"
+    )
+
+
+@app.command()
+def migrate(
+    slug: str = typer.Argument(..., help="Project slug."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would change without writing anything."
+    ),
+) -> None:
+    """Convert a v1 ``plan/timeline.json`` into a v2 ``plan/cut.json``."""
+    fn = _lazy("ytedit.migrate", "migrate_project")
+    if fn is None:
+        _not_implemented("migrate", "ytedit.migrate")
+    project = _load(slug)
+    report = fn(project, dry_run=dry_run)
+    console.print(report.markdown(), markup=False, highlight=False)
+    if report.issues:
+        console.print(f"[yellow]{len(report.issues)} issue(s)[/] — see the report above")
 
 
 # ----------------------------------------------------------------------
@@ -225,7 +314,7 @@ def plan(
         "(no cost, e.g. after a post-processing fix).",
     ),
 ) -> None:
-    """Turn the footage log into an edit plan and a draft timeline."""
+    """Turn the footage log into ``plan/cut.json`` and resolve it to a timeline."""
     fn = _lazy("ytedit.ai.plan", "plan")
     if fn is None:
         _not_implemented("plan", "ytedit.ai.plan")
@@ -233,116 +322,11 @@ def plan(
 
 
 @app.command()
-def tidy(
-    slug: str = typer.Argument(..., help="Project slug."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Report changes without writing."),
-    force: bool = typer.Option(
-        False, "--force", help="Overwrite a human-edited timeline instead of writing a draft."
-    ),
-) -> None:
-    """Give every speech cut air (~0.3 s before / ~0.45 s after) and merge jump cuts."""
-    from .ai.tidy import TidyError
-    from .ai.tidy import tidy as run_tidy
-
-    project = _load(slug)
-    try:
-        result = run_tidy(project, dry_run=dry_run, force=force)
-    except TidyError as exc:
-        console.print(f"[bold red]{exc}[/]")
-        raise typer.Exit(code=1) from exc
-
-    changes = result["changes"]
-    if not changes:
-        console.print("[green]nothing to tidy[/] — every cut already has its air")
-        return
-    for change in changes:
-        console.print(f"[dim]-[/] {change}")
-    console.print(
-        f"[bold]{len(changes)}[/] change(s) · "
-        f"{result['sentence_snapped']} sentence-snapped · "
-        f"{result['overlaid']} overlay change(s) · "
-        f"{result['deduped']} dedupe change(s) "
-        f"({result['ambient_repeats']} ambient repeat(s) allowed) · duration "
-        f"{result['duration_before']:.2f}s -> {result['duration_after']:.2f}s"
-    )
-    for issue in result["issues"]:
-        console.print(f"[yellow]![/] {issue}")
-    if result["dry_run"]:
-        console.print("[yellow]dry run — nothing written[/]")
-        return
-    console.print(f"[green]wrote[/] {result['written']} (backup: {result['backup']})")
-    if result["edited_by_human"] and not force:
-        console.print(
-            "[yellow]timeline.json is human-edited[/] — review the draft, "
-            "or re-run with --force"
-        )
-
-
-@app.command("voice-anchor")
-def voice_anchor(
-    slug: str = typer.Argument(..., help="Project slug."),
-    voice_id: str = typer.Argument(..., help="Voice item id (tracks.voice), e.g. v002."),
-    segment_id: str = typer.Argument(..., help="Video segment id to pin it to, e.g. s014."),
-    offset: float = typer.Option(
-        0.0, "--offset", help="Seconds after the segment's start where the pickup begins."
-    ),
-    force: bool = typer.Option(
-        False, "--force", help="Overwrite a human-edited timeline instead of writing a draft."
-    ),
-) -> None:
-    """Pin a voice pickup to a video segment instead of an absolute time.
-
-    The pickup then follows that segment through every later pass (speech
-    padding, sentence snapping, overlay cutaways, audio dedupe, another
-    ``ytedit tidy``) instead of drifting at a fixed timestamp.
-    """
-    from .ai.tidy import backup_timeline
-    from .timeline import AnchorSignature, Timeline, VoiceAnchor
-
-    project = _load(slug)
-    if not project.timeline_file.exists():
-        console.print(f"[bold red]no timeline at {project.timeline_file}[/]")
-        raise typer.Exit(code=1)
-
-    timeline = Timeline.load(project.timeline_file)
-    human_edited = bool(timeline.meta.edited_by_human)
-
-    item = next((v for v in timeline.tracks.voice if v.id == voice_id), None)
-    if item is None:
-        console.print(f"[bold red]no voice item {voice_id!r} in tracks.voice[/]")
-        raise typer.Exit(code=1)
-    target_seg = next((s for s in timeline.tracks.video if s.id == segment_id), None)
-    if target_seg is None:
-        console.print(f"[bold red]no video segment {segment_id!r} in tracks.video[/]")
-        raise typer.Exit(code=1)
-
-    item.anchor = VoiceAnchor(
-        segment=segment_id, offset=offset, uid=target_seg.uid,
-        signature=AnchorSignature(clip=target_seg.clip, **{"in": target_seg.in_}),
-    )
-    timeline.resolve_anchors()
-
-    backup = backup_timeline(project)
-    write_to_draft = human_edited and not force
-    target = project.plan_dir / ("timeline.draft.json" if write_to_draft else "timeline.json")
-    timeline.save(target)
-    console.print(
-        f"[green]{voice_id}[/] anchored to {segment_id} +{offset:.2f}s "
-        f"-> at {item.at:.2f}s · wrote {project.rel(target)} (backup: {backup})"
-    )
-    if write_to_draft:
-        console.print(
-            "[yellow]timeline.json is human-edited[/] — review the draft, "
-            "or re-run with --force"
-        )
-
-
-@app.command()
 def captions(
     slug: str = typer.Argument(..., help="Project slug."),
     force: bool = typer.Option(
         False, "--force",
-        help="Re-ask the writer for places and overwrite a human-edited timeline.",
+        help="Re-ask the writer for places and overwrite a human-edited cut.",
     ),
     include_cold_open: bool = typer.Option(
         False, "--include-cold-open", help="Also allow a location card during the cold open."
@@ -352,7 +336,7 @@ def captions(
         help="Keep the planner's own location captions instead of replacing them.",
     ),
 ) -> None:
-    """Place a location card at every new place, anchored to its segment."""
+    """Place a location card at every new place, on that place's first beat."""
     from .ai.locations import LocationsError
     from .ai.locations import run_captions_stage as _run_captions
     from .ai.publish import format_timecode
@@ -383,7 +367,7 @@ def captions(
         console.print(f"[yellow]![/] {issue}")
     if result["edited_by_human"] and not force:
         console.print(
-            "[yellow]timeline.json is human-edited[/] — review the draft, "
+            "[yellow]cut.json is human-edited[/] — review the draft, "
             "or re-run with --force"
         )
 
@@ -430,7 +414,7 @@ def denoise(
             if not clips:
                 console.print("[bold red]--preview needs --clip <id>[/]")
                 raise typer.Exit(code=2)
-            from .ai.tidy import load_words
+            from .words import load_words
 
             for clip_id in clips:
                 starts = [w.s for w in load_words(project, clip_id)] or None
@@ -575,12 +559,19 @@ def noise(
 def run(
     slug: str = typer.Argument(..., help="Project slug."),
     until: str = typer.Option(
-        "plan", "--until", help="Last stage to run: ingest|transcribe|analyze|plan|music."
+        "plan", "--until",
+        help="Last stage to run: ingest|transcribe|analyze|sentences|plan.",
     ),
     force: bool = typer.Option(False, "--force", help="Re-run stages even if done."),
 ) -> None:
-    """Run ingest -> transcribe -> analyze -> plan (-> music) in order, skipping done stages."""
-    order = ["ingest", "transcribe", "analyze", "plan", "music"]
+    """Run ingest -> transcribe -> analyze -> sentences -> plan, skipping done stages.
+
+    Music is deliberately not part of this chain: a bed is only worth
+    generating once the cut is stable, and it costs real money per track (see
+    the cost rules in CLAUDE.md). Run ``ytedit music`` yourself when the cut
+    has settled.
+    """
+    order = ["ingest", "transcribe", "analyze", "sentences", "plan"]
     if until not in order:
         console.print(f"[bold red]--until must be one of {', '.join(order)}[/]")
         raise typer.Exit(code=2)
@@ -589,8 +580,8 @@ def run(
         "ingest": ("ytedit.media.ingest", "ingest"),
         "transcribe": ("ytedit.ai.transcribe", "transcribe"),
         "analyze": ("ytedit.ai.analyze", "analyze"),
+        "sentences": ("ytedit.ai.sentences", "write_sentences"),
         "plan": ("ytedit.ai.plan", "plan"),
-        "music": ("ytedit.ai.music", "generate_music"),
     }
     for stage in order[: order.index(until) + 1]:
         if not force and project.stage_status(stage) == "done":
@@ -600,8 +591,14 @@ def run(
         fn = _lazy(*modules[stage])
         if fn is None:
             _not_implemented(stage, modules[stage][0])
-        fn(project, force=force)
+        if stage == "sentences":
+            fn(project)
+        else:
+            fn(project, force=force)
         project = _load(slug)
+    # The cut is the source of truth; make sure the derived timeline matches
+    # it before anyone renders or reviews.
+    _ensure_resolved(project)
 
 
 @app.command()
@@ -654,8 +651,10 @@ def render(
     fn = _lazy("ytedit.media.render", "render")
     if fn is None:
         _not_implemented("render", "ytedit.media.render")
+    project = _load(slug)
+    _ensure_resolved(project)
     fn(
-        _load(slug), preview=preview, draft=draft, master=master or not (preview or draft),
+        project, preview=preview, draft=draft, master=master or not (preview or draft),
         no_music=no_music, no_voice=no_voice, x264=x264,
     )
 
@@ -709,17 +708,20 @@ def at(
     ),
     as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON instead."),
 ) -> None:
-    """Resolve a rendered timecode to its exact segment/audio/caption/chapter.
+    """Resolve a rendered timecode to its exact beat/segment/audio/caption/chapter.
 
     Turns a timecoded note ("at 4:27 the sentence is cut") into a precise
-    reference into plan/timeline.json — the segment id/uid/clip/in-out, where
-    its audio actually comes from, the transcript words or voice pickup heard
+    reference into the edit: the plan/cut.json beat (id, kind, clip, its
+    sentences and which of its shots is on screen) — which is what an edit is
+    expressed against — plus the derived plan/timeline.json segment, where its
+    audio actually comes from, the transcript words or voice pickup heard
     there, active captions, the music cue and the chapter.
     """
     from .inspect import TimecodeError, inspect_moment, inspect_range, parse_timecode
     from .timeline import Timeline
 
     project = _load(slug)
+    _ensure_resolved(project)
     if not project.timeline_file.exists():
         console.print(f"[bold red]no timeline at {project.timeline_file}[/]")
         raise typer.Exit(code=2)
@@ -746,6 +748,18 @@ def at(
     for entry in results:
         moment = entry["moment"]
         console.print(f"\n[bold cyan]{moment['at_tc']}[/] ({moment['at']}s)")
+        beat = moment["beat"]
+        if beat is not None:
+            beat_table = Table(show_header=False, box=None, padding=(0, 1))
+            beat_table.add_row("beat", f"{beat['id']} (uid {beat['uid']})")
+            beat_table.add_row("kind", beat["kind"] + (f" / {beat['role']}" if beat["role"] else ""))
+            beat_table.add_row("source", beat["clip"] or beat["file"] or "-")
+            if beat["sentences"]:
+                beat_table.add_row("sentences", ", ".join(beat["sentences"]))
+            elif beat["words"]:
+                beat_table.add_row("words", f"{beat['words'][0]}-{beat['words'][1]}")
+            beat_table.add_row("on screen", beat["on_screen"]["label"])
+            console.print(beat_table)
         seg = moment["segment"]
         if seg is None:
             console.print("  [dim]no video segment at this time[/]")
@@ -767,8 +781,8 @@ def at(
             console.print(
                 f"  audio source: {moment['audio_clip']} @ {moment['audio_clip_time']}s"
             )
-        if moment["sentence_ids"]:
-            console.print(f"  sentence ids: {', '.join(moment['sentence_ids'])}")
+        if moment["sentences_heard"]:
+            console.print(f"  sentences heard: {', '.join(moment['sentences_heard'])}")
         if moment["words"]:
             words = " ".join(w["text"] for w in moment["words"])
             console.print(f"  words nearby: {words}")
@@ -791,13 +805,98 @@ def at(
             console.print(around_table)
 
 
+@app.command(name="check-render")
+def check_render(
+    slug: str = typer.Argument(..., help="Project slug."),
+    render: str = typer.Option(
+        "draft", "--render", help="draft | preview | master, or a path to a rendered file."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Re-transcribe even when the cached transcript still matches."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print machine-readable JSON and write the .json report too."
+    ),
+) -> None:
+    """Transcribe a finished render and check how its cuts actually sound.
+
+    Lines every real audio boundary (a segment whose audio does not simply
+    continue the previous one, plus every voice pickup's start and end) up
+    against the render's own transcript: how much air there is on each side,
+    whether a cut lands inside a word, whether the same audio is replayed.
+    Always exits 0 — this is a report, not a gate (that is `ytedit qc`).
+    """
+    from rich.markup import escape
+
+    from .verify import VerifyError, check_render as run_check, timecode
+
+    project = _load(slug)
+    _ensure_resolved(project)
+    try:
+        result = run_check(project, render=render, force=force, write_json=as_json)
+    except VerifyError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(code=2) from exc
+
+    if as_json:
+        console.print_json(json.dumps(result, ensure_ascii=False))
+        return
+
+    counts = result["counts"]
+    table = Table(
+        title=f"{Path(result['render']).name} — {counts['boundaries']} audio boundaries",
+        header_style="bold cyan",
+    )
+    for col in ("at", "boundary", "beats", "flags", "source", "render"):
+        table.add_column(col, overflow="fold")
+    for row in result["boundaries"]:
+        source = []
+        for label, side, edge in (("A", row["before"], "out"), ("B", row["after"], "in")):
+            if side and side["word"]:
+                source.append(
+                    f"{label} {side['clip']}@{side[edge]:.2f} "
+                    f"{side['word']!r} {side['margin']:+.2f}"
+                )
+        phrase = "(no words both sides)"
+        if row["render_gap"] is not None:
+            phrase = (
+                f"...{row['render_before']} [{row['render_gap']:.2f}s] "
+                f"{row['render_after']}..."
+            )
+        if row["straddle"]:
+            phrase += f" STRADDLE {row['straddle']['text']!r}"
+        flags = ", ".join(row["flags"])
+        table.add_row(
+            timecode(row["at"]),
+            row["label"],
+            escape(row["beats"]),
+            f"[bold red]{escape(flags)}[/]" if flags else "-",
+            escape("; ".join(source)) or "-",
+            escape(phrase),
+        )
+    console.print(table)
+
+    extra = ", ".join(
+        f"{k}: {v}" for k, v in sorted(counts.items()) if k not in ("boundaries", "flagged")
+    )
+    colour = "green" if not counts["flagged"] else "yellow"
+    console.print(
+        f"[{colour}]{counts['flagged']}/{counts['boundaries']} boundaries flagged[/]"
+        + (f" ({extra})" if extra else "")
+        + f" — transcript {'cached' if result['cached'] else 'fresh'}, "
+        f"report: {result['report_md']}"
+    )
+
+
 @app.command()
 def qc(slug: str = typer.Argument(..., help="Project slug.")) -> None:
     """Check the timeline and the rendered master against the playbook rules."""
     fn = _lazy("ytedit.qc", "qc")
     if fn is None:
         _not_implemented("qc", "ytedit.qc")
-    fn(_load(slug))
+    project = _load(slug)
+    _ensure_resolved(project)
+    fn(project)
 
 
 @app.command()
@@ -827,17 +926,17 @@ def voice(
     force: bool = typer.Option(
         False, "--force",
         help="Re-process every manifest entry (ignore the incoming-state cache) and "
-        "overwrite a human-edited timeline instead of writing a draft.",
+        "overwrite a human-edited cut instead of writing a draft.",
     ),
 ) -> None:
-    """Clean up narration pickups from voice/incoming/ and place them on the timeline.
+    """Clean up narration pickups from voice/incoming/ and place them in the cut.
 
     Reads voice/incoming/manifest.yaml (written as a draft on the first run if
-    missing), transcribes each WAV, cuts retakes/instructions/stutters/pauses,
-    trims to speech, and places the result at its narration request's beat or
-    an explicit anchor — growing the muted picture underneath (or pulling in
-    manifest broll_pool clips) when the pickup runs long. See
-    voice/incoming/report.md for what happened to each file.
+    missing, listing the cut's beats to choose from), transcribes each WAV,
+    cuts retakes/instructions/stutters/pauses, trims to speech, then inserts a
+    voice beat after the beat the manifest names (or the one its narration
+    request points at), taking its picture from the B-roll beats that follow.
+    See voice/incoming/report.md for what happened to each file.
     """
     from .ai.voice import VoiceError, run_voice
 
@@ -868,7 +967,7 @@ def voice(
         console.print(f"[green]wrote[/] {result['written']} (backup: {result['backup']})")
         if result["edited_by_human"] and not force:
             console.print(
-                "[yellow]timeline.json is human-edited[/] — review the draft, "
+                "[yellow]cut.json is human-edited[/] — review the draft, "
                 "or re-run with --force"
             )
 

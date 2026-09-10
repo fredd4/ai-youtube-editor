@@ -261,31 +261,19 @@ pacing:
   max_shot_seconds_late: 7.0
   pacing_switch_at: 360.0
   min_shot_seconds: 0.8
-  # Air around speech, enforced deterministically by `ytedit tidy` and at the
-  # end of every plan run (ytedit/ai/tidy.py). A cut is only ever moved
-  # outwards, never closer to a word.
+  # Air around speech. The resolver (ytedit/cut.py) gives every speech beat's
+  # picture this much air on each side, clamped only by the clip's own edges.
   speech_pad_before: 0.30      # seconds of air before the first word
   speech_pad_after: 0.45       # seconds of air after the last word
-  speech_snap_window: 0.6      # only pad when the cut is this close to speech
-  merge_gap: 0.15              # same-clip jump cuts closer than this are merged
-  # Sentence-boundary snapping: a cut that lands mid-sentence is extended to the
-  # end (or back to the start) of that sentence before the pad is applied.
-  sentence_gap_max: 1.2        # words further apart than this end the sentence
-  sentence_extend_max: 8.0     # most a sentence snap may add to one side of a cut
-  # Audio ledger dedupe (ytedit/ai/ledger.py): no audio may ever play twice.
-  audio_dupe_tolerance: 0.25   # overlap under this is not worth fixing
-  # Story-continuity cutaways (ytedit/ai/overlay.py: close_silent_interruptions).
-  # A muted cutaway run stranded between two speech pieces of the same take is
-  # never left silent: within this many seconds it is "filled" (the cutaways
-  # carry the narrator's own voice continuously); beyond it, a "J-cut" — the
-  # take is extended to the end of its sentence, then the cutaways carry the
-  # NEXT segment's opening words instead, so the thought always finishes
-  # before the picture cuts away.
-  story_fill_max_s: 10.0
-  # `ytedit tidy` (ytedit/ai/tidy.py) re-runs pad/snap -> overlay -> dedupe ->
-  # anchors until a full round changes nothing, up to this many rounds, then
-  # stops and reports whichever changes are still oscillating.
-  tidy_max_rounds: 4
+  # The *audio* never reaches a neighbouring word: the audible window stops
+  # word_guard seconds short of it and the extra picture renders silent
+  # (VideoSegment.audio_window). This is what guarantees a pause instead of
+  # replaying half a syllable.
+  word_guard: 0.05             # minimum clearance from a neighbouring word
+  # Warn when a real cut between two speech beats carries less total air than
+  # this (this beat's tail + the next beat's head) — usually a clip boundary
+  # eating into the pad, which no amount of padding can give back.
+  air_warn_below: 0.35
   # Structural beats (seconds). "end-20" = 20 s before the end.
   markers:
     - { at: 0.0, label: hook }
@@ -296,13 +284,13 @@ pacing:
     - { at: -20.0, label: payoff-cta }   # negative = relative to the end
 
 # Location cards (`ytedit captions`, ytedit/ai/locations.py): one card at
-# every genuinely new place, anchored to its segment so later padding/overlay/
-# dedupe passes never leave it drifting under the wrong shot.
+# every genuinely new place, placed on that place's first beat in cut.json so
+# it follows its picture however the cut is re-edited.
 captions:
   min_gap_s: 90.0          # don't re-card a place already shown this recently
   location_seconds: 2.4    # on-screen duration of a generated location card
-  card_offset_s: 0.3       # seconds after the segment's cut before the card appears
-  min_segment_s: 2.5       # a shorter segment defers the card to the next same-place one
+  card_offset_s: 0.3       # seconds after the beat's start before the card appears
+  min_segment_s: 2.5       # a shorter beat defers the card to the next same-place one
   skip_cold_open_s: 10.0   # no cards during the cold-open montage
   end_screen_s: 15.0       # nor in the closing seconds
   max_tokens: 16000        # writer call that normalizes footage-log place names

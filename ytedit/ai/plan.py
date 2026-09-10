@@ -1,54 +1,41 @@
-"""Edit planning: ``analysis/footage_log.json`` -> ``plan/edit_plan.json`` + timeline.
+"""Edit planning: ``analysis/footage_log.json`` -> ``plan/edit_plan.json`` + ``plan/cut.json``.
 
 The planner model (``models.planner``) reads the whole footage log and returns one
 compact JSON object (``plan.system`` in prompts.md): a story structure, a segment
-list and the cue sheets. It is never asked for a ``timeline.json`` document —
-:func:`build_timeline` derives that here — because everything the model returns is
-a *proposal*, re-derived deterministically so the non-negotiable rules of the
-playbook always hold, whatever the model said.
+list and the cue sheets. It is never asked for a timeline document —
+:func:`build_cut` derives ``plan/cut.json`` here — because everything the model
+returns is a *proposal*, re-derived deterministically so the non-negotiable rules
+of the playbook always hold, whatever the model said.
 
-Deterministic post-processing, in order:
+Since cut v2 (``docs/ARCHITECTURE.md``) the planner addresses speech by sentence
+id and never by seconds, and this module owns exactly one translation step:
+**planner segments -> beats**. Everything that used to police seconds here (speech
+padding, sentence snapping, overlay cutaways, the audio ledger, anchors, the
+``vo_`` WAV extraction) is gone: :func:`ytedit.cut.resolve` is now the only place
+where a sentence becomes a time, and it is what writes ``plan/timeline.json``.
 
-0. Consecutive planner segments that both carry ``voice_over`` for the same
-   clip, separated by a small gap, are merged into one segment first — a
-   planner that splits one narration take into two proposals must not produce
-   two overlapping audio extractions (see the merge pre-pass in
-   :func:`build_timeline`).
-1. Segments referencing unknown clips, or with ``in >= out``, are dropped;
-   ``in``/``out`` are clamped to the clip's real duration from ``state.json``.
-2. Every range the footage log marked as an **editor instruction** is excised
-   from every segment (segments split around it) — a spoken "put this at the
-   end" must never survive into the cut.
-3. The **last-take rule** is enforced: attempts a clip's analysis did not keep
-   are excised too, unless the planner deliberately kept that range as silent
-   B-roll (``mute_source: true``).
-4. Vertical clips get ``transform.fit = "blur-fill"`` unless the planner asked
-   for a specific fit.
-5. Structural **markers** come from ``pacing.markers`` in the settings, never
-   from the model (a negative ``at`` is relative to the end).
-6. Captions / music cues / chapters are clamped and de-overlapped, then
-   :meth:`Timeline.validate` runs and trivially fixable issues are fixed.
-7. :func:`ytedit.ai.tidy.pad_segments_to_speech` gives every speech cut ~0.3 s of
-   air before the first word and ~0.45 s after the last one, snaps a cut that
-   still lands mid-sentence out to that sentence's own boundary, and merges
-   same-clip jump cuts closer than ``pacing.merge_gap``.
-7b. :func:`ytedit.ai.overlay.overlay_cutaways` finds a cutaway (or a run of them)
-   dropped between two contiguous pieces of one take and gives it ``audio_from``
-   so the narration keeps running underneath the cutaway instead of stopping
-   dead; the continuation is moved (or, when too little is left of it, dropped).
-8. A segment carrying ``voice_over`` (playbook §3: post-trip narration clips) has
-   its own clip audio extracted into ``tracks.voice`` and is replaced on screen by
-   its ``picture`` cuts (``mute_source: true``); the voice item's position is
-   resolved only after step 7, since padding upstream can shift it. Speech
-   padding makes the narration audio longer than its picture cuts add up to;
-   the shortfall is covered by extending the picture cuts themselves (last cut
-   first) and only falls back to the narration clip's own face-cam picture
-   when the remainder is still a full shot (``pacing.min_shot_seconds``) —
-   never a sub-second flash back to the narrator (see
-   :func:`_build_voice_over_segment`).
+What :func:`build_cut` does, in order:
 
-A timeline with ``meta.edited_by_human`` never gets overwritten: the fresh draft
-goes to ``plan/timeline.draft.json`` for diffing (playbook §1.5).
+1. A segment carrying ``sentences`` becomes one or more **speech beats** — one per
+   contiguous run of ids, so a planner that jumps backwards or leaves a gap gets
+   split instead of silently mis-cut. ``cutaways[]`` become the beat's ``shots``
+   (``after`` = the sentence they follow); ``voice_over.picture[]`` becomes the
+   shots of an ``on_camera: false`` beat (the narrator is heard, not seen).
+2. A segment with no ``sentences`` is B-roll: a **broll beat** in raw seconds,
+   ``audio: "mute"`` when the planner asked for silence. Editor-instruction and
+   rejected-take ranges are still excised from those seconds (a segment split by
+   an instruction becomes several beats), and ranges are clamped to the clip.
+3. A segment that *looks* like speech but carries no ``sentences`` — words in its
+   range, not muted — is a **planner error**: :func:`plan` shows the model exactly
+   which segments broke the rule and asks once more (see
+   :class:`SpeechSecondsError`). There is no raw-seconds speech path any more.
+4. Captions, chapters, markers and music cues arrive from the planner in absolute
+   seconds; they are attached to the **beat** playing at that second
+   (:func:`ytedit.cut.beat_spans`), because a beat is the only position that
+   survives a re-cut.
+
+A cut with ``meta.edited_by_human`` never gets overwritten: the fresh draft goes to
+``plan/cut.draft.json`` for diffing (playbook §1.5).
 """
 
 from __future__ import annotations
@@ -56,44 +43,40 @@ from __future__ import annotations
 import json
 import re
 
-from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from ytedit.ai.openrouter import OpenRouter, OpenRouterError
 from ytedit.ai.prompts import render
-from ytedit.ai.ledger import dedupe_audio
-from ytedit.ai.overlay import overlay_cutaways
 from ytedit.ai.sentences import (
     compact_footage_log_for_planner,
     load_sentence_index,
     load_sentences,
     write_sentences,
 )
-from ytedit.ai.tidy import pad_segments_to_speech, sentence_snap_count
 from ytedit.config import Settings
 from ytedit.costs import charge
-from ytedit.log import get_logger
-from ytedit.media.ffmpeg import FFmpegError, ff
-from ytedit.project import Project, utcnow
-from ytedit.timeline import (
-    AnchorSignature,
-    AudioFrom,
-    Caption,
-    Chapter,
-    Duck,
-    Marker,
+from ytedit.cut import (
+    Beat as CutBeat,
+    Caption as CutCaption,
+    Chapter as CutChapter,
+    Cut,
+    Marker as CutMarker,
+    MusicCue as CutMusicCue,
     MuteRange,
-    MusicCue,
-    Timeline,
-    Transform,
-    Transition,
-    VideoSegment,
-    VoiceAnchor,
-    VoiceItem,
-    new_timeline,
+    Shot,
+    beat_at,
+    beat_spans,
+    cut_path,
+    load_cut,
+    resolve_verbose,
+    save_cut,
 )
+from ytedit.log import get_logger
+from ytedit.project import Project, utcnow
+from ytedit.timeline import Duck, Timeline, Transform, Transition
+from ytedit.words import load_words
 
 log = get_logger(__name__)
 
@@ -119,6 +102,43 @@ _EPS = 1e-6
 
 class PlanError(RuntimeError):
     """Raised when the plan stage cannot run (missing inputs, unusable output)."""
+
+
+class SpeechSecondsError(PlanError):
+    """The planner gave speech as raw seconds instead of sentence ids.
+
+    Since cut v2 there is no seconds path for narration: a segment whose range
+    covers transcript words but carries neither ``sentences`` nor
+    ``mute_source`` cannot be turned into a beat without guessing where a word
+    starts. Rather than guess, :func:`plan` shows the model exactly which
+    segments broke the rule (:meth:`prompt_note`) and asks once more; a second
+    failure surfaces as this error, which is a :class:`PlanError`.
+
+    Attributes:
+        segments: One human-readable line per offending segment.
+    """
+
+    def __init__(self, segments: Sequence[str]) -> None:
+        self.segments = list(segments)
+        super().__init__(
+            f"{len(self.segments)} planner segment(s) contain speech but no "
+            "`sentences` (cut v2 addresses narration by sentence id, never by "
+            "seconds): " + "; ".join(self.segments)
+        )
+
+    def prompt_note(self) -> str:
+        """The correction appended to the planner's user prompt on the retry."""
+        return (
+            "Your previous answer broke the hard rule about speech. These segments "
+            "give raw in/out seconds over a stretch of the clip where the narrator "
+            "is talking, but no `sentences`:\n"
+            + "\n".join(f"- {line}" for line in self.segments)
+            + "\nEvery segment carrying dialogue must list the contiguous sentence "
+            "ids from that clip's `sentences` inventory and omit in/out. Use in/out "
+            "only for B-roll, silent-broll, audio-only and cold-open picks — or set "
+            '"mute_source": true when you deliberately want that picture silent. '
+            "Return the whole JSON object again, fixed."
+        )
 
 
 # ----------------------------------------------------------------------
@@ -298,10 +318,10 @@ class VoiceOverPicture(_Lenient):
 class VoiceOver(_Lenient):
     """Optional voice-over routing for a segment (playbook §3: post-trip narration).
 
-    When present, :func:`build_timeline` uses the segment's own clip audio as a
-    narration pickup (``tracks.voice``) and shows ``picture`` cuts instead of the
-    segment's own footage — the narrator is heard, not seen, except where the
-    picture cuts fall short of the narration length.
+    When present the segment becomes an ``on_camera: false`` speech beat: the
+    clip's own audio still carries the narration, but ``picture`` cuts are what
+    the viewer sees. The narrator's own face only appears in a tail no picture
+    cut covers, which the resolver flags (``narrator_visible``).
     """
 
     picture: list[VoiceOverPicture] = Field(default_factory=list)
@@ -310,13 +330,11 @@ class VoiceOver(_Lenient):
 class PlanCutaway(_Lenient):
     """A picture-only insert placed after one sentence of a speech segment.
 
-    The narration audio underneath keeps running (see
-    :func:`_build_sentence_run_segments`): the cutaway's own audio is
-    replaced by the stretch of the speech segment's clip that would
-    otherwise have been skipped, exactly the semantics
-    ``ytedit/ai/overlay.py`` produces for a planner that (in the legacy,
-    raw-seconds regime) split one take into two contiguous pieces around a
-    cutaway.
+    Becomes a :class:`ytedit.cut.Shot` on the beat that owns
+    ``after_sentence``. The narration underneath never stops: a shot carries no
+    audio of its own by definition, so the take keeps playing while the picture
+    cuts away — which is why the planner must never fake a cutaway by splitting
+    one take into two segments with a gap.
     """
 
     clip: str = ""
@@ -325,21 +343,13 @@ class PlanCutaway(_Lenient):
     after_sentence: str = ""
 
 
-class PlanAudioFrom(_Lenient):
-    """Internal: where a synthetic (sentence-expanded) segment's audio comes from.
-
-    Not part of the planner-facing schema — set only by
-    :func:`_build_sentence_run_segments` when it expands a ``cutaways`` entry
-    into its own :class:`PlanSegment`.
-    """
-
-    clip: str = ""
-    in_: float = Field(0.0, alias="in")
-    out: float = 0.0
-
-
 class PlanSegment(_Lenient):
-    """A proposed video segment, before deterministic post-processing."""
+    """One proposal from the planner, on its way to becoming one or more beats.
+
+    ``sentences`` (speech) and ``in``/``out`` (B-roll, silent, cold-open) are
+    mutually exclusive: a segment carrying dialogue but no sentence ids is a
+    :class:`SpeechSecondsError`, not something to interpret.
+    """
 
     clip: str = ""
     in_: float = Field(0.0, alias="in")
@@ -355,17 +365,12 @@ class PlanSegment(_Lenient):
     speed: float = 1.0
     #: Post-trip narration routing (playbook §3); see :class:`VoiceOver`.
     voice_over: VoiceOver | None = None
-    #: Script-first speech routing: contiguous sentence ids of one clip: when
-    #: set, ``in``/``out`` above are ignored — :func:`build_timeline` derives
-    #: them from the sentence catalogue instead (see
-    #: :func:`_expand_sentence_segments`).
+    #: Script-first speech routing: contiguous sentence ids of one clip. When
+    #: set, ``in``/``out`` above are ignored entirely — the beat carries the ids
+    #: and :func:`ytedit.cut.resolve` is what turns them into seconds.
     sentences: list[str] = Field(default_factory=list)
     #: Optional picture-only inserts along ``sentences`` (see :class:`PlanCutaway`).
     cutaways: list[PlanCutaway] = Field(default_factory=list)
-    #: Internal only (never planner-facing): set by sentence-cutaway expansion
-    #: so a synthetic cutaway segment carries its borrowed audio through the
-    #: normal per-segment pipeline in :func:`build_timeline`.
-    audio_from: PlanAudioFrom | None = None
     notes: str = ""
 
 
@@ -721,55 +726,6 @@ def subtract_ranges(
     return [(s, e) for s, e in pieces if e - s > _EPS]
 
 
-def _merge_consecutive_voice_over(
-    segments: Sequence[PlanSegment], cfg: Settings
-) -> tuple[list[PlanSegment], int]:
-    """Merge consecutive same-clip ``voice_over`` segments into one.
-
-    A planner that proposes one narration take as two (or more) adjacent
-    segments — e.g. ``c211 1.7-12.2`` then ``c211 12.7-22.1`` — would otherwise
-    have each padded independently by :func:`_build_voice_over_segment`, and
-    the resulting WAVs overlap: the same syllable is extracted twice and heard
-    twice in the render. Segments are merged here, before any padding happens,
-    whenever they share a clip, both carry ``voice_over``, and the gap between
-    them is small enough that they clearly belong to the same take.
-
-    Args:
-        segments: The planner's segment list, in order.
-        cfg: Settings supplying the speech-padding and jump-cut-merge amounts
-            that size the merge gap.
-
-    Returns:
-        ``(merged_segments, merge_count)`` — ``merge_count`` is how many
-        segments were folded into a predecessor (a chain of three merged into
-        one counts as two), for ``stats["voice_over_merged"]``.
-    """
-    pad_before = max(0.0, float(cfg.get("pacing.speech_pad_before", 0.30)))
-    pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
-    merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
-    threshold = max(1.0, pad_before + pad_after + merge_gap)
-
-    merged: list[PlanSegment] = []
-    count = 0
-    for seg in segments:
-        prev = merged[-1] if merged else None
-        if (
-            prev is not None
-            and prev.voice_over is not None
-            and seg.voice_over is not None
-            and prev.clip == seg.clip
-            and (seg.in_ - prev.out) <= threshold + _EPS
-        ):
-            pictures = list(prev.voice_over.picture) + list(seg.voice_over.picture)
-            prev.voice_over = VoiceOver(picture=pictures)
-            prev.out = max(prev.out, seg.out)
-            prev.notes = " / ".join(n for n in (prev.notes, seg.notes) if n)
-            count += 1
-            continue
-        merged.append(seg)
-    return merged, count
-
-
 # ----------------------------------------------------------------------
 # script-first speech: sentence-id segments (see ytedit/ai/sentences.py)
 # ----------------------------------------------------------------------
@@ -805,202 +761,330 @@ def _contiguous_sentence_runs(
     return runs
 
 
-def _build_sentence_run_segments(
-    seg: PlanSegment,
-    run: list[str],
-    sentence_index: Mapping[str, dict[str, Any]],
-    cutaways: Sequence[PlanCutaway],
-    pad_before: float,
-    pad_after: float,
-    stats: dict[str, Any],
-) -> tuple[list[PlanSegment], set[str]]:
-    """Expand one contiguous sentence run (plus any cutaways inside it).
-
-    Splits ``run`` at every ``cutaway.after_sentence`` that falls inside it,
-    in run order, emitting: a speech piece ending exactly at the split
-    sentence (no trailing pad — the narration continues under the cutaway), a
-    synthetic cutaway :class:`PlanSegment` carrying ``audio_from`` over the
-    stretch of ``seg.clip`` the cutaway covers, then the next piece resuming
-    exactly where that borrowed audio ends. Only the very first piece gets a
-    leading pad; only the very last piece gets a trailing one.
-
-    Returns:
-        ``(segments, matched_after_sentence_ids)`` — the second lets the
-        caller report any of ``cutaways`` that named a sentence outside this
-        run (or this segment altogether) as dropped.
-    """
-    clip_id = str(sentence_index[run[0]].get("clip", seg.clip))
-    ordered_cutaways = sorted(
-        (c for c in cutaways if c.after_sentence in run),
-        key=lambda c: run.index(c.after_sentence),
+# ----------------------------------------------------------------------
+# planner segments -> beats
+# ----------------------------------------------------------------------
+def _clip_is_vertical(clip: Mapping[str, Any]) -> bool:
+    """True when a clip registry entry describes portrait footage."""
+    return str(clip.get("orientation", "")).lower() == "vertical" or (
+        int(clip.get("height") or 0) > int(clip.get("width") or 0) > 0
     )
-    matched = {c.after_sentence for c in ordered_cutaways}
 
-    result: list[PlanSegment] = []
-    remaining = list(run)
-    audio_cursor = 0.0
-    first_piece = True
 
-    def emit_piece(ids: list[str], is_last: bool) -> None:
-        nonlocal first_piece
-        first_s = float(sentence_index[ids[0]]["s"])
-        last_e = float(sentence_index[ids[-1]]["e"])
-        piece_in = round(max(0.0, first_s - pad_before), 3) if first_piece else round(audio_cursor, 3)
-        piece_out = round(last_e + pad_after, 3) if is_last else round(last_e, 3)
-        new_seg = seg.model_copy(deep=True)
-        new_seg.clip = clip_id
-        new_seg.in_ = piece_in
-        new_seg.out = piece_out
-        new_seg.sentences = list(ids)
-        new_seg.cutaways = []
-        new_seg.audio_from = None
-        result.append(new_seg)
-        first_piece = False
+def _fit_for(
+    seg: PlanSegment, clip_id: str, clip: Mapping[str, Any], default_fit: str,
+    stats: dict[str, Any],
+) -> str:
+    """The planner's ``fit``, or the vertical-clip rule when it did not care."""
+    fit = seg.fit
+    if fit is None:
+        if _clip_is_vertical(clip):
+            fit = default_fit
+            if clip_id not in stats["vertical_fixed"]:
+                stats["vertical_fixed"].append(clip_id)
+        else:
+            fit = "cover"
+    if fit not in ("cover", "contain", "blur-fill", "crop-pan"):
+        fit = "cover"
+    return fit
 
-    for cutaway in ordered_cutaways:
-        split_at = remaining.index(cutaway.after_sentence)
-        piece_ids, remaining = remaining[: split_at + 1], remaining[split_at + 1 :]
-        if not piece_ids:
+
+def _beat_common(
+    seg: PlanSegment, fit: str, first: bool
+) -> dict[str, Any]:
+    """The fields every beat of one planner segment shares.
+
+    ``transition_in`` rides on the *first* beat a segment produces only: a
+    segment split into several beats (a non-contiguous sentence run, an
+    instruction range excised out of B-roll) is one editorial move on screen,
+    so the fade belongs to its opening frame and nowhere else.
+    """
+    return {
+        "role": seg.role or "",
+        "notes": seg.notes or "",
+        "transform": Transform(fit=fit, zoom=max(1.0, _num(seg.zoom, 1.0))),
+        "grade": seg.grade or "default",
+        "transition_in": _transition(seg.transition_in) if first else Transition(),
+    }
+
+
+def _shot_from_cutaway(
+    cutaway: PlanCutaway, clips: Mapping[str, Any], default_fit: str,
+    after: str | None, stats: dict[str, Any],
+) -> Shot | None:
+    """One ``cutaways[]``/``voice_over.picture[]`` entry as a :class:`Shot`.
+
+    Returns ``None`` (with a ``dropped_cutaways`` stat) for an unknown clip or
+    an empty range — a shot that cannot show a frame is worse than no shot,
+    because the resolver would stretch its neighbour over the hole.
+    """
+    clip_id = str(cutaway.clip)
+    clip = clips.get(clip_id)
+    where = f"after {after}" if after else "at the beat start"
+    if clip is None:
+        stats["dropped_cutaways"].append(f"{where}: unknown clip {clip_id!r}")
+        return None
+    start, end = float(cutaway.in_), float(cutaway.out)
+    duration = float(clip.get("duration") or 0.0)
+    if duration > 0:
+        start, end = max(0.0, min(start, duration)), max(0.0, min(end, duration))
+    if end - start <= _EPS:
+        stats["dropped_cutaways"].append(
+            f"{where}: empty range {clip_id} {cutaway.in_:.2f}-{cutaway.out:.2f}"
+        )
+        return None
+    return Shot(
+        clip=clip_id,
+        **{"in": round(start, 3)},
+        out=round(end, 3),
+        after=after,
+        transform=Transform(fit=_clip_is_vertical(clip) and default_fit or "cover"),
+    )
+
+
+def _valid_sentences(
+    seg: PlanSegment,
+    sentence_index: Mapping[str, dict[str, Any]],
+    used: dict[str, str],
+    label: str,
+    stats: dict[str, Any],
+) -> list[str]:
+    """Filter one segment's sentence references down to the usable ones.
+
+    Unknown ids and ids already spent elsewhere in the plan are dropped (the
+    resolver would error on a sentence used twice, and a plan that errors is a
+    plan the user cannot look at). An ``instruction`` id is dropped outright — a
+    spoken "cut this" must never reach the cut. A ``retake_of``/``duplicate_of``
+    id is **kept**: the catalogue's detection of those is heuristic, so
+    overriding it is the editor's call, and dropping the sentence silently
+    would delete narration the planner deliberately chose. It is recorded in
+    ``flagged_sentence_refs`` instead, which the edit-plan report prints.
+    """
+    valid: list[str] = []
+    for sid in seg.sentences:
+        info = sentence_index.get(sid)
+        if info is None:
+            stats["unknown_sentence_refs"].append(sid)
             continue
-        emit_piece(piece_ids, is_last=False)
-        audio_cursor = result[-1].out
-        cut_clip = str(cutaway.clip)
-        cut_in, cut_out = float(cutaway.in_), float(cutaway.out)
-        if not cut_clip or cut_out <= cut_in + _EPS:
-            stats["dropped_cutaways"].append(
-                f"after {cutaway.after_sentence}: bad cutaway ({cut_clip!r} "
-                f"{cut_in:.2f}-{cut_out:.2f})"
+        if sid in used:
+            stats["duplicate_sentence_refs"].append(f"{sid} (already in {used[sid]})")
+            continue
+        if info.get("instruction"):
+            stats["excluded_sentence_refs"].append(f"{sid} (instruction)")
+            continue
+        if info.get("retake_of"):
+            stats["flagged_sentence_refs"].append(f"{sid} (retake_of {info['retake_of']})")
+        elif info.get("duplicate_of"):
+            stats["flagged_sentence_refs"].append(
+                f"{sid} (duplicate_of {info['duplicate_of']})"
             )
-            continue
-        duration = cut_out - cut_in
-        result.append(
-            PlanSegment(
-                clip=cut_clip,
-                **{"in": cut_in},
-                out=cut_out,
-                role="cutaway",
-                audio_from=PlanAudioFrom(
-                    clip=clip_id, **{"in": audio_cursor}, out=round(audio_cursor + duration, 3)
-                ),
-                notes=f"cutaway after {cutaway.after_sentence}",
+        used[sid] = label
+        valid.append(sid)
+    return valid
+
+
+def _speech_beats(
+    seg: PlanSegment,
+    valid_ids: list[str],
+    sentence_index: Mapping[str, dict[str, Any]],
+    clips: Mapping[str, Any],
+    default_fit: str,
+    stats: dict[str, Any],
+) -> list[CutBeat]:
+    """Turn one planner speech segment into its beats.
+
+    One beat per contiguous run of sentence ids: the resolver refuses a beat
+    whose ids skip a number, and a jump backwards in one segment is the
+    planner mis-reading its own inventory, not an edit.
+
+    ``voice_over`` flips the whole segment off camera — the narrator is heard
+    while its ``picture`` cuts play — and those cuts become the shots of the
+    *first* beat, because picture cuts carry no sentence to hang the rest off.
+    Otherwise each ``cutaways[]`` entry becomes a shot on whichever run owns
+    the sentence it names.
+    """
+    clip_id = str(sentence_index[valid_ids[0]].get("clip", seg.clip))
+    clip = clips.get(clip_id, {})
+    fit = _fit_for(seg, clip_id, clip, default_fit, stats)
+    off_camera = seg.voice_over is not None
+
+    runs = _contiguous_sentence_runs(valid_ids, sentence_index)
+    if len(runs) > 1:
+        stats["non_contiguous_splits"] += len(runs) - 1
+
+    beats: list[CutBeat] = []
+    matched: set[str] = set()
+    for index, run in enumerate(runs):
+        shots: list[Shot] = []
+        if off_camera:
+            if index == 0:
+                for picture in seg.voice_over.picture:  # type: ignore[union-attr]
+                    shot = _shot_from_cutaway(
+                        PlanCutaway(
+                            clip=picture.clip, **{"in": picture.in_}, out=picture.out
+                        ),
+                        clips, default_fit, None, stats,
+                    )
+                    if shot is not None:
+                        shots.append(shot)
+            elif len(runs) > 1:
+                stats["voice_over_split"] += 1
+        else:
+            for cutaway in seg.cutaways:
+                if cutaway.after_sentence not in run:
+                    continue
+                matched.add(cutaway.after_sentence)
+                shot = _shot_from_cutaway(
+                    cutaway, clips, default_fit, cutaway.after_sentence, stats
+                )
+                if shot is not None:
+                    shots.append(shot)
+            shots.sort(key=lambda s: run.index(str(s.after)))
+
+        beats.append(
+            CutBeat(
+                kind="speech",
+                clip=clip_id,
+                sentences=list(run),
+                on_camera=not off_camera,
+                shots=shots,
+                gain_db=_num(seg.source_audio_gain_db, 0.0),
+                **_beat_common(seg, fit, first=index == 0),
             )
         )
-        audio_cursor = round(audio_cursor + duration, 3)
 
-    if remaining:
-        emit_piece(remaining, is_last=True)
-    return result, matched
-
-
-def _expand_sentence_segments(
-    segments: Sequence[PlanSegment],
-    sentence_index: Mapping[str, dict[str, Any]],
-    cfg: Settings,
-    stats: dict[str, Any],
-) -> list[PlanSegment]:
-    """Turn every ``sentences``-carrying segment into raw-seconds segments.
-
-    A segment without ``sentences`` passes through unchanged (the legacy,
-    raw-``in``/``out`` shape keeps working exactly as before). One with
-    ``sentences`` is validated against ``sentence_index`` (unknown, already
-    used, or excluded — instruction / retake / duplicate — ids are dropped
-    with a stat) and split into contiguous same-clip runs; each run becomes
-    one or more :class:`PlanSegment`\\ s via
-    :func:`_build_sentence_run_segments`.
-
-    ``used_sentence_ids`` is tracked across the *whole* call (not per
-    segment) so a sentence referenced twice anywhere in the plan is only kept
-    the first time — see ``stats["duplicate_sentence_refs"]``.
-    """
-    pad_before = max(0.0, float(cfg.get("pacing.speech_pad_before", 0.30)))
-    pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
-    used: set[str] = set()
-    out: list[PlanSegment] = []
-
-    for seg in segments:
-        if not seg.sentences:
-            out.append(seg)
-            continue
-
-        valid_ids: list[str] = []
-        for sid in seg.sentences:
-            info = sentence_index.get(sid)
-            if info is None:
-                stats["unknown_sentence_refs"].append(sid)
-                continue
-            if sid in used:
-                stats["duplicate_sentence_refs"].append(sid)
-                continue
-            if info.get("instruction"):
-                stats["excluded_sentence_refs"].append(f"{sid} (instruction)")
-                continue
-            if info.get("retake_of"):
-                stats["excluded_sentence_refs"].append(
-                    f"{sid} (retake_of {info['retake_of']})"
-                )
-                continue
-            if info.get("duplicate_of"):
-                stats["excluded_sentence_refs"].append(
-                    f"{sid} (duplicate_of {info['duplicate_of']})"
-                )
-                continue
-            used.add(sid)
-            valid_ids.append(sid)
-
-        if not valid_ids:
-            continue
-
-        runs = _contiguous_sentence_runs(valid_ids, sentence_index)
-        if len(runs) > 1:
-            stats["non_contiguous_splits"] += len(runs) - 1
-
-        matched_after: set[str] = set()
-        for run in runs:
-            built, matched = _build_sentence_run_segments(
-                seg, run, sentence_index, seg.cutaways, pad_before, pad_after, stats
-            )
-            out.extend(built)
-            matched_after |= matched
+    if off_camera:
+        stats["voice_over_segments"] += 1
         for cutaway in seg.cutaways:
-            if cutaway.after_sentence and cutaway.after_sentence not in matched_after:
+            stats["dropped_cutaways"].append(
+                f"after {cutaway.after_sentence}: voice-over segment "
+                "(picture comes from voice_over.picture)"
+            )
+    else:
+        for cutaway in seg.cutaways:
+            if cutaway.after_sentence and cutaway.after_sentence not in matched:
                 stats["dropped_cutaways"].append(
                     f"after {cutaway.after_sentence}: sentence not in this segment"
                 )
-        stats["sentence_segments"] += 1
+    stats["sentence_segments"] += 1
+    return beats
 
-    return out
+
+def _broll_beats(
+    seg: PlanSegment,
+    clip_id: str,
+    clip: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    default_fit: str,
+    min_shot: float,
+    stats: dict[str, Any],
+) -> list[CutBeat]:
+    """Turn one planner B-roll segment into beats, minus what must never air.
+
+    Spoken editor instructions are excised from every range (a "put this at the
+    end" that survives into the cut is the one defect nobody forgives), and so
+    are the take attempts the analysis rejected — unless the planner asked for
+    the picture silent on purpose, which is exactly how a rejected take is
+    legitimately reused as B-roll (playbook §3). One range cut in two produces
+    two beats.
+    """
+    start, end = float(seg.in_), float(seg.out)
+    duration = float(clip.get("duration") or 0.0)
+    if duration > 0:
+        clamped_s = max(0.0, min(start, duration))
+        clamped_e = max(0.0, min(end, duration))
+        if abs(clamped_s - start) > 1e-3 or abs(clamped_e - end) > 1e-3:
+            stats["clamped"].append(
+                f"{clip_id} {start:.2f}-{end:.2f} -> {clamped_s:.2f}-{clamped_e:.2f}"
+            )
+        start, end = clamped_s, clamped_e
+    if end - start <= _EPS:
+        stats["dropped_empty"].append(f"{clip_id} {seg.in_:.2f}-{seg.out:.2f}")
+        return []
+
+    cuts = list(instruction_ranges(entry))
+    if cuts:
+        stats["instruction_cuts"] += 1
+    if not seg.mute_source:
+        take_cuts = rejected_take_ranges(entry)
+        if take_cuts:
+            stats["take_cuts"] += 1
+        cuts += take_cuts
+
+    pieces = subtract_ranges((start, end), cuts)
+    if len(pieces) > 1:
+        stats["split_segments"] += 1
+
+    fit = _fit_for(seg, clip_id, clip, default_fit, stats)
+    beats: list[CutBeat] = []
+    for piece_s, piece_e in pieces:
+        if piece_e - piece_s < min_shot:
+            stats["dropped_too_short"].append(f"{clip_id} {piece_s:.2f}-{piece_e:.2f}")
+            continue
+        beats.append(
+            CutBeat(
+                kind="broll",
+                clip=clip_id,
+                **{"in": round(piece_s, 3)},
+                out=round(piece_e, 3),
+                audio="mute" if seg.mute_source else "ambient",
+                **_beat_common(seg, fit, first=not beats),
+            )
+        )
+    return beats
+
+
+def _has_words(project: Project, clip_id: str, start: float, end: float) -> bool:
+    """True when a clip's transcript has any word inside ``[start, end)``."""
+    return any(
+        word.e > start + _EPS and word.s < end - _EPS
+        for word in load_words(project, clip_id)
+    )
 
 
 # ----------------------------------------------------------------------
-# timeline construction
+# cut construction
 # ----------------------------------------------------------------------
-def build_timeline(
+def build_cut(
     plan_obj: EditPlan,
     project: Project,
     footage_log: dict[str, Any],
     settings: Settings | None = None,
-) -> tuple[Timeline, dict[str, Any]]:
-    """Turn a planner proposal into a validated :class:`Timeline`.
+) -> tuple[Cut, dict[str, Any]]:
+    """Turn a planner proposal into ``plan/cut.json`` — the source of truth.
+
+    This is the only translation between what the model proposed and the edit
+    model of ``docs/ARCHITECTURE.md``. It produces beats, never seconds of
+    speech: the sentence ids travel through untouched and
+    :func:`ytedit.cut.resolve` decides where the words start.
 
     Args:
         plan_obj: The normalized planner output.
-        project: Project supplying the clip registry (durations, orientation).
-        footage_log: Merged analysis used for instruction / take / music rules.
+        project: Project supplying the clip registry, the sentence catalogue
+            and the transcripts.
+        footage_log: Merged analysis used for the instruction / take / music
+            rules.
         settings: Settings override (defaults to ``project.settings``).
 
     Returns:
-        ``(timeline, stats)`` where ``stats`` records what the post-processor
-        changed — dropped segments, excised instruction ranges, take cuts.
+        ``(cut, stats)`` where ``stats`` records every deterministic decision —
+        dropped segments, excised instruction ranges, flagged sentence ids,
+        the resolver's own findings — for ``plan/edit_plan.md``.
+
+    Raises:
+        SpeechSecondsError: When a segment covers transcript words but carries
+            no ``sentences`` and is not deliberately muted. :func:`plan` turns
+            this into one retry of the planner call.
     """
     cfg = settings or project.settings
     width, height, fps = cfg.canvas
-    timeline = new_timeline(width=width, height=height, fps=fps, language=project.language)
 
     state = project.load_state()
     clips: dict[str, dict[str, Any]] = state.get("clips", {})
     entries = _entries_by_clip(footage_log)
     min_shot = float(cfg.get("pacing.min_shot_seconds", 0.8))
     default_fit = str(cfg.get("fit.default_mode", "blur-fill"))
+    sentence_index = load_sentence_index(project)
 
     stats: dict[str, Any] = {
         "segments_in": len(plan_obj.segments),
@@ -1013,551 +1097,99 @@ def build_timeline(
         "vertical_fixed": [],
         "dropped_too_short": [],
         "voice_over_segments": 0,
-        "voice_over_merged": 0,
-        "voice_over_dropped": [],
-        "voice_over_dropped_picture": 0,
+        "voice_over_split": 0,
         # -- script-first (sentence-referenced) speech, see ai/sentences.py --
         "sentence_segments": 0,
         "unknown_sentence_refs": [],
         "duplicate_sentence_refs": [],
         "excluded_sentence_refs": [],
+        "flagged_sentence_refs": [],
         "non_contiguous_splits": 0,
         "dropped_cutaways": [],
     }
 
-    #: One entry per ``voice_over`` segment: the extracted-audio metadata plus the
-    #: (mutable) list of picture-cut ``VideoSegment`` objects standing in for it.
-    #: Positions are resolved from these object references *after* tidy's speech
-    #: padding, because padding upstream can shift every later segment's start.
-    voice_groups: list[dict[str, Any]] = []
+    beats: list[CutBeat] = []
+    used_sentences: dict[str, str] = {}
+    speech_in_seconds: list[str] = []
 
-    sentence_index = load_sentence_index(project)
-    segments, stats["voice_over_merged"] = _merge_consecutive_voice_over(
-        plan_obj.segments, cfg
-    )
-    segments = _expand_sentence_segments(segments, sentence_index, cfg, stats)
+    for index, seg in enumerate(plan_obj.segments):
+        label = f"segment #{index + 1}"
+        if seg.sentences:
+            valid_ids = _valid_sentences(seg, sentence_index, used_sentences, label, stats)
+            if not valid_ids:
+                continue
+            beats += _speech_beats(
+                seg, valid_ids, sentence_index, clips, default_fit, stats
+            )
+            continue
 
-    video: list[VideoSegment] = []
-    for index, seg in enumerate(segments):
         clip_id = str(seg.clip)
         clip = clips.get(clip_id)
         if clip is None:
             stats["dropped_unknown_clip"].append(clip_id or f"#{index}")
             continue
-
-        duration = float(clip.get("duration") or 0.0)
-        start, end = float(seg.in_), float(seg.out)
-        if duration > 0:
-            clamped_s = max(0.0, min(start, duration))
-            clamped_e = max(0.0, min(end, duration))
-            if abs(clamped_s - start) > 1e-3 or abs(clamped_e - end) > 1e-3:
-                stats["clamped"].append(
-                    f"{clip_id} {start:.2f}-{end:.2f} -> {clamped_s:.2f}-{clamped_e:.2f}"
-                )
-            start, end = clamped_s, clamped_e
-        if end - start <= _EPS:
-            stats["dropped_empty"].append(f"{clip_id} {seg.in_:.2f}-{seg.out:.2f}")
+        if not seg.mute_source and _has_words(project, clip_id, float(seg.in_), float(seg.out)):
+            speech_in_seconds.append(
+                f"{label}: {clip_id} {seg.in_:.2f}-{seg.out:.2f} "
+                f"(role {seg.role or '—'}, notes {seg.notes or '—'})"
+            )
             continue
+        beats += _broll_beats(
+            seg, clip_id, clip, entries.get(clip_id, {}), default_fit, min_shot, stats
+        )
 
-        entry = entries.get(clip_id, {})
+    if speech_in_seconds:
+        raise SpeechSecondsError(speech_in_seconds)
 
-        if seg.voice_over is not None:
-            added = _build_voice_over_segment(
-                seg=seg,
-                clip_id=clip_id,
-                clip=clip,
-                clips=clips,
-                seg_in=start,
-                seg_out=end,
-                entry=entry,
-                cfg=cfg,
-                project=project,
-                default_fit=default_fit,
-                video=video,
-                voice_groups=voice_groups,
-                stats=stats,
-            )
-            if not added:
-                stats["voice_over_dropped"].append(f"{clip_id} {start:.2f}-{end:.2f}")
-            continue
+    cut = Cut(
+        fps=fps,
+        width=width,
+        height=height,
+        language=project.language,
+        beats=beats,
+        mute_ranges=_build_mute_ranges(plan_obj, footage_log, clips),
+    )
+    cut.renumber()
+    if cut.beats:
+        # Nothing to fade in from at the very top of the programme.
+        cut.beats[0].transition_in = Transition(type="cut", duration=0.0)
 
-        cuts: list[tuple[float, float]] = []
-        if seg.audio_from is None:
-            # A synthetic cutaway carrying borrowed audio is already an exact,
-            # deterministically-computed range (see
-            # _build_sentence_run_segments) — excising instructions/rejected
-            # takes from it would risk splitting its audio_from mapping.
-            cuts = list(instruction_ranges(entry))
-            if cuts:
-                stats["instruction_cuts"] += 1
-            # Silent B-roll keeps rejected takes on purpose (playbook §3).
-            if not seg.mute_source:
-                take_cuts = rejected_take_ranges(entry)
-                if take_cuts:
-                    stats["take_cuts"] += 1
-                cuts += take_cuts
+    # Everything below is positioned by beat, so the geometry has to exist
+    # first: one resolve pass answers "what is playing at 41.2 s" for the
+    # captions, the chapters, the markers and the music beds alike.
+    spans, issues = beat_spans(project, cut)
+    total = max((end for _start, end in spans.values()), default=0.0)
+    stats["validation_issues"] = [str(issue) for issue in issues]
+    for beat in cut.beats:
+        span = spans.get(beat.uid)
+        if span is not None and beat.transition_in.duration > span[1] - span[0]:
+            beat.transition_in = Transition(type="cut", duration=0.0)
 
-        pieces = subtract_ranges((start, end), cuts)
-        if len(pieces) > 1:
-            stats["split_segments"] += 1
+    cut.captions = _build_captions(plan_obj, cut, spans, total)
+    cut.music = _build_music(plan_obj, cut, spans, total, cfg)
+    cut.chapters = _build_chapters(plan_obj, cut, spans, total)
+    cut.markers = _build_markers(cfg, cut, spans, total, plan_obj)
 
-        fit = seg.fit
-        if fit is None:
-            vertical = str(clip.get("orientation", "")).lower() == "vertical" or (
-                int(clip.get("height") or 0) > int(clip.get("width") or 0) > 0
-            )
-            fit = default_fit if vertical else "cover"
-            if vertical:
-                stats["vertical_fixed"].append(clip_id)
-        if fit not in ("cover", "contain", "blur-fill", "crop-pan"):
-            fit = "cover"
+    cut.meta.generated_by = f"plan@{utcnow()}"
+    cut.meta.edited_by_human = False
+    cut.meta.title_candidates = list(plan_obj.title_candidates)
+    cut.meta.notes = plan_obj.story.premise or ""
 
-        # A single piece (guaranteed when audio_from is set, since cuts is
-        # then empty) carries the whole borrowed-audio range unchanged; a
-        # segment excised into several pieces would otherwise need the range
-        # split proportionally, which never happens here in practice.
-        audio_from = None
-        if seg.audio_from is not None and len(pieces) == 1:
-            audio_from = AudioFrom(
-                clip=str(seg.audio_from.clip),
-                **{"in": float(seg.audio_from.in_)},
-                out=float(seg.audio_from.out),
-            )
-
-        for piece_s, piece_e in pieces:
-            if piece_e - piece_s < min_shot:
-                stats["dropped_too_short"].append(f"{clip_id} {piece_s:.2f}-{piece_e:.2f}")
-                continue
-            video.append(
-                VideoSegment(
-                    id="",  # assigned below, once the final order is known
-                    clip=clip_id,
-                    **{"in": round(piece_s, 3)},
-                    out=round(piece_e, 3),
-                    role=seg.role or "",
-                    transform=Transform(fit=fit, zoom=max(1.0, _num(seg.zoom, 1.0))),
-                    grade=seg.grade or "default",
-                    transition_in=_transition(seg.transition_in),
-                    speed=seg.speed if seg.speed and seg.speed > 0 else 1.0,
-                    mute_source=bool(seg.mute_source),
-                    source_audio_gain_db=_num(seg.source_audio_gain_db, 0.0),
-                    audio_from=audio_from,
-                    sentence_ids=list(seg.sentences) if seg.sentences else [],
-                    notes=seg.notes or "",
-                )
-            )
-
-    for i, segment in enumerate(video):
-        segment.id = f"s{i + 1:03d}"
-    # A transition cannot be longer than the shot it enters, and the first
-    # segment never transitions in from anything.
-    if video:
-        video[0].transition_in = Transition(type="cut", duration=0.0)
-    for segment in video:
-        if segment.transition_in.duration > segment.duration:
-            segment.transition_in = Transition(type="cut", duration=0.0)
-    timeline.tracks.video = video
-
-    # 7. Give every speech cut its air back and merge same-clip jump cuts; the
-    #    model is told to leave room but the deterministic pass is what enforces
-    #    it (see ytedit/ai/tidy.py). Ids are re-assigned because a merge drops one.
-    timeline, padded = pad_segments_to_speech(timeline, project, cfg)
-    stats["padded"] = padded
-    stats["sentence_snapped"] = sentence_snap_count(padded)
-    for i, segment in enumerate(timeline.tracks.video):
-        segment.id = f"s{i + 1:03d}"
-
-    # 7b. A cutaway dropped between two contiguous pieces of one take keeps the
-    #     narration running underneath it (ytedit/ai/overlay.py). Ids are
-    #     re-assigned again because the pass can drop the continuation segment.
-    timeline, overlaid = overlay_cutaways(timeline, project, cfg)
-    stats["overlaid"] = overlaid
-    # 7c. No audio twice: whatever the planner and the passes above produced,
-    #     a stretch of narration already heard is muted or advanced past.
-    timeline, dedupe_changes = dedupe_audio(timeline, project, cfg)
-    stats["deduped"] = len(dedupe_changes)
-    for i, segment in enumerate(timeline.tracks.video):
-        segment.id = f"s{i + 1:03d}"
-    video = timeline.tracks.video
-
-    total = timeline.duration()
-    stats["segments_out"] = len(video)
+    stats["beats_out"] = len(cut.beats)
     stats["duration_s"] = total
-
-    # Voice items are placed only now: their absolute position is wherever their
-    # picture-cut segments (tracked by object identity) landed after padding, not
-    # where they were provisionally laid out before earlier segments could grow.
-    timeline.tracks.voice, stats["voice_over_items"] = _build_voice_items(timeline, voice_groups)
-    # The items above are already placed at their anchor segment's current
-    # position, but resolving here too means a plan that later gets loaded and
-    # re-tidied is bootstrapped in the same anchored state (harmless no-op now).
-    timeline.resolve_anchors()
-
-    timeline.mute_ranges = _build_mute_ranges(plan_obj, footage_log, clips)
-    timeline.markers = _build_markers(cfg, total, plan_obj)
-    timeline.tracks.captions = _build_captions(plan_obj, total)
-    timeline.tracks.music = _build_music(plan_obj, total, cfg)
-    timeline.chapters = _build_chapters(plan_obj, total)
-
-    timeline.meta.generated_by = f"plan@{utcnow()}"
-    timeline.meta.edited_by_human = False
-    timeline.meta.title_candidates = list(plan_obj.title_candidates)
-    timeline.meta.notes = plan_obj.story.premise or ""
-
-    issues = timeline.validate(project)
-    fixed, remaining = _fix_trivial_issues(timeline, project, issues)
-    stats["validation_fixed"] = fixed
-    stats["validation_issues"] = remaining
-    return timeline, stats
+    return cut, stats
 
 
 # ----------------------------------------------------------------------
-# voice-over segments (playbook §3: post-trip narration clips)
+# absolute tracks -> beat references
 # ----------------------------------------------------------------------
 def _vertical_fit(clip: dict[str, Any], default_fit: str) -> str:
-    """Apply the vertical-clip fit rule (playbook §3) to one clip registry entry."""
-    vertical = str(clip.get("orientation", "")).lower() == "vertical" or (
-        int(clip.get("height") or 0) > int(clip.get("width") or 0) > 0
-    )
-    return default_fit if vertical else "cover"
+    """Apply the vertical-clip fit rule (playbook §3) to one clip registry entry.
 
-
-def _voice_over_audio_range(
-    entry: dict[str, Any],
-    clip_duration: float,
-    seg_in: float,
-    seg_out: float,
-    pad_before: float,
-    pad_after: float,
-) -> tuple[float, float]:
-    """Compute the clip-time ``[start, end]`` range to extract as narration audio.
-
-    Pads ``[seg_in, seg_out]`` by the configured speech padding, clamped to the
-    clip and never crossing an excised editor instruction or a rejected take —
-    the same ranges :func:`build_timeline` cuts around for ordinary segments.
+    Kept as a public-ish helper because ``ytedit.ai.voice`` picks the fit of a
+    pickup's shots the same way and must not re-derive the rule.
     """
-    start = max(0.0, seg_in - pad_before)
-    end = seg_out + pad_after
-    if clip_duration > 0:
-        end = min(end, clip_duration)
-    if end - start <= _EPS:
-        return round(max(0.0, seg_in), 3), round(max(0.0, seg_out), 3)
-
-    cuts = list(instruction_ranges(entry)) + list(rejected_take_ranges(entry))
-    pieces = subtract_ranges((start, end), cuts)
-    for piece_s, piece_e in pieces:
-        if piece_s <= seg_in + _EPS and piece_e >= seg_out - _EPS:
-            return round(piece_s, 3), round(piece_e, 3)
-
-    best: tuple[float, float] | None = None
-    best_overlap = 0.0
-    for piece_s, piece_e in pieces:
-        overlap = min(piece_e, seg_out) - max(piece_s, seg_in)
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best = (piece_s, piece_e)
-    if best is not None:
-        return round(best[0], 3), round(best[1], 3)
-    # Nothing survived the cuts (the whole padded span was excised) — fall back to
-    # the segment's own bounds, unpadded, rather than dropping the narration.
-    return round(max(0.0, seg_in), 3), round(max(0.0, seg_out), 3)
-
-
-def _voice_source_audio(project: Project, clip: dict[str, Any], clip_id: str) -> Path:
-    """The work WAV to cut narration audio from — denoised when active.
-
-    Mirrors :func:`ytedit.media.render.denoised_audio`, re-read here rather than
-    imported to keep the plan stage free of the heavier render-module imports.
-    """
-    if clip.get("use_denoised") and clip.get("denoised"):
-        candidate = project.path / str(clip["denoised"])
-        if candidate.exists():
-            return candidate
-    return project.audio_path(clip_id)
-
-
-def _extract_voice_clip(audio_src: Path, start: float, end: float, out_path: Path) -> None:
-    """Cut ``[start, end)`` from ``audio_src`` into ``out_path`` (idempotent)."""
-    if out_path.exists():
-        return
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    duration = max(0.0, end - start)
-    ff(
-        "-ss", f"{start:.6f}",
-        "-i", str(audio_src),
-        "-t", f"{duration:.6f}",
-        "-ar", "48000",
-        "-ac", "1",
-        "-c:a", "pcm_s16le",
-        str(out_path),
-    )
-
-
-def _extend_picture_cuts(
-    group_segments: list[VideoSegment], shortfall: float, clips: dict[str, Any]
-) -> float:
-    """Extend real picture cuts in place to absorb a shortfall; never shrinks.
-
-    Tries the LAST cut first, up to its own clip's duration, then walks
-    backwards through the earlier cuts if the last one could not absorb it
-    all — this is always tried before ever falling back to the narrator's own
-    face-cam picture (see :func:`_build_voice_over_segment`).
-
-    Args:
-        group_segments: The picture-cut run, screen order (mutated in place).
-        shortfall: Seconds still missing from the narration length.
-        clips: Clip registry, for each cut's own clip duration.
-
-    Returns:
-        Whatever shortfall remains after extending (``0`` when fully covered).
-    """
-    remaining = shortfall
-    for seg in reversed(group_segments):
-        if remaining <= _EPS:
-            break
-        clip_duration = float((clips.get(seg.clip) or {}).get("duration") or 0.0)
-        room = (clip_duration - seg.out) if clip_duration > 0 else remaining
-        extend = min(remaining, max(0.0, room))
-        if extend > _EPS:
-            seg.out = round(seg.out + extend, 3)
-            remaining -= extend
-    return max(0.0, remaining)
-
-
-def _normalize_picture_run(
-    group_segments: list[VideoSegment], voice_duration: float, clips: dict[str, Any]
-) -> float:
-    """Trim or extend ``group_segments`` in place to match ``voice_duration``.
-
-    A run longer than the narration is trimmed from its last cut (dropping it
-    entirely if trimming would leave nothing); a run still short after the
-    fallback picture was added is extended on the last cut, clamped to that
-    clip's own duration — the narration must never run past its own picture.
-
-    Returns:
-        The final total duration of ``group_segments``.
-    """
-    total = sum(s.duration for s in group_segments)
-    while group_segments and total > voice_duration + _EPS:
-        last = group_segments[-1]
-        overshoot = total - voice_duration
-        new_dur = last.duration - overshoot
-        if new_dur > _EPS:
-            last.out = round(last.in_ + new_dur, 3)
-            total = voice_duration
-        else:
-            total -= last.duration
-            group_segments.pop()
-
-    if group_segments and total < voice_duration - _EPS:
-        last = group_segments[-1]
-        clip_duration = float((clips.get(last.clip) or {}).get("duration") or 0.0)
-        new_out = last.out + (voice_duration - total)
-        if clip_duration > 0:
-            new_out = min(new_out, clip_duration)
-        if new_out > last.out + _EPS:
-            total += new_out - last.out
-            last.out = round(new_out, 3)
-    return total
-
-
-def _build_voice_over_segment(
-    seg: PlanSegment,
-    clip_id: str,
-    clip: dict[str, Any],
-    clips: dict[str, dict[str, Any]],
-    seg_in: float,
-    seg_out: float,
-    entry: dict[str, Any],
-    cfg: Settings,
-    project: Project,
-    default_fit: str,
-    video: list[VideoSegment],
-    voice_groups: list[dict[str, Any]],
-    stats: dict[str, Any],
-) -> bool:
-    """Turn one ``voice_over`` segment into a voice pickup plus picture cuts.
-
-    Appends the resolved picture-cut ``VideoSegment``\\ s to ``video`` and records
-    the extracted-audio metadata in ``voice_groups`` for :func:`_build_voice_items`
-    to place once the timeline's final segment positions are known.
-
-    Returns:
-        ``True`` when a voice-over pickup was produced, ``False`` when there was
-        nothing usable to extract (the caller then drops the segment entirely, as
-        it would an unknown clip).
-    """
-    pad_before = max(0.0, float(cfg.get("pacing.speech_pad_before", 0.30)))
-    pad_after = max(0.0, float(cfg.get("pacing.speech_pad_after", 0.45)))
-    clip_duration = float(clip.get("duration") or 0.0)
-
-    a_start, a_end = _voice_over_audio_range(
-        entry, clip_duration, seg_in, seg_out, pad_before, pad_after
-    )
-    voice_duration = round(a_end - a_start, 3)
-    if voice_duration <= _EPS:
-        return False
-
-    fname = f"vo_{clip_id}_{a_start:06.2f}_{a_end:06.2f}.wav"
-    rel_path = f"voice/{fname}"
-    out_path = project.voice_dir / fname
-    audio_src = _voice_source_audio(project, clip, clip_id)
-    try:
-        _extract_voice_clip(audio_src, a_start, a_end, out_path)
-    except FFmpegError as exc:
-        log.warning(
-            "voice-over extraction failed for %s %.2f-%.2f: %s", clip_id, a_start, a_end, exc
-        )
-        return False
-
-    group_segments: list[VideoSegment] = []
-    picks = list(seg.voice_over.picture) if seg.voice_over is not None else []
-    for pick in picks:
-        pick_clip_id = str(pick.clip)
-        pick_clip = clips.get(pick_clip_id)
-        if pick_clip is None:
-            stats["voice_over_dropped_picture"] += 1
-            continue
-        pick_duration = float(pick_clip.get("duration") or 0.0)
-        p_start, p_end = float(pick.in_), float(pick.out)
-        if pick_duration > 0:
-            p_start = max(0.0, min(p_start, pick_duration))
-            p_end = max(0.0, min(p_end, pick_duration))
-        if p_end - p_start <= _EPS:
-            stats["voice_over_dropped_picture"] += 1
-            continue
-        group_segments.append(
-            VideoSegment(
-                id="",
-                clip=pick_clip_id,
-                **{"in": round(p_start, 3)},
-                out=round(p_end, 3),
-                role="b-roll",
-                transform=Transform(fit=_vertical_fit(pick_clip, default_fit)),
-                mute_source=True,
-                notes=f"VO picture for {clip_id}",
-            )
-        )
-
-    total = sum(s.duration for s in group_segments)
-    shortfall = voice_duration - total
-    if shortfall > _EPS:
-        # Speech padding routinely makes the narration ~0.75s longer than the
-        # picture cuts the planner picked for it. Cover that first by growing
-        # the real picture cuts (last one first) — never by flashing back to
-        # the narrator's own face for a fraction of a second.
-        if group_segments:
-            shortfall = _extend_picture_cuts(group_segments, shortfall, clips)
-        min_shot = max(0.0, float(cfg.get("pacing.min_shot_seconds", 0.8)))
-        if shortfall > _EPS:
-            if not group_segments or shortfall >= min_shot - _EPS:
-                # Either there was nothing to extend, or what's left is a full
-                # shot on its own — the VO clip's own picture fills the gap,
-                # muted (its audio is already carried by the voice item).
-                group_segments.append(
-                    VideoSegment(
-                        id="",
-                        clip=clip_id,
-                        **{"in": round(seg_in, 3)},
-                        out=round(seg_out, 3),
-                        role="b-roll",
-                        transform=Transform(fit=_vertical_fit(clip, default_fit)),
-                        mute_source=True,
-                        notes=f"VO picture for {clip_id}",
-                    )
-                )
-            else:
-                # Too small to extend a real cut with and too small to justify
-                # a fallback shot of its own — absorb it as a last resort by
-                # pulling the first cut's in-point back.
-                first = group_segments[0]
-                first.in_ = round(max(0.0, first.in_ - shortfall), 3)
-
-    _normalize_picture_run(group_segments, voice_duration, clips)
-    if not group_segments:
-        return False
-
-    video.extend(group_segments)
-    voice_groups.append(
-        {
-            "file": rel_path,
-            "clip": clip_id,
-            "in": a_start,
-            "out": a_end,
-            "duration": voice_duration,
-            "segments": group_segments,
-        }
-    )
-    stats["voice_over_segments"] += 1
-    return True
-
-
-def _build_voice_items(
-    timeline: Timeline, voice_groups: list[dict[str, Any]]
-) -> tuple[list[VoiceItem], list[dict[str, Any]]]:
-    """Place each voice-over group at its picture cuts' final timeline position.
-
-    Segment padding (:func:`ytedit.ai.tidy.pad_segments_to_speech`) can shift the
-    start of everything after a padded cut, so the voice item's absolute ``at``
-    is only resolved here, from where its (identity-tracked) picture segments
-    actually landed — never from a position computed before padding ran.
-
-    Returns:
-        ``(voice_items, voice_over_report)`` — the second is the same information
-        in a shape :func:`render_edit_plan_md` can list.
-    """
-    starts: dict[int, float] = {
-        id(pos.segment): pos.start for pos in timeline.segment_positions()
-    }
-
-    items: list[VoiceItem] = []
-    report: list[dict[str, Any]] = []
-    for i, group in enumerate(voice_groups):
-        start: float | None = None
-        anchor_segment: VideoSegment | None = None
-        for segment in group["segments"]:
-            candidate = starts.get(id(segment))
-            if candidate is not None and (start is None or candidate < start):
-                start = candidate
-                anchor_segment = segment
-        if start is None:
-            log.warning(
-                "voice-over pickup %s lost all its picture segments during tidy — dropped",
-                group["file"],
-            )
-            continue
-        end = round(start + group["duration"], 3)
-        item_id = f"v{i + 1:03d}"
-        # Anchor to the first picture segment of the group, offset 0, so the
-        # pickup follows it through any later pass instead of staying pinned
-        # to the absolute time computed here. Keyed on the segment's uid
-        # (stable across every later renumbering), with a clip/in signature
-        # to repair the anchor if that uid is ever lost.
-        anchor = (
-            VoiceAnchor(
-                segment=anchor_segment.id,
-                offset=0.0,
-                uid=anchor_segment.uid,
-                signature=AnchorSignature(clip=anchor_segment.clip, **{"in": anchor_segment.in_}),
-            )
-            if anchor_segment
-            else None
-        )
-        items.append(
-            VoiceItem(id=item_id, file=group["file"], at=round(start, 3), end=end, anchor=anchor)
-        )
-        report.append(
-            {
-                "id": item_id,
-                "file": group["file"],
-                "clip": group["clip"],
-                "in": group["in"],
-                "out": group["out"],
-                "at": round(start, 3),
-                "end": end,
-            }
-        )
-    return items, report
+    return default_fit if _clip_is_vertical(clip) else "cover"
 
 
 def _transition(raw: dict[str, Any]) -> Transition:
@@ -1596,30 +1228,96 @@ def _build_mute_ranges(
     return sorted(out, key=lambda m: (m.clip, m.s))
 
 
-def _build_markers(cfg: Settings, total: float, plan_obj: EditPlan) -> list[Marker]:
-    """Structural markers from ``pacing.markers`` (negative ``at`` = from the end)."""
-    markers: list[Marker] = []
+def _beat_under(
+    cut: Cut, spans: Mapping[str, tuple[float, float]], t: float
+) -> CutBeat | None:
+    """The beat playing at absolute second ``t`` (``None`` for an empty cut)."""
+    return beat_at(dict(spans), cut, max(0.0, float(t)))
+
+
+def _beat_ending_at(
+    cut: Cut, spans: Mapping[str, tuple[float, float]], t: float
+) -> CutBeat | None:
+    """The last beat that is still playing *just before* ``t``.
+
+    A music cue's ``end`` is exclusive — it is the second the next section
+    starts on — so a cue ending exactly on a beat boundary must claim the beat
+    that finished there, not the one that opens the next chapter. Anywhere
+    else this is simply the beat under ``t``.
+    """
+    beat = _beat_under(cut, spans, t)
+    if beat is None:
+        return None
+    span = spans.get(beat.uid)
+    if span is not None and abs(span[0] - t) <= 0.05:
+        previous: CutBeat | None = None
+        for candidate in cut.beats:
+            if candidate.uid == beat.uid:
+                return previous or beat
+            if candidate.uid in spans:
+                previous = candidate
+    return beat
+
+
+def _build_markers(
+    cfg: Settings,
+    cut: Cut,
+    spans: Mapping[str, tuple[float, float]],
+    total: float,
+    plan_obj: EditPlan,
+) -> list[CutMarker]:
+    """Structural markers from ``pacing.markers``, pinned to the beat under each.
+
+    The times in the settings (negative ``at`` = from the end) are targets for
+    *this* runtime; once the beat under one is known the marker travels with
+    it, so a later re-cut moves the "hook" flag with the hook instead of
+    leaving it stranded at 0:07.
+    """
+    markers: list[CutMarker] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(at: float, label: str) -> None:
+        beat = _beat_under(cut, spans, at)
+        if beat is None:
+            return
+        key = (beat.uid, label)
+        if key in seen:
+            return
+        seen.add(key)
+        markers.append(CutMarker(beat=beat.uid, label=label))
+
     for spec in cfg.get("pacing.markers", []) or []:
         if not isinstance(spec, dict):
             continue
         at = _num(spec.get("at", 0.0))
-        label = str(spec.get("label", ""))
         if at < 0:
             at = total + at
         if at < -_EPS or at > total + _EPS:
             continue
-        markers.append(Marker(at=round(max(0.0, at), 3), label=label))
+        add(max(0.0, at), str(spec.get("label", "")))
     # Subscribe CTA rides at ~30% of runtime unless the planner placed it.
     cta_at = plan_obj.cta.at_s if plan_obj.cta.at_s > 0 else round(total * 0.30, 1)
     if total > 0 and 0 < cta_at < total:
-        markers.append(Marker(at=round(cta_at, 3), label="subscribe-cta"))
-    return sorted(markers, key=lambda m: m.at)
+        add(cta_at, "subscribe-cta")
+    return markers
 
 
-def _build_captions(plan_obj: EditPlan, total: float) -> list[Caption]:
-    """Clamp, de-overlap and id the planner's captions."""
+def _build_captions(
+    plan_obj: EditPlan,
+    cut: Cut,
+    spans: Mapping[str, tuple[float, float]],
+    total: float,
+) -> list[CutCaption]:
+    """Clamp and de-overlap the planner's captions, then anchor them to beats.
+
+    The planner answers in absolute seconds, which is the only frame it can
+    reason in, but a caption stored that way drifts the moment anything
+    upstream of it changes length. Overlap is resolved here, in absolute time,
+    where "which card is on screen" is still meaningful; what gets stored is
+    the beat plus an offset into it.
+    """
     ordered = sorted(plan_obj.captions, key=lambda c: _num(c.at))
-    out: list[Caption] = []
+    placed: list[tuple[float, float, PlanCaption]] = []
     for item in ordered:
         text = (item.text or "").strip()
         if not text:
@@ -1633,32 +1331,64 @@ def _build_captions(plan_obj: EditPlan, total: float) -> list[Caption]:
         end = min(end, total)
         if end - at < 0.4:
             continue
+        if placed and at < placed[-1][1] - _EPS and placed[-1][2].style != "subtitle":
+            # Trim the previous card rather than dropping either of them.
+            prev_at, _prev_end, prev_item = placed[-1]
+            trimmed = round(max(prev_at + 0.4, at - 0.05), 3)
+            if trimmed <= prev_at:
+                placed.pop()
+            else:
+                placed[-1] = (prev_at, trimmed, prev_item)
+        placed.append((at, end, item))
+
+    out: list[CutCaption] = []
+    for at, end, item in placed:
+        beat = _beat_under(cut, spans, at)
+        if beat is None:
+            continue
+        span = spans[beat.uid]
         style = item.style if item.style in ("location", "hook", "subtitle") else "location"
         position = item.position if item.position in (
             "lower-left", "lower-right", "lower-center", "center",
             "upper-left", "upper-right", "upper-center",
         ) else "lower-left"
-        if out and at < out[-1].end - _EPS and out[-1].style != "subtitle":
-            # Trim the previous card rather than dropping either of them.
-            out[-1].end = round(max(out[-1].at + 0.4, at - 0.05), 3)
-            if out[-1].end <= out[-1].at:
-                out.pop()
         out.append(
-            Caption(id="", at=round(at, 3), end=round(end, 3), text=text, style=style,
-                    position=position)  # type: ignore[arg-type]
+            CutCaption(
+                id="",
+                beat=beat.uid,
+                offset=round(max(0.0, at - span[0]), 3),
+                duration=round(max(0.4, end - at), 3),
+                text=(item.text or "").strip(),
+                style=style,
+                position=position,  # type: ignore[arg-type]
+            )
         )
     for i, caption in enumerate(out):
         caption.id = f"t{i + 1:03d}"
     return out
 
 
-def _build_music(plan_obj: EditPlan, total: float, cfg: Settings) -> list[MusicCue]:
-    """Convert plan cues to timeline cues; files are filled in by the music stage."""
+def _build_music(
+    plan_obj: EditPlan,
+    cut: Cut,
+    spans: Mapping[str, tuple[float, float]],
+    total: float,
+    cfg: Settings,
+) -> list[CutMusicCue]:
+    """Convert the planner's cue sheet into inclusive beat ranges.
+
+    A bed that is stored as "b012 through b031" keeps covering the section it
+    was written for when the cut around it moves; the files themselves are
+    generated later by the music stage from these very ids.
+    """
     amount = _num(cfg.get("ducking.amount_db", -12.0), -12.0)
     attack = _num(cfg.get("ducking.attack", 0.15), 0.15)
     release = _num(cfg.get("ducking.release", 0.6), 0.6)
-    out: list[MusicCue] = []
-    for i, cue in enumerate(sorted(plan_obj.music_cues, key=lambda c: _num(c.at))):
+    order = {beat.uid: i for i, beat in enumerate(cut.beats)}
+
+    out: list[CutMusicCue] = []
+    cursor = 0.0
+    for cue in sorted(plan_obj.music_cues, key=lambda c: _num(c.at)):
         at = max(0.0, _num(cue.at))
         end = _num(cue.end, at + _num(cue.length_s, 60.0))
         if end <= at:
@@ -1666,17 +1396,22 @@ def _build_music(plan_obj: EditPlan, total: float, cfg: Settings) -> list[MusicC
         if at >= total - _EPS:
             continue
         end = min(end, total)
-        if out and at < out[-1].end - _EPS:
-            at = out[-1].end
+        at = max(at, cursor)
         if end - at < 5.0:
             continue
-        cue_id = cue.id or f"m{i + 1:03d}"
+        first = _beat_under(cut, spans, at)
+        last = _beat_ending_at(cut, spans, end)
+        if first is None or last is None:
+            continue
+        if order.get(last.uid, 0) < order.get(first.uid, 0):
+            last = first
+        cursor = end
         out.append(
-            MusicCue(
-                id=cue_id,
-                file=f"music/{cue_id}.mp3",
-                at=round(at, 3),
-                end=round(end, 3),
+            CutMusicCue(
+                id="",
+                file="",
+                **{"from": first.uid},
+                to=last.uid,
                 gain_db=_num(cue.gain_db, -18.0),
                 fade_in=2.0,
                 fade_out=3.0,
@@ -1694,51 +1429,41 @@ def _build_music(plan_obj: EditPlan, total: float, cfg: Settings) -> list[MusicC
     return out
 
 
-def _build_chapters(plan_obj: EditPlan, total: float) -> list[Chapter]:
-    """Enforce YouTube's chapter rules: start at 0, ascending, >= 10 s apart."""
-    ordered = sorted(plan_obj.chapters, key=lambda c: _num(c.at))
-    out: list[Chapter] = []
-    for item in ordered:
-        title = (item.title or "").strip()
-        at = max(0.0, _num(item.at))
-        if not title or at > max(0.0, total - 10.0) + _EPS:
-            continue
-        if out and at - out[-1].at < 10.0:
-            continue
-        out.append(Chapter(at=round(at, 3), title=title))
-    if out and out[0].at > _EPS:
-        out[0].at = 0.0
-    return out
+def _build_chapters(
+    plan_obj: EditPlan,
+    cut: Cut,
+    spans: Mapping[str, tuple[float, float]],
+    total: float,
+) -> list[CutChapter]:
+    """Enforce YouTube's chapter rules against the *resolved* beat starts.
 
-
-def _fix_trivial_issues(
-    timeline: Timeline, project: Project, issues: Sequence[str]
-) -> tuple[list[str], list[str]]:
-    """Fix what can be fixed mechanically; return ``(fixed, remaining)``.
-
-    Music files legitimately do not exist yet at plan time (the music stage
-    generates them from the cue sheet), so those issues are filtered out rather
-    than reported as problems.
+    "First at 0:00, at least 10 s apart, none in the last 10 s" is a rule about
+    what the viewer sees, so it is checked on where each chapter's beat
+    actually lands — the planner's own guess at a timecode is only used to pick
+    the beat.
     """
-    fixed: list[str] = []
-    total = timeline.duration()
-    for caption in timeline.tracks.captions:
-        if caption.end > total + _EPS:
-            fixed.append(f"caption {caption.id}: trimmed {caption.end:.2f}s -> {total:.2f}s")
-            caption.end = round(total, 3)
-    timeline.tracks.captions = [c for c in timeline.tracks.captions if c.end - c.at > 0.3]
-    for cue in timeline.tracks.music:
-        if cue.end > total + _EPS:
-            fixed.append(f"music {cue.id}: trimmed {cue.end:.2f}s -> {total:.2f}s")
-            cue.end = round(total, 3)
-    timeline.markers = [m for m in timeline.markers if m.at <= total + _EPS]
-
-    remaining = [
-        issue
-        for issue in timeline.validate(project)
-        if "missing file music/" not in issue
-    ]
-    return fixed, remaining
+    out: list[CutChapter] = []
+    starts: list[float] = []
+    for item in sorted(plan_obj.chapters, key=lambda c: _num(c.at)):
+        title = (item.title or "").strip()
+        if not title:
+            continue
+        beat = _beat_under(cut, spans, max(0.0, _num(item.at)))
+        if beat is None:
+            continue
+        start = spans[beat.uid][0]
+        if start > max(0.0, total - 10.0) + _EPS:
+            continue
+        if any(chapter.beat == beat.uid for chapter in out):
+            continue
+        if starts and start - starts[-1] < 10.0:
+            continue
+        out.append(CutChapter(beat=beat.uid, title=title))
+        starts.append(start)
+    if out and cut.beats and out[0].beat != cut.beats[0].uid:
+        # YouTube ignores a chapter list whose first entry is not 0:00.
+        out[0].beat = cut.beats[0].uid
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -1879,8 +1604,40 @@ def _mmss(seconds: float) -> str:
 # ----------------------------------------------------------------------
 # markdown reports
 # ----------------------------------------------------------------------
+def spans_of(timeline: Timeline) -> dict[str, tuple[float, float]]:
+    """``beat uid -> (start, end)`` read back off a resolved timeline.
+
+    The same answer :func:`ytedit.cut.beat_spans` gives, without paying for a
+    second resolve pass: the plan stage already has the timeline in hand.
+    """
+    spans: dict[str, tuple[float, float]] = {}
+    for pos in timeline.segment_positions():
+        uid = pos.segment.beat
+        if not uid:
+            continue
+        start, _end = spans.get(uid, (pos.start, pos.end))
+        spans[uid] = (start, pos.end)
+    return spans
+
+
+def _beat_script(
+    beat: CutBeat, sentence_index: Mapping[str, dict[str, Any]]
+) -> str:
+    """``c048#3–c048#5 "first words…"`` for a speech beat, ``""`` otherwise."""
+    if not beat.sentences:
+        return ""
+    script = f"`{beat.sentences[0]}`" + (
+        f"–`{beat.sentences[-1]}`" if len(beat.sentences) > 1 else ""
+    )
+    words = str((sentence_index.get(beat.sentences[0]) or {}).get("text", "")).split()
+    if words:
+        script += " “" + " ".join(words[:6]) + ("…" if len(words) > 6 else "") + "”"
+    return script
+
+
 def render_edit_plan_md(
     plan_obj: EditPlan,
+    cut: Cut,
     timeline: Timeline,
     project: Project,
     stats: dict[str, Any],
@@ -1890,19 +1647,28 @@ def render_edit_plan_md(
     """Render the human-readable ``plan/edit_plan.md``.
 
     Args:
+        plan_obj: The planner's proposal, for everything the cut does not
+            carry (story beats, risks, thumbnails, narration requests).
+        cut: The cut that was built from it — the beat table is the report.
+        timeline: That cut resolved, which is where every timecode comes from.
+        project: The owning project.
+        stats: What :func:`build_cut` recorded about its own decisions.
+        warnings: :func:`pacing_report` output.
         sentence_index: The flat sentence catalogue (``<clip>#<n>`` -> sentence
             dict, see ``ytedit/ai/sentences.py``) used to show the first words
-            of a speech segment's script next to its sentence ids. Omitted
+            of a speech beat's script next to its sentence ids. Omitted
             (``None``) just skips that text — the ids alone still print.
     """
     sentence_index = sentence_index or {}
     total = timeline.duration()
+    spans = spans_of(timeline)
     lines: list[str] = [
         f"# Edit plan — {project.slug}",
         "",
         f"Generated: {utcnow()} · language: `{project.language}` · "
         f"estimated runtime: **{_mmss(total)}** "
-        f"({len(timeline.tracks.video)} shots, {len(timeline.clip_ids())} clips)",
+        f"({len(cut.beats)} beats, {len(timeline.tracks.video)} shots, "
+        f"{len(timeline.clip_ids())} clips)",
         "",
     ]
     if plan_obj.story.title_working:
@@ -1938,104 +1704,106 @@ def render_edit_plan_md(
 
     # -- markers ---------------------------------------------------------
     lines += ["## Structural markers", ""]
-    for marker in timeline.markers:
-        shot = timeline.segment_at(marker.at)
-        where = f"`{shot.segment.id}` / `{shot.segment.clip}`" if shot else "**no shot**"
-        lines.append(f"- **{_mmss(marker.at)}** {marker.label} → {where}")
+    for marker in cut.markers:
+        beat = cut.beat_by_ref(marker.beat)
+        span = spans.get(marker.beat)
+        where = f"`{beat.id}` / `{beat.clip or beat.file or '—'}`" if beat else "**no beat**"
+        when = _mmss(span[0]) if span else "—"
+        lines.append(f"- **{when}** {marker.label} → {where}")
     lines.append("")
 
-    # -- segment table ---------------------------------------------------
+    # -- beat table ------------------------------------------------------
     lines += [
-        "## Segments",
+        "## Beats",
         "",
-        "| # | at | clip | in–out | dur | role | fit | notes |",
-        "|---|---|---|---|---|---|---|---|",
+        "| beat | at | kind | clip | source | dur | role | fit | shots | notes |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for i, pos in enumerate(timeline.segment_positions(), start=1):
-        seg = pos.segment
-        mute = " 🔇" if seg.mute_source else ""
-        vo = " 🎙" if seg.notes.startswith("VO picture for ") else ""
-        overlay = " 🎞" if seg.audio_from is not None else ""
-        note = _md_cell(seg.notes)
-        if seg.audio_from is not None:
-            borrowed = (
-                f"audio: `{seg.audio_from.clip}` "
-                f"{seg.audio_from.in_:.2f}–{seg.audio_from.out:.2f}"
-            )
-            note = f"{note} · {borrowed}" if note else borrowed
-        if seg.sentence_ids:
-            first_sentence = sentence_index.get(seg.sentence_ids[0])
-            words = str((first_sentence or {}).get("text", "")).split()
-            preview = " ".join(words[:6]) + ("…" if len(words) > 6 else "")
-            script = f"`{seg.sentence_ids[0]}`" + (
-                f"–`{seg.sentence_ids[-1]}`" if len(seg.sentence_ids) > 1 else ""
-            )
-            script += f" “{preview}”" if preview else ""
-            note = f"{note} · {script}" if note else script
+    for beat in cut.beats:
+        span = spans.get(beat.uid)
+        at = _mmss(span[0]) if span else "—"
+        duration = f"{span[1] - span[0]:.1f}s" if span else "**unresolved**"
+        if beat.kind == "speech":
+            source = _beat_script(beat, sentence_index)
+            if beat.words:
+                source = f"words {beat.words[0]}–{beat.words[1]}"
+            camera = "" if beat.on_camera else " 🎙"
+        elif beat.kind == "voice":
+            source = f"`{beat.file}`"
+            camera = " 🎙"
+        else:
+            source = f"{_num(beat.in_):.1f}–{_num(beat.out):.1f}"
+            camera = " 🔇" if beat.audio == "mute" else ""
+        shots = ", ".join(
+            f"`{shot.clip}`" + (f" after {shot.after}" if shot.after else "")
+            for shot in beat.shots
+        ) or "—"
         lines.append(
-            f"| {i} | {_mmss(pos.start)} | `{seg.clip}` | "
-            f"{seg.in_:.1f}–{seg.out:.1f} | {seg.duration:.1f}s | "
-            f"{seg.role or '—'}{mute}{vo}{overlay} | "
-            f"{seg.transform.fit} | {note} |"
+            f"| `{beat.id}` | {at} | {beat.kind} | `{beat.clip or '—'}` | {source} | "
+            f"{duration} | {beat.role or '—'}{camera} | {beat.transform.fit} | "
+            f"{shots} | {_md_cell(beat.notes)} |"
         )
     lines.append("")
 
-    # -- voice-over ---------------------------------------------------------
-    voice_over_items = stats.get("voice_over_items") or []
-    if voice_over_items:
+    # -- captions --------------------------------------------------------
+    if cut.captions:
         lines += [
-            "## Voice-over (🎙)",
+            "## Captions",
             "",
-            "| voice | at | end | source clip | in–out |",
+            "| at | beat | dur | style | text |",
             "|---|---|---|---|---|",
         ]
-        for item in voice_over_items:
+        for caption in cut.captions:
+            beat = cut.beat_by_ref(caption.beat)
+            span = spans.get(caption.beat)
+            at = _mmss(span[0] + caption.offset) if span else "—"
             lines.append(
-                f"| `{item['id']}` | {_mmss(item['at'])} | {_mmss(item['end'])} | "
-                f"`{item['clip']}` | {item['in']:.1f}–{item['out']:.1f} |"
-            )
-        lines.append("")
-
-    # -- captions --------------------------------------------------------
-    if timeline.tracks.captions:
-        lines += ["## Captions", "", "| at | end | style | text |", "|---|---|---|---|"]
-        for caption in timeline.tracks.captions:
-            lines.append(
-                f"| {_mmss(caption.at)} | {_mmss(caption.end)} | {caption.style} | "
-                f"{_md_cell(caption.text)} |"
+                f"| {at} | `{beat.id if beat else caption.beat}` +{caption.offset:.1f}s | "
+                f"{caption.duration:.1f}s | {caption.style} | {_md_cell(caption.text)} |"
             )
         lines.append("")
 
     # -- music cue sheet --------------------------------------------------
     lines += ["## Music cue sheet", ""]
-    if plan_obj.music_cues:
-        lines += ["| cue | section | mood / style | at–end | length | gain | duck |",
+    if cut.music:
+        lines += ["| cue | section | mood / style | beats | at–end | gain | duck |",
                   "|---|---|---|---|---|---|---|"]
-        for cue, planned in zip(timeline.tracks.music, plan_obj.music_cues):
+        for cue, planned in zip(cut.music, plan_obj.music_cues):
+            first, last = cut.beat_by_ref(cue.from_), cut.beat_by_ref(cue.to)
+            start = spans.get(cue.from_)
+            end = spans.get(cue.to)
+            when = (
+                f"{_mmss(start[0])}–{_mmss(end[1])}" if start and end else "—"
+            )
             lines.append(
                 f"| `{cue.id}` | {planned.section or '—'} | "
                 f"{_md_cell(planned.mood or planned.style)} | "
-                f"{_mmss(cue.at)}–{_mmss(cue.end)} | {cue.duration:.0f}s | "
-                f"{cue.gain_db:.0f} dB | {cue.duck.amount_db:.0f} dB |"
+                f"`{first.id if first else cue.from_}`–`{last.id if last else cue.to}` | "
+                f"{when} | {cue.gain_db:.0f} dB | {cue.duck.amount_db:.0f} dB |"
             )
     else:
         lines.append("_No music cues planned._")
     lines.append("")
 
     # -- mute ranges ------------------------------------------------------
-    if timeline.mute_ranges:
+    if cut.mute_ranges:
         lines += ["## Mute ranges (source audio, clip time)", ""]
-        for mute in timeline.mute_ranges:
+        for mute in cut.mute_ranges:
             lines.append(
                 f"- `{mute.clip}` {mute.s:.1f}–{mute.e:.1f}s @ {mute.gain_db:.0f} dB — {mute.reason}"
             )
         lines.append("")
 
     # -- chapters ---------------------------------------------------------
-    if timeline.chapters:
+    if cut.chapters:
         lines += ["## Chapters", ""]
-        for chapter in timeline.chapters:
-            lines.append(f"- {_mmss(chapter.at)} {chapter.title}")
+        for chapter in cut.chapters:
+            beat = cut.beat_by_ref(chapter.beat)
+            span = spans.get(chapter.beat)
+            when = _mmss(span[0]) if span else "—"
+            lines.append(
+                f"- {when} ({'`' + beat.id + '`' if beat else chapter.beat}) {chapter.title}"
+            )
         lines.append("")
 
     # -- narration --------------------------------------------------------
@@ -2098,40 +1866,20 @@ def render_edit_plan_md(
     lines += [
         "## Deterministic post-processing",
         "",
-        f"- segments proposed: {stats.get('segments_in', 0)} → kept: {stats.get('segments_out', 0)}",
+        f"- segments proposed: {stats.get('segments_in', 0)} → beats: "
+        f"{stats.get('beats_out', 0)}",
         f"- clips with instruction ranges excised: {stats.get('instruction_cuts', 0)}",
         f"- clips with rejected takes excised: {stats.get('take_cuts', 0)}",
-        f"- segments split around excised ranges: {stats.get('split_segments', 0)}",
-        f"- speech-air / jump-cut edits: {len(stats.get('padded') or [])}",
-        f"- segments snapped to a sentence boundary: {stats.get('sentence_snapped', 0)}",
-        f"- overlay-cutaway edits (🎞): {len(stats.get('overlaid') or [])}",
+        f"- B-roll segments split around excised ranges: {stats.get('split_segments', 0)}",
+        f"- voice-over (off-camera) segments: {stats.get('voice_over_segments', 0)}",
     ]
-    padded = list(stats.get("padded") or [])
-    if padded:
-        lines.append("")
-        lines.append("Speech padding (segment ids as of the pass, before re-numbering):")
-        lines.append("")
-        lines += [f"  - {change}" for change in padded[:20]]
-        if len(padded) > 20:
-            lines.append(f"  - ... and {len(padded) - 20} more")
-        lines.append("")
-    overlaid = list(stats.get("overlaid") or [])
-    if overlaid:
-        lines.append("")
-        lines.append("Overlay cutaways (narration kept running underneath):")
-        lines.append("")
-        lines += [f"  - {change}" for change in overlaid[:20]]
-        if len(overlaid) > 20:
-            lines.append(f"  - ... and {len(overlaid) - 20} more")
-        lines.append("")
     for key, label in (
         ("dropped_unknown_clip", "dropped (unknown clip)"),
         ("dropped_empty", "dropped (in >= out)"),
         ("dropped_too_short", "dropped (below min shot length)"),
         ("clamped", "clamped to clip duration"),
         ("vertical_fixed", "vertical clips set to blur-fill"),
-        ("validation_fixed", "auto-fixed validation issues"),
-        ("validation_issues", "remaining validation issues"),
+        ("validation_issues", "resolver findings"),
     ):
         values = stats.get(key) or []
         if values:
@@ -2145,8 +1893,10 @@ def render_edit_plan_md(
         ("non_contiguous_splits", "non-contiguous sentence runs auto-split"),
         ("unknown_sentence_refs", "unknown sentence ids dropped"),
         ("duplicate_sentence_refs", "sentence ids reused elsewhere (kept first use only)"),
-        ("excluded_sentence_refs", "instruction/retake/duplicate ids dropped"),
+        ("excluded_sentence_refs", "instruction ids dropped"),
+        ("flagged_sentence_refs", "retake/duplicate ids kept — check these"),
         ("dropped_cutaways", "cutaways dropped (bad clip/range or unmatched sentence)"),
+        ("voice_over_split", "voice-over runs left without picture cuts"),
     )
     any_script_row = False
     for key, label in script_rows:
@@ -2215,6 +1965,22 @@ DEFAULT_PLAN_MAX_TOKENS = 32000
 MAX_PLAN_MAX_TOKENS = 64000
 
 
+def _existing_cut_is_human_edited(project: Project) -> bool:
+    """Has the user (or the web editor) touched ``plan/cut.json``?
+
+    The flag lives in the cut, not in the derived timeline: ``timeline.json``
+    is regenerated from scratch by the resolver and carries no authorship.
+    """
+    path = cut_path(project)
+    if not path.exists():
+        return False
+    try:
+        return bool(load_cut(path).meta.edited_by_human)
+    except Exception as exc:  # a broken cut must not block a re-plan
+        log.warning("could not read %s: %s", path, exc)
+        return False
+
+
 def plan(
     project: Project,
     force: bool = False,
@@ -2224,9 +1990,13 @@ def plan(
 ) -> dict[str, Any]:
     """Run the edit-planning stage.
 
+    Writes ``plan/cut.json`` — the source of truth — and, when it resolves
+    cleanly, the derived ``plan/timeline.json`` next to the two Markdown
+    reports the user actually reads.
+
     Args:
         project: Project whose ``analysis/footage_log.json`` is ready.
-        force: Overwrite ``plan/timeline.json`` even when a human edited it.
+        force: Overwrite ``plan/cut.json`` even when a human edited it.
         notes: Free-form editorial direction appended to the user prompt as
             "Editor notes"; use it to steer a re-plan without editing prompts.
             Ignored when ``from_response`` is set — there is no prompt to
@@ -2238,19 +2008,22 @@ def plan(
             previous run's ``plan/planner_response.json`` instead — useful to
             re-run the deterministic post-processing (bug fixes, settings
             tweaks) without paying for the LLM again. Everything downstream
-            (``EditPlan.from_llm`` -> :func:`build_timeline` -> tidy ->
-            artifact writing, including the human-edited-timeline guard) runs
-            exactly as it would for a fresh planner answer. No cost is logged.
+            (``EditPlan.from_llm`` -> :func:`build_cut` -> resolve -> artifact
+            writing, including the human-edited-cut guard) runs exactly as it
+            would for a fresh planner answer, except that there is no prompt to
+            retry against. No cost is logged.
 
     Returns:
-        ``{"timeline", "edit_plan", "markdown", "narration", "draft",
-        "duration_s", "warnings", "stats", "cost_usd", "finish_reason",
-        "completion_tokens"}``.
+        ``{"cut", "timeline", "edit_plan", "markdown", "narration", "draft",
+        "duration_s", "beats", "segments", "warnings", "stats", "cost_usd",
+        "finish_reason", "completion_tokens"}``.
 
     Raises:
         PlanError: When the footage log is missing, the planner returns
-            something unusable, or (``from_response``) there is no previous
-            ``plan/planner_response.json`` to rebuild from.
+            something unusable (including speech given as raw seconds twice in
+            a row — see :class:`SpeechSecondsError`), or (``from_response``)
+            there is no previous ``plan/planner_response.json`` to rebuild
+            from.
     """
     settings = project.settings
     write_sentences(project)  # script-first: refresh the sentence catalogue every plan run
@@ -2266,17 +2039,42 @@ def plan(
     total_seconds = sum(float(c.get("duration") or 0.0) for c in clips.values())
 
     existing: Timeline | None = None
-    human_edited = False
     if project.timeline_file.exists():
         try:
             existing = Timeline.load(project.timeline_file)
-            human_edited = bool(existing.meta.edited_by_human)
         except Exception as exc:  # a broken timeline must not block a re-plan
             log.warning("could not read %s: %s", project.timeline_file, exc)
+    human_edited = _existing_cut_is_human_edited(project)
 
     project.set_stage(STAGE, "running")
     try:
         raw_path = project.plan_dir / "planner_response.json"
+
+        def ask(retry_note: str | None = None) -> dict[str, Any]:
+            """One planner round trip, dumped to disk before anything parses it."""
+            answer = _ask_planner(
+                project=project,
+                settings=settings,
+                footage_log=footage_log,
+                existing=existing,
+                clip_count=len(entries),
+                total_minutes=total_seconds / 60.0,
+                notes=notes,
+                retry_note=retry_note,
+                max_tokens=int(
+                    max_tokens
+                    if max_tokens is not None
+                    else settings.get("plan.max_tokens", DEFAULT_PLAN_MAX_TOKENS)
+                ),
+            )
+            # Dump the raw answer first: a truncated or off-schema reply is only
+            # debuggable if it survived to disk, and the model was already paid for.
+            project.plan_dir.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text(
+                json.dumps(answer["json"], indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            return answer
+
         if from_response:
             if not raw_path.exists():
                 raise PlanError(
@@ -2296,30 +2094,32 @@ def plan(
                 "prompt_tokens": 0,
             }
         else:
-            result = _ask_planner(
-                project=project,
-                settings=settings,
-                footage_log=footage_log,
-                existing=existing,
-                clip_count=len(entries),
-                total_minutes=total_seconds / 60.0,
-                notes=notes,
-                max_tokens=int(
-                    max_tokens
-                    if max_tokens is not None
-                    else settings.get("plan.max_tokens", DEFAULT_PLAN_MAX_TOKENS)
-                ),
-            )
-            # Dump the raw answer first: a truncated or off-schema reply is only
-            # debuggable if it survived to disk, and the model was already paid for.
-            project.plan_dir.mkdir(parents=True, exist_ok=True)
-            raw_path.write_text(
-                json.dumps(result["json"], indent=2, ensure_ascii=False), encoding="utf-8"
-            )
+            result = ask()
 
-        plan_obj = EditPlan.from_llm(result["json"])
-        timeline, stats = build_timeline(plan_obj, project, footage_log, settings)
-        if not timeline.tracks.video:
+        spent = float(result["cost_usd"])
+        try:
+            plan_obj = EditPlan.from_llm(result["json"])
+            cut, stats = build_cut(plan_obj, project, footage_log, settings)
+        except SpeechSecondsError as exc:
+            # Speech given in seconds cannot be turned into a beat without
+            # guessing where a word starts, and guessing is what cut v2 exists
+            # to stop. Show the model its own offending segments and ask once
+            # more; a second failure is a prompt problem, not a fluke.
+            if from_response:
+                raise
+            log.warning(
+                "[clip]%s[/] the planner gave %d speech segment(s) as raw seconds — "
+                "asking it once more with the offending segments named",
+                project.slug,
+                len(exc.segments),
+            )
+            result = ask(retry_note=exc.prompt_note())
+            spent += float(result["cost_usd"])
+            plan_obj = EditPlan.from_llm(result["json"])
+            cut, stats = build_cut(plan_obj, project, footage_log, settings)
+        result["cost_usd"] = round(spent, 6)
+
+        if not cut.beats:
             truncated = (
                 " The reply hit the output-token cap (finish_reason=length), so it "
                 "stops mid-JSON: raise plan.max_tokens or plan in two passes."
@@ -2327,27 +2127,42 @@ def plan(
                 else ""
             )
             raise PlanError(
-                f"the planner ({result['model']}) produced no usable video segments "
-                f"({len(plan_obj.segments)} proposed, "
+                f"the planner ({result['model']}) produced no usable beats "
+                f"({len(plan_obj.segments)} segments proposed, "
                 f"{len(stats.get('dropped_unknown_clip', []))} referenced unknown clips, "
                 f"{len(stats.get('dropped_empty', []))} were empty) — its raw answer is in "
                 f"{raw_path}.{truncated}"
             )
-        warnings = pacing_report(timeline, settings)
 
         # --- write artifacts -------------------------------------------
         project.plan_dir.mkdir(parents=True, exist_ok=True)
         write_to_draft = human_edited and not force
-        target = project.plan_dir / ("timeline.draft.json" if write_to_draft else "timeline.json")
-        timeline.save(target)
+        target = cut_path(project).with_name("cut.draft.json" if write_to_draft else "cut.json")
+        save_cut(cut, target)
         if write_to_draft:
             log.warning(
-                "[clip]%s[/] timeline.json is human-edited — wrote the new draft to %s "
+                "[clip]%s[/] cut.json is human-edited — wrote the new draft to %s "
                 "(diff it, or re-run with --force to overwrite)",
                 project.slug,
                 target.name,
             )
 
+        timeline, issues = resolve_verbose(project, cut)
+        errors = [issue for issue in issues if issue.severity == "error"]
+        stats["validation_issues"] = [str(issue) for issue in issues]
+        if write_to_draft:
+            timeline_path = project.timeline_file  # untouched: the draft is not the cut
+        elif errors:
+            # A timeline written from a cut that does not validate would hide
+            # the breakage behind a fresh mtime; leave it stale so `render`
+            # re-resolves and refuses out loud.
+            for issue in errors:
+                log.error("[clip]%s[/] %s", project.slug, issue)
+            timeline_path = project.timeline_file
+        else:
+            timeline_path = timeline.save(project.timeline_file)
+
+        warnings = pacing_report(timeline, settings)
         edit_plan_doc = {
             "project": project.slug,
             "generated": utcnow(),
@@ -2358,7 +2173,8 @@ def plan(
             "raw": result["json"],
             "stats": stats,
             "pacing_warnings": warnings,
-            "timeline_file": project.rel(target),
+            "cut_file": project.rel(target),
+            "timeline_file": project.rel(timeline_path),
             "estimated_runtime_s": timeline.duration(),
         }
         project.edit_plan_file.write_text(
@@ -2367,7 +2183,7 @@ def plan(
         md_path = project.plan_dir / "edit_plan.md"
         md_path.write_text(
             render_edit_plan_md(
-                plan_obj, timeline, project, stats, warnings, load_sentence_index(project)
+                plan_obj, cut, timeline, project, stats, warnings, load_sentence_index(project)
             ),
             encoding="utf-8",
         )
@@ -2375,12 +2191,14 @@ def plan(
         narration_path.write_text(render_narration_requests_md(plan_obj, project), encoding="utf-8")
 
         summary: dict[str, Any] = {
-            "timeline": str(target),
+            "cut": str(target),
+            "timeline": str(timeline_path),
             "edit_plan": str(project.edit_plan_file),
             "markdown": str(md_path),
             "narration": str(narration_path),
             "draft": write_to_draft,
             "duration_s": timeline.duration(),
+            "beats": len(cut.beats),
             "segments": len(timeline.tracks.video),
             "warnings": warnings,
             "stats": stats,
@@ -2393,14 +2211,16 @@ def plan(
             "done",
             cost_usd=round(result["cost_usd"], 6),
             duration_s=timeline.duration(),
+            beats=len(cut.beats),
             segments=len(timeline.tracks.video),
             draft=write_to_draft,
             warnings=len(warnings),
         )
         log.info(
-            "[clip]%s[/] plan: %d shots, %s runtime, %d pacing warnings, "
+            "[clip]%s[/] plan: %d beats, %d shots, %s runtime, %d pacing warnings, "
             "%s output tokens, $%.4f",
             project.slug,
+            len(cut.beats),
             len(timeline.tracks.video),
             _mmss(timeline.duration()),
             len(warnings),
@@ -2421,10 +2241,18 @@ def _ask_planner(
     clip_count: int,
     total_minutes: float,
     notes: str | None,
+    retry_note: str | None = None,
     max_tokens: int = DEFAULT_PLAN_MAX_TOKENS,
     client: OpenRouter | None = None,
 ) -> dict[str, Any]:
-    """Render the plan prompts and call the planner model once."""
+    """Render the plan prompts and call the planner model once.
+
+    Args:
+        retry_note: A correction appended to the user prompt after an answer
+            that broke a hard rule (see :class:`SpeechSecondsError`) — the
+            convention every AI stage here follows: show the model exactly what
+            was wrong with its own output and ask for the whole object again.
+    """
     model = settings.model("planner")
     system_prompt = render("plan.system", project_language=project.language)
     catalogue = load_sentences(project)
@@ -2448,6 +2276,8 @@ def _ask_planner(
     )
     if notes:
         user_prompt += f"\n\nEditor notes: {notes.strip()}"
+    if retry_note:
+        user_prompt += f"\n\n{retry_note.strip()}"
 
     spend: list[float] = []
 
@@ -2597,12 +2427,16 @@ __all__ = [
     "pacing_report",
     "load_footage_log",
     "footage_entries",
-    "build_timeline",
+    "instruction_ranges",
+    "rejected_take_ranges",
+    "build_cut",
+    "spans_of",
     "subtract_ranges",
     "units_for_ledger",
     "DEFAULT_PLAN_MAX_TOKENS",
     "EditPlan",
     "PlanError",
+    "SpeechSecondsError",
     "render_edit_plan_md",
     "render_narration_requests_md",
 ]

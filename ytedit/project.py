@@ -46,8 +46,8 @@ SUBDIRS: tuple[str, ...] = (
     "jobs",
 )
 
-#: Pipeline stages in order. ``denoise`` and ``tidy`` are optional repair
-#: stages: nothing downstream requires them, they just stay ``pending``.
+#: Pipeline stages in order. ``denoise``, ``voice`` and ``captions`` are
+#: optional: nothing downstream requires them, they just stay ``pending``.
 STAGES: tuple[str, ...] = (
     "ingest",
     "denoise",
@@ -55,8 +55,8 @@ STAGES: tuple[str, ...] = (
     "analyze",
     "sentences",
     "plan",
-    "tidy",
     "voice",
+    "captions",
     "music",
     "render",
     "qc",

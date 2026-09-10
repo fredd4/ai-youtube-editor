@@ -6,17 +6,16 @@ narration played twice, and retakes that survived into the cut. This module
 builds, from the already-transcribed and already-analyzed clips, a numbered
 catalogue of every sentence in the project (``<clip>#<n>``) so the planner
 (``ytedit.ai.plan``) can reference *sentences* instead of seconds, and
-:func:`ytedit.ai.plan.build_timeline` can validate that every reference is
-legal.
+:func:`ytedit.cut.resolve` — the one place that turns speech into seconds —
+can validate that every reference is legal.
 
 A sentence ends at a word whose text ends in ``.``, ``?``, ``!`` or ``…``, at a
 pause longer than :data:`SENTENCE_PAUSE_MAX`, or at the clip's last word —
-exactly the boundary rule :mod:`ytedit.ai.tidy` already uses to decide where a
-padded cut may extend to (:func:`ytedit.ai.tidy.ends_sentence`), reused here so
-the two stay in lockstep.
+the boundary rule of :func:`ytedit.words.ends_sentence`, which the resolver
+uses too, so the catalogue and the cut always agree on where a sentence ends.
 
 Each sentence carries three independent flags, all advisory to the planner and
-enforced deterministically by ``build_timeline``:
+enforced deterministically by :func:`ytedit.cut.validate`:
 
 * ``instruction`` — the sentence overlaps a spoken editor instruction
   (``analysis/<clip>.json.instructions[]``) and must never be used.
@@ -26,11 +25,14 @@ enforced deterministically by ``build_timeline``:
 * ``duplicate_of`` — the sentence's text is a near-duplicate (Jaccard word
   overlap >= :data:`DUPLICATE_JACCARD`) of a *later* sentence anywhere in the
   project (the last-take rule generalized across clips); it points at that
-  later sentence, unless the later one is itself an instruction.
+  later sentence, unless the later one is itself an instruction. Only
+  sentences of at least :data:`DUPLICATE_MIN_WORDS` distinct words are
+  compared: short remarks repeat all the time in real speech ("Zobaczcie.",
+  "Jest bardzo dobre.") without being a second take of anything.
 
 ``keep_default`` is ``true`` only when none of the three flags apply — a
 convenience hint for a human skimming ``analysis/sentences.md``, not something
-the planner or ``build_timeline`` reads.
+the planner or the resolver reads.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ytedit.ai.tidy import Word, ends_sentence, load_words
+from ytedit.words import Word, ends_sentence, load_words
 from ytedit.log import get_logger
 from ytedit.project import Project, utcnow
 
@@ -55,6 +57,14 @@ SENTENCE_PAUSE_MAX: float = 1.2
 #: Minimum normalized word-overlap (Jaccard) for two sentences to count as
 #: near-duplicates of each other.
 DUPLICATE_JACCARD: float = 0.7
+
+#: Distinct normalized words a sentence must have before it may be flagged a
+#: duplicate (on *both* sides of the pair). Below this the overlap measure is
+#: meaningless: "Zobaczcie." matches every other "Zobaczcie." in the trip, and
+#: two three-word remarks sharing two words already clear the Jaccard bar. The
+#: the reference project run produced four such false positives, each of them a real sentence
+#: the planner was then told to skip.
+DUPLICATE_MIN_WORDS: int = 4
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _EPS = 1e-6
@@ -119,7 +129,7 @@ def split_words_into_sentences(words: Sequence[Word]) -> list[list[Word]]:
 
     Args:
         words: Clip-time words, sorted by start (as returned by
-            :func:`ytedit.ai.tidy.load_words`).
+            :func:`ytedit.words.load_words`).
 
     Returns:
         A list of non-empty word groups, in order.
@@ -235,6 +245,13 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
 def flag_duplicates(ordered_sentences: list[dict[str, Any]]) -> None:
     """Set ``duplicate_of`` on the earlier of two near-duplicate sentences.
 
+    Only sentences with at least :data:`DUPLICATE_MIN_WORDS` distinct
+    normalized words take part, on both sides of the pair. A short phrase
+    ("Zobaczcie.", "Jest bardzo dobre.") is a thing people say twice in a trip
+    without meaning it as a retake, and at three words or fewer the Jaccard
+    measure cannot tell the two cases apart — flagging them cost the reference project four
+    perfectly good sentences.
+
     Args:
         ordered_sentences: Every sentence in the project, in chronological
             order (project clip order, then sentence order within a clip) —
@@ -243,10 +260,10 @@ def flag_duplicates(ordered_sentences: list[dict[str, Any]]) -> None:
     normalized = [_normalized_words(s["text"]) for s in ordered_sentences]
     n = len(ordered_sentences)
     for i in range(n):
-        if not normalized[i]:
+        if len(normalized[i]) < DUPLICATE_MIN_WORDS:
             continue
         for j in range(i + 1, n):
-            if not normalized[j]:
+            if len(normalized[j]) < DUPLICATE_MIN_WORDS:
                 continue
             if _jaccard(normalized[i], normalized[j]) >= DUPLICATE_JACCARD:
                 later = ordered_sentences[j]
@@ -484,6 +501,7 @@ def compact_footage_log_for_planner(
 __all__ = [
     "SENTENCE_PAUSE_MAX",
     "DUPLICATE_JACCARD",
+    "DUPLICATE_MIN_WORDS",
     "SentencesError",
     "build_clip_sentences",
     "build_sentence_catalogue",

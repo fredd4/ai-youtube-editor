@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from test_render import EXPECTED_DURATION, build_render_project
+from test_render import EXPECTED_DURATION, build_render_project, write_placeholder_cut
 from ytedit import qc as Q
+from ytedit.ai.sentences import write_sentences
 from ytedit.config import Settings
+from ytedit.cut import Beat, Cut, cut_path, load_cut, save_cut
 from ytedit.media.render import render
 from ytedit.project import Project
 
@@ -32,16 +34,55 @@ def master_report(mastered: Project) -> dict:
 
 
 def write_timeline(project: Project, document: dict) -> None:
-    """Write a timeline document into a project."""
+    """Write a timeline document, with a stand-in cut so the cut checks pass.
+
+    These tests exercise the *timeline* rules against timelines that are far
+    easier to state directly than to derive from a cut, so the cut written
+    here only has to validate: one ``broll`` beat per video segment, same clip
+    and range. It goes in first, because ``ensure_resolved`` re-resolves only
+    when the cut is the newer of the two.
+    """
+    write_placeholder_cut(project, document)
     project.timeline_file.write_text(
         json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
 
+def write_sentence_cut(project: Project, runs: list[list[str]]) -> None:
+    """A real cut of speech beats over a three-sentence ``c001``.
+
+    ``c001#3`` is a spoken editor instruction, so a run naming it is how a cut
+    error is provoked. Nothing is written to ``plan/timeline.json`` — the point
+    of these tests is what ``ytedit qc`` does with the *cut*.
+    """
+    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
+    project.transcript_path("c001").write_text(
+        json.dumps({
+            "clip": "c001", "language": "pl",
+            "words": [
+                {"t": "Pierwsze", "s": 1.0, "e": 1.4},
+                {"t": "zdanie.", "s": 1.45, "e": 1.9},
+                {"t": "Drugie", "s": 3.0, "e": 3.4},
+                {"t": "zdanie.", "s": 3.45, "e": 3.9},
+                {"t": "Wytnij", "s": 6.0, "e": 6.4},
+                {"t": "to.", "s": 6.45, "e": 6.8},
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    project.analysis_path("c001").write_text(
+        json.dumps({"clip": "c001", "instructions": [{"s": 5.9, "e": 6.9, "text": "wytnij to"}]}),
+        encoding="utf-8",
+    )
+    write_sentences(project)
+    beats = [Beat(kind="speech", clip="c001", sentences=list(run)) for run in runs]
+    save_cut(Cut(beats=beats), cut_path(project))
+
+
 def minimal(**overrides) -> dict:
     """A tiny valid timeline (one 4 s segment, no media dependencies)."""
     document: dict = {
-        "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
+        "version": 2, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
         "tracks": {"video": [
             {"id": "s001", "clip": "c001", "in": 0.0, "out": 4.0, "role": "cold-open"},
         ], "voice": [], "music": [], "captions": [], "sfx": []},
@@ -108,7 +149,7 @@ def test_find_rendered_prefers_the_master(mastered: Project) -> None:
 # ----------------------------------------------------------------------
 # timeline rules
 # ----------------------------------------------------------------------
-def test_qc_without_a_timeline_raises(project: Project) -> None:
+def test_qc_without_a_cut_or_a_timeline_raises(project: Project) -> None:
     with pytest.raises(Q.QCError, match="no timeline"):
         Q.qc(project, show_table=False)
 
@@ -269,173 +310,53 @@ def test_a_font_without_polish_glyphs_is_a_hard_failure(
     assert any(e.startswith("rule 21") for e in report["errors"])
 
 
-def test_duplicate_speech_audio_is_an_error(project: Project) -> None:
-    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
-    project.transcript_path("c001").write_text(json.dumps({
-        "clip": "c001", "language": "pl",
-        "words": [{"t": "Cześć", "s": 2.0, "e": 2.4}],
-    }), encoding="utf-8")
-    write_timeline(project, minimal(tracks={
-        "video": [
-            {"id": "s001", "clip": "c001", "in": 0.0, "out": 5.0, "role": "a-roll"},
-            {"id": "s002", "clip": "c001", "in": 1.0, "out": 6.0, "role": "a-roll"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
+
+# ----------------------------------------------------------------------
+# the cut checks (v1 rules 31-36, now ytedit.cut.validate under a `cut:` prefix)
+# ----------------------------------------------------------------------
+def test_a_project_without_a_cut_is_an_error(project: Project) -> None:
+    """The cut is the source of truth; a project with only a timeline is broken."""
+    project.timeline_file.write_text(
+        json.dumps(minimal(), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     report = Q.qc(project, show_table=False)
     assert report["ok"] is False
-    assert any(
-        e.startswith("rule 31") and "s001" in e and "s002" in e for e in report["errors"]
-    )
+    assert any(e.startswith("cut: no ") for e in report["errors"])
 
 
-def test_duplicate_ambient_audio_is_only_a_warning(project: Project) -> None:
-    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
-    # No transcript at all: the overlap carries no speech, so it is allowed.
-    write_timeline(project, minimal(tracks={
-        "video": [
-            {"id": "s001", "clip": "c001", "in": 0.0, "out": 5.0, "role": "cutaway"},
-            {"id": "s002", "clip": "c001", "in": 1.0, "out": 6.0, "role": "cutaway"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
-    report = Q.qc(project, show_table=False)
-    assert not any(e.startswith("rule 31") for e in report["errors"])
-    assert any(w.startswith("rule 31") and "ambient" in w for w in report["warnings"])
-
-
-def test_a_true_mid_sentence_cut_warns(project: Project) -> None:
-    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
-    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
-    project.transcript_path("c001").write_text(json.dumps({
-        "clip": "c001", "language": "pl",
-        "words": [
-            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
-            {"t": "Gamma", "s": 4.0, "e": 4.4}, {"t": "Delta.", "s": 4.6, "e": 6.0},
-        ],
-    }), encoding="utf-8")
-    write_timeline(project, minimal(tracks={
-        "video": [
-            {"id": "s001", "clip": "c001", "in": 0.9, "out": 4.5, "role": "a-roll"},
-            {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0, "role": "cutaway"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
-    report = Q.qc(project, show_table=False)
-    assert any(
-        w.startswith("rule 32") and "s001" in w and "mid-sentence" in w
-        for w in report["warnings"]
-    )
-
-
-def test_a_silent_cutaway_between_two_speech_pieces_is_a_rule_36_error(
-    project: Project,
-) -> None:
-    """A muted cutaway stranding one take between two speech pieces of the
-    same clip, with no ``audio_from`` — the exact defect ``ytedit tidy``'s
-    ``close_silent_interruptions`` fixes — is a hard error: it means the
-    timeline was never (re-)tidied.
-    """
-    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
-    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
-    project.transcript_path("c001").write_text(json.dumps({
-        "clip": "c001", "language": "pl",
-        "words": [
-            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
-            {"t": "Gamma", "s": 4.0, "e": 4.4}, {"t": "Delta.", "s": 4.6, "e": 6.0},
-        ],
-    }), encoding="utf-8")
-    write_timeline(project, minimal(tracks={
-        "video": [
-            {"id": "s001", "clip": "c001", "in": 0.7, "out": 3.45, "role": "a-roll"},
-            {"id": "s002", "clip": "c002", "in": 0.0, "out": 0.55, "role": "cutaway",
-             "mute_source": True},
-            {"id": "s003", "clip": "c001", "in": 4.4, "out": 6.45, "role": "a-roll"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
+def test_a_validator_error_is_a_qc_error(project: Project) -> None:
+    """A sentence claimed by two beats can no longer be a rule of its own."""
+    write_sentence_cut(project, [["c001#1"], ["c001#1"]])
     report = Q.qc(project, show_table=False)
     assert report["ok"] is False
-    assert any(
-        e.startswith("rule 36") and "s001" in e and "s003" in e
-        for e in report["errors"]
-    )
+    assert any(e.startswith("cut: sentence_reused") for e in report["errors"])
 
 
-def test_a_cutaway_already_carrying_audio_is_not_a_rule_36_error(project: Project) -> None:
-    """A cutaway that already has ``audio_from`` (or is not muted) is not a
-    silent interruption — rule 36 must stay quiet."""
-    project.add_clip({"id": "c001", "duration": 30.0, "orientation": "horizontal"})
-    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
-    project.transcript_path("c001").write_text(json.dumps({
-        "clip": "c001", "language": "pl",
-        "words": [
-            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
-            {"t": "Gamma", "s": 4.0, "e": 4.4}, {"t": "Delta.", "s": 4.6, "e": 6.0},
-        ],
-    }), encoding="utf-8")
-    write_timeline(project, minimal(tracks={
-        "video": [
-            {"id": "s001", "clip": "c001", "in": 0.7, "out": 3.45, "role": "a-roll"},
-            {"id": "s002", "clip": "c002", "in": 0.0, "out": 1.0, "role": "cutaway",
-             "audio_from": {"clip": "c001", "in": 3.45, "out": 4.45}},
-            {"id": "s003", "clip": "c001", "in": 4.45, "out": 6.45, "role": "a-roll"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
+def test_a_validator_warning_is_a_qc_warning(project: Project) -> None:
+    """Words inside an ambient B-roll beat: make it speech, or mute it."""
+    write_sentence_cut(project, [])
+    cut = load_cut(cut_path(project))
+    cut.beats = [Beat(kind="broll", clip="c001", **{"in": 0.0}, out=4.0)]
+    save_cut(cut, cut_path(project))
     report = Q.qc(project, show_table=False)
-    assert not any(e.startswith("rule 36") for e in report["errors"])
+    assert any(w.startswith("cut: speech_in_broll") for w in report["warnings"])
 
 
-def test_a_speech_segment_cut_off_far_from_its_sentence_end_is_a_rule_37_warning(
-    project: Project,
-) -> None:
-    """Rule 37 fires even when the rest of the sentence is too far away for
-    rule 32's narrower "true break" check to ever complete it — the broader,
-    story-continuity rule from the fourth review round.
-    """
-    project.add_clip({"id": "c001", "duration": 60.0, "orientation": "horizontal"})
-    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
-    project.transcript_path("c001").write_text(json.dumps({
-        "clip": "c001", "language": "pl",
-        "words": [
-            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
-        ],
-    }), encoding="utf-8")
-    write_timeline(project, minimal(tracks={
-        "video": [
-            # stops right after 'Alfa' — 'Beta.' is 0.2 s away but the next
-            # segment is a different clip entirely, so it is unreachable.
-            {"id": "s001", "clip": "c001", "in": 0.9, "out": 1.5, "role": "a-roll"},
-            {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0, "role": "cutaway"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
+def test_an_instruction_sentence_is_a_cut_error(project: Project) -> None:
+    write_sentence_cut(project, [["c001#3"]])
     report = Q.qc(project, show_table=False)
-    assert any(
-        w.startswith("rule 37") and "s001" in w and "mid-thought" in w
-        for w in report["warnings"]
-    )
+    assert report["ok"] is False
+    assert any(e.startswith("cut: instruction_sentence") for e in report["errors"])
 
 
-def test_a_sentence_ended_out_is_not_a_rule_37_warning(project: Project) -> None:
-    project.add_clip({"id": "c001", "duration": 60.0, "orientation": "horizontal"})
-    project.add_clip({"id": "c002", "duration": 10.0, "orientation": "horizontal"})
-    project.transcript_path("c001").write_text(json.dumps({
-        "clip": "c001", "language": "pl",
-        "words": [
-            {"t": "Alfa", "s": 1.0, "e": 1.4}, {"t": "Beta.", "s": 1.6, "e": 3.0},
-        ],
-    }), encoding="utf-8")
-    write_timeline(project, minimal(tracks={
-        "video": [
-            {"id": "s001", "clip": "c001", "in": 0.9, "out": 3.0, "role": "a-roll"},
-            {"id": "s002", "clip": "c002", "in": 0.0, "out": 2.0, "role": "cutaway"},
-        ],
-        "voice": [], "music": [], "captions": [], "sfx": [],
-    }))
+def test_a_clean_cut_resolves_and_leaves_the_timeline_current(project: Project) -> None:
+    write_sentence_cut(project, [["c001#1"], ["c001#2"]])
     report = Q.qc(project, show_table=False)
-    assert not any(w.startswith("rule 37") for w in report["warnings"])
+    assert not [e for e in report["errors"] if e.startswith("cut:")]
+    timeline = json.loads(project.timeline_file.read_text(encoding="utf-8"))
+    assert timeline["version"] == 2
+    assert [seg["clip"] for seg in timeline["tracks"]["video"]] == ["c001", "c001"]
+
 
 
 # ----------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Deterministic wind/background-noise scan over clip work audio.
 
 ``ytedit noise <slug>`` reads each clip's transcript (``transcripts/<clip>.json``,
-via :func:`ytedit.ai.tidy.load_words`) and its work audio
+via :func:`ytedit.words.load_words`) and its work audio
 (``media/audio/<clip>.wav``, 48 kHz mono ``pcm_s16le`` — the same file
 :mod:`ytedit.media.audio` denoises) and measures, purely from signal levels,
 whether the clip needs :func:`ytedit.media.audio.denoise_clips` before it goes
@@ -53,7 +53,7 @@ from ..project import utcnow
 from ..timeline import merge_ranges
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ..ai.tidy import Word
+    from ..words import Word
     from ..project import Project
 
 log = get_logger(__name__)
@@ -204,7 +204,7 @@ def scan_clip(project: "Project", clip_id: str, words: "list[Word] | None" = Non
     Args:
         project: Owning project.
         clip_id: Clip to scan.
-        words: Pre-loaded transcript words (:func:`ytedit.ai.tidy.load_words`
+        words: Pre-loaded transcript words (:func:`ytedit.words.load_words`
             output); loaded from disk when omitted.
 
     Returns:
@@ -213,7 +213,7 @@ def scan_clip(project: "Project", clip_id: str, words: "list[Word] | None" = Non
         than :data:`MIN_WORDS` words, no audio, or under
         :data:`MIN_SPAN_SECONDS` of gap or speech signal.
     """
-    from ..ai.tidy import load_words
+    from ..words import load_words
 
     wav = project.audio_path(clip_id)
     if not wav.exists():
@@ -355,7 +355,7 @@ def scan_project(
         settings.get("noise.snr_warn_db", DEFAULT_SNR_WARN_DB) if snr_warn_db is None else snr_warn_db
     )
 
-    from ..ai.tidy import load_words
+    from ..words import load_words
 
     state = project.load_state()
     clips: dict[str, Any] = state.get("clips", {})

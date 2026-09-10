@@ -1,7 +1,20 @@
-"""Quality control: the playbook rule checker over a timeline and its master.
+"""Quality control: the playbook rule checker over a cut, its timeline and its master.
 
-``qc(project)`` runs two families of checks and writes
+``qc(project)`` runs three families of checks and writes
 ``exports/qc_report.json`` plus a human-readable ``exports/qc_report.md``:
+
+**The cut** — ``plan/cut.json`` is the source of truth, so QC re-resolves it
+first (:func:`ytedit.cut.ensure_resolved`, so a hand-edited cut is never
+checked against a stale ``plan/timeline.json``) and then runs
+:func:`ytedit.cut.validate` over it, surfacing every issue it reports with a
+``cut: `` prefix — errors as errors, warnings as warnings. The old rules 31-37
+lived here to police cuts expressed in seconds (audio played twice, a cut
+landing mid-sentence, a pickup over on-camera speech, a dangling anchor, a
+pickup spilling past its picture, a silent interruption, a mid-thought cut).
+They are gone: in the cut model those failure modes are unrepresentable —
+every sentence/word range is claimed at most once, shots carry picture only
+and never their own audio, and narration is addressed by sentence id, so the
+resolver either lays a beat out correctly or refuses it.
 
 **Timeline rules** — pacing (delegated to :func:`ytedit.ai.plan.pacing_report`,
 which implements research rules 5-9), the structural marker template (rule 4),
@@ -9,24 +22,12 @@ a clean final 20 s for the end screen, the Polish ending guard on the mapped
 transcript (rule 8), vertical-clip handling (rule 15), caption bounds and the
 safe-area font check (rule 21), Content-ID pre-flight (every
 ``background_music`` flag the footage log raised must be answered by a
-``mute_range``, rule 19), the audio ledger dedupe check (no audio range may
-play twice, rule 31), a true-break sentence check (a cut where the audio
-actually stops landing mid-sentence, rule 32), a voice pickup overlapping a
-segment's own narration (rule 33), an anchor that could not be resolved
-against a stable segment (rule 34), a voice pickup spilling past the
-muted/ambient picture it was covered by (rule 35), a muted cutaway run
-stranding the narrator mid-take with no audio at all (rule 36), and a speech
-segment whose ``out`` is not a sentence end when the next segment's audio
-comes from somewhere else (rule 37). Rules 31-37 are not in
-``docs/research/youtube-production-playbook.md`` (1-30) — they encode rules
-added afterwards; see :mod:`ytedit.ai.ledger` (31),
-:attr:`ytedit.timeline.VideoSegment.uid` (33-35, the stable-anchor fix), and
-:mod:`ytedit.ai.overlay` (36-37, story continuity over cutaway pacing).
+``mute_range``, rule 19), the opening beat and the measured A-roll share.
 
 **Rendered file** — container and codec conformance (rule 23: H.264 High,
 yuv420p, faststart with ``moov`` ahead of ``mdat``, bt709 tags, AAC-LC
-48 kHz), the measured programme loudness (rule 16: −14 LUFS ±1, true peak
-≤ −1 dBTP) and the music-under-speech separation (rule 18: 14-18 LU).
+48 kHz), the measured programme loudness (rule 16: -14 LUFS +/-1, true peak
+<= -1 dBTP) and the music-under-speech separation (rule 18: 14-18 LU).
 
 Everything is advisory except the checks marked as errors; the return value is
 ``{"ok": bool, "errors": [...], "warnings": [...], "info": [...]}``.
@@ -38,14 +39,17 @@ import json
 import re
 import struct
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 from .log import console, get_logger
 from .media import audio as audio_mod
 from .media import captions as captions_mod
 from .media.ffmpeg import FFmpegError, ff, ffprobe_json
 from .project import Project, utcnow
-from .timeline import Timeline, speech_ranges_from_transcripts
+from .timeline import Timeline, TimelineVersionError, speech_ranges_from_transcripts
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .cut import Issue as CutIssue
 
 log = get_logger(__name__)
 
@@ -93,11 +97,6 @@ MIN_MEASURE_SECONDS: float = 3.0
 AAC_BITRATE_TARGET: int = 320_000
 #: ...this hard floor, under which it becomes an error.
 AAC_BITRATE_FLOOR: int = 192_000
-
-#: Rule 33: a voice pickup may overlap a segment carrying its own narration
-#: by up to this much (float/frame noise) before it is an error.
-VOICE_OVERLAP_TOLERANCE: float = 0.3
-
 
 class QCError(RuntimeError):
     """QC could not run at all (no timeline, unreadable media)."""
@@ -310,12 +309,79 @@ def measure_ranges_loudness(
 # ----------------------------------------------------------------------
 # timeline checks
 # ----------------------------------------------------------------------
+def _cut_message(issue: "CutIssue") -> str:
+    """One :class:`ytedit.cut.Issue` as a QC line: ``cut: <code> [<beat>]: <why>``."""
+    where = f" [{issue.beat}]" if issue.beat else ""
+    return f"cut: {issue.code}{where}: {issue.message}"
+
+
+def check_cut(project: Project, report: Report) -> bool:
+    """Re-resolve ``plan/cut.json`` and run :func:`ytedit.cut.validate` into ``report``.
+
+    The cut is the source of truth and ``plan/timeline.json`` is derived from
+    it, so this runs *before* any timeline rule: :func:`ytedit.cut.ensure_resolved`
+    rewrites the timeline whenever the cut is newer, which is what stops QC
+    from passing a hand-edited cut on the strength of a stale derived file.
+    Every issue the validator reports becomes a QC finding of the same
+    severity, prefixed ``cut: ``.
+
+    A project with no ``cut.json`` cannot be checked at all — the timeline
+    alone says nothing about which sentence a beat was meant to carry — so
+    that is an error pointing at ``ytedit migrate`` / ``ytedit plan``.
+
+    Args:
+        project: The project to check.
+        report: Report to accumulate into.
+
+    Returns:
+        ``True`` when the cut resolved, so ``plan/timeline.json`` is current
+        and the timeline/file rules are worth running; ``False`` when there is
+        no cut, or it has errors and the derived timeline was left stale.
+    """
+    from . import cut as cut_mod
+
+    path = cut_mod.cut_path(project)
+    if not path.exists():
+        report.error(
+            f"cut: no {project.rel(path)} — the cut is the source of truth since cut v2; "
+            f"run `ytedit migrate {project.slug}` to convert an older project, or "
+            f"`ytedit plan {project.slug}` to build one"
+        )
+        return False
+
+    try:
+        cut_mod.ensure_resolved(project)
+    except cut_mod.CutError as exc:
+        # The resolver refused the cut. Its issues *are* the validation
+        # result, so report them here and do not run validate() again.
+        for issue in exc.issues:
+            (report.error if issue.severity == "error" else report.warn)(_cut_message(issue))
+        report.checks["cut_errors"] = sum(1 for i in exc.issues if i.severity == "error")
+        return False
+    except Exception as exc:  # pragma: no cover - unreadable cut/project
+        report.error(f"cut: could not resolve {project.rel(path)}: {exc}")
+        return False
+
+    try:
+        issues = cut_mod.validate(project, cut_mod.load_cut(path))
+    except Exception as exc:  # pragma: no cover - defensive
+        report.error(f"cut: could not validate {project.rel(path)}: {exc}")
+        return False
+
+    for issue in issues:
+        (report.error if issue.severity == "error" else report.warn)(_cut_message(issue))
+    report.checks["cut_errors"] = sum(1 for i in issues if i.severity == "error")
+    report.checks["cut_warnings"] = sum(1 for i in issues if i.severity == "warning")
+    return True
+
+
 def check_timeline(project: Project, timeline: Timeline, report: Report) -> None:
-    """Run every timeline-level playbook rule into ``report``."""
-    # Resolve anchors against the timeline as it stands now (not whatever it
-    # held when last saved) so rule 34 sees fresh anchor_issues and rules 33/
-    # 35 check the pickups' actual current positions.
-    timeline.resolve_anchors()
+    """Run every timeline-level playbook rule into ``report``.
+
+    The timeline is a *derived* artifact (:func:`ytedit.cut.resolve`), so
+    nothing here re-resolves or repairs it: :func:`check_cut` has already made
+    sure it matches ``plan/cut.json``.
+    """
     total = timeline.duration()
     report.checks["duration"] = total
     report.checks["segments"] = len(timeline.tracks.video)
@@ -393,32 +459,6 @@ def check_timeline(project: Project, timeline: Timeline, report: Report) -> None
 
     # --- rule 21: the caption font must carry Polish -------------------
     _check_font(project, timeline, report)
-
-    # --- rule 31: no audio range may play twice -------------------------
-    _check_duplicate_audio(project, timeline, report)
-
-    # --- rule 32: a true cut landing mid-sentence ------------------------
-    _check_sentence_breaks(project, timeline, report)
-
-    # --- rule 33: a voice pickup over a segment's own narration ----------
-    for issue in voice_pickup_overlap_issues(project, timeline):
-        report.error(issue)
-
-    # --- rule 34: an anchor that could not be resolved -------------------
-    for issue in anchor_issue_messages(timeline):
-        report.error(issue)
-
-    # --- rule 35: a voice pickup spilling past its muted/ambient picture -
-    for issue in voice_spill_issues(project, timeline):
-        report.warn(issue)
-
-    # --- rule 36: a silent cutaway stranding a take mid-thought -----------
-    for issue in silent_interruption_issues(project, timeline):
-        report.error(issue)
-
-    # --- rule 37: a speech segment cut off, not at a sentence end --------
-    for issue in mid_thought_cut_issues(project, timeline):
-        report.warn(issue)
 
 
 def pacing_warnings(timeline: Timeline, settings: Any) -> list[str]:
@@ -537,300 +577,6 @@ def _check_font(project: Project, timeline: Timeline, report: Report) -> None:
         report.checks["caption_font"] = str(font_file)
     except captions_mod.CaptionFontError as exc:
         report.error(f"rule 21: {exc}")
-
-
-def _check_duplicate_audio(project: Project, timeline: Timeline, report: Report) -> None:
-    """Rule 31 (not in the 1-30 research playbook — the audio ledger dedupe
-    pass added afterwards): no audio range may be heard more than once.
-
-    Speech playing twice is an ERROR — it is the exact defect
-    :mod:`ytedit.ai.ledger` exists to fix, so seeing one here means a
-    hand-edited ``timeline.json`` was never run back through ``ytedit tidy``.
-    A repeated *ambient* range (no transcript word in it) is only a WARNING:
-    the dedupe pass allows those by default since a repeated splash of crowd
-    noise or wind is harmless.
-    """
-    try:
-        from .ai.ledger import find_duplicate_audio
-    except ImportError:  # pragma: no cover - AI layer not installed
-        log.debug("ytedit.ai.ledger is unavailable; skipping the audio-dedupe rule")
-        return
-    try:
-        findings = find_duplicate_audio(timeline, project)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("find_duplicate_audio failed: %s", exc)
-        return
-    for finding in findings:
-        ids = " / ".join(finding.ids)
-        message = (
-            f"rule 31: {finding.clip} {_mmss(finding.start)}-{_mmss(finding.end)} "
-            f"({finding.duration:.2f}s) plays twice — {ids}"
-        )
-        if finding.speech:
-            report.error(message)
-        else:
-            report.warn(message + " (ambient — allowed by default, but re-run `ytedit tidy`)")
-
-
-def _check_sentence_breaks(project: Project, timeline: Timeline, report: Report) -> None:
-    """Rule 32 (not in the 1-30 research playbook): a true cut — the audio
-    actually stops there, see :func:`ytedit.ai.tidy._is_continuous_handoff` —
-    landing in the middle of a sentence.
-
-    ``ytedit tidy`` already tries to fix every one of these (extend, or
-    retract/advance to the nearest complete sentence when extension is
-    blocked); a finding here means either ``tidy`` was never re-run after a
-    hand edit, or the cap/guard left it capped mid-sentence on purpose.
-    """
-    try:
-        from .ai.tidy import (
-            _in_head,
-            _is_continuous_handoff,
-            _out_tail,
-            has_sentence_marks,
-            load_words,
-        )
-    except ImportError:  # pragma: no cover - AI layer not installed
-        log.debug("ytedit.ai.tidy is unavailable; skipping the sentence-break rule")
-        return
-
-    cfg = project.settings
-    gap_max = max(0.0, float(cfg.get("pacing.sentence_gap_max", 1.2)))
-    merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
-    words_cache: dict[str, list] = {}
-    video = timeline.tracks.video
-
-    def words_for(clip_id: str) -> list:
-        if clip_id not in words_cache:
-            words_cache[clip_id] = load_words(project, clip_id)
-        return words_cache[clip_id]
-
-    for index, seg in enumerate(video):
-        if seg.mute_source:
-            continue
-        words = words_for(seg.clip)
-        if not words or not has_sentence_marks(words):
-            continue
-
-        next_seg = video[index + 1] if index + 1 < len(video) else None
-        if next_seg is None or not _is_continuous_handoff(seg, next_seg, merge_gap):
-            found = _out_tail(seg, words, gap_max)
-            if found is not None:
-                _last, tail = found
-                report.warn(
-                    f"rule 32: {seg.id} out at {_mmss(seg.out)} cuts mid-sentence "
-                    f"— next word would be '{tail[0].text}'"
-                )
-
-        prev_seg = video[index - 1] if index > 0 else None
-        if prev_seg is None or not _is_continuous_handoff(prev_seg, seg, merge_gap):
-            found_in = _in_head(seg, words, gap_max)
-            if found_in is not None:
-                _first, head = found_in
-                report.warn(
-                    f"rule 32: {seg.id} in at {_mmss(seg.in_)} opens mid-sentence "
-                    f"— previous word was '{head[0].text}'"
-                )
-
-
-def voice_pickup_overlap_issues(
-    project: Project, timeline: Timeline, tolerance: float = VOICE_OVERLAP_TOLERANCE
-) -> list[str]:
-    """Rule 33 (ERROR): a voice pickup must not run over a segment carrying
-    its own narration.
-
-    This is the exact failure mode that motivated stable segment identity
-    (see :attr:`ytedit.timeline.VideoSegment.uid`): a hand-edit or a stale
-    anchor can leave a pickup's absolute position sitting on top of a shot
-    that has its own spoken narration — the CTA plays over someone else's
-    sentence, or a narration pickup starts before the picture it was written
-    for. "Carries its own narration" means the segment is not muted and
-    either its own ``[in, out)`` (no ``audio_from``) or its ``audio_from``
-    range has a transcript word in it.
-
-    Args:
-        project: Project supplying transcripts.
-        timeline: The EDL to check.
-        tolerance: Overlap under this many seconds is not reported (frame
-            rounding, a deliberate handoff at the very edge of a cut).
-
-    Returns:
-        One message per offending (voice item, segment) pair.
-    """
-    words_cache: dict[str, list] = {}
-
-    def has_words(clip: str, s: float, e: float) -> bool:
-        if clip not in words_cache:
-            from .ai.tidy import load_words
-            words_cache[clip] = load_words(project, clip)
-        return any(w.e > s + 1e-6 and w.s < e - 1e-6 for w in words_cache[clip])
-
-    issues: list[str] = []
-    positions = timeline.segment_positions()
-    for item in timeline.tracks.voice:
-        end = item.end if item.end is not None else item.at
-        if end <= item.at:
-            continue
-        for pos in positions:
-            overlap = _overlap((item.at, end), (pos.start, pos.end))
-            if overlap <= tolerance + 1e-9:
-                continue
-            seg = pos.segment
-            if seg.mute_source:
-                continue
-            if seg.audio_from is not None:
-                clip, s, e = seg.audio_from.clip, seg.audio_from.in_, seg.audio_from.out
-            else:
-                clip, s, e = seg.clip, seg.in_, seg.out
-            if not has_words(clip, s, e):
-                continue
-            issues.append(
-                f"rule 33: voice {item.id} ({_mmss(item.at)}-{_mmss(end)}) overlaps "
-                f"{seg.id} ({clip} {_mmss(pos.start)}-{_mmss(pos.end)}) by {overlap:.2f}s, "
-                "which carries its own narration"
-            )
-    return issues
-
-
-def anchor_issue_messages(timeline: Timeline) -> list[str]:
-    """Rule 34 (ERROR): an anchor :meth:`Timeline.resolve_anchors` could not
-    resolve — uid not found and no unique signature match either.
-
-    Call ``timeline.resolve_anchors()`` before this so
-    :attr:`ytedit.timeline.Meta.anchor_issues` reflects the timeline as it
-    stands now, not whatever it held when the file was last saved.
-    """
-    return [f"rule 34: {issue}" for issue in timeline.meta.anchor_issues]
-
-
-def voice_spill_issues(project: Project, timeline: Timeline) -> list[str]:
-    """Rule 35 (WARNING): a voice pickup whose end runs past the last
-    muted/ambient picture under it — the narration spills into the next
-    scene instead of ending inside the B-roll it was covered by.
-
-    Walks forward from the segment the pickup starts under, for as long as
-    each further segment is muted or ambient (reuses
-    :func:`ytedit.ai.voice._is_coverable`, the same notion the pickup-growth
-    pass uses to decide what it may run over); if the pickup's end reaches
-    past where that run stops, it is spilling into a segment that was never
-    grown/inserted to cover it.
-    """
-    try:
-        from .ai.voice import _is_coverable
-    except ImportError:  # pragma: no cover - AI layer not installed
-        log.debug("ytedit.ai.voice is unavailable; skipping the voice-spill rule")
-        return []
-
-    issues: list[str] = []
-    positions = timeline.segment_positions()
-    for item in timeline.tracks.voice:
-        end = item.end if item.end is not None else item.at
-        if end <= item.at:
-            continue
-        # The segment that is on screen when the pickup starts: a pickup
-        # anchored to a cut starts exactly at one segment's end / the next
-        # one's start, so the end bound is exclusive.
-        idx = next(
-            (i for i, pos in enumerate(positions) if pos.start - 1e-6 <= item.at < pos.end - 1e-6),
-            None,
-        )
-        if idx is None:
-            continue
-        run_end = positions[idx].start
-        i = idx
-        while i < len(positions) and _is_coverable(project, positions[i].segment):
-            run_end = positions[i].end
-            i += 1
-        if end > run_end + 0.05:
-            issues.append(
-                f"rule 35: voice {item.id} ends at {_mmss(end)}, {end - run_end:.2f}s past "
-                f"the muted/ambient picture under it (ends {_mmss(run_end)}) — spills into "
-                "the next scene"
-            )
-    return issues
-
-
-def silent_interruption_issues(project: Project, timeline: Timeline) -> list[str]:
-    """Rule 36 (ERROR): a muted cutaway run leaves the narrator silent
-    mid-take.
-
-    Thin wrapper over :func:`ytedit.ai.overlay.find_silent_interruptions` —
-    the exact pattern :func:`ytedit.ai.overlay.close_silent_interruptions`
-    exists to fix on every ``ytedit tidy``. Seeing this here almost always
-    means a hand-edited ``timeline.json`` was never run back through tidy, or
-    the fix was blocked (a voice pickup covers the run, or the ledger already
-    claims the range it would need).
-    """
-    try:
-        from .ai.overlay import find_silent_interruptions
-    except ImportError:  # pragma: no cover - AI layer not installed
-        log.debug("ytedit.ai.overlay is unavailable; skipping the silent-interruption rule")
-        return []
-    try:
-        findings = find_silent_interruptions(timeline, project)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("find_silent_interruptions failed: %s", exc)
-        return []
-    return [f"rule 36: {finding}" for finding in findings]
-
-
-def mid_thought_cut_issues(project: Project, timeline: Timeline) -> list[str]:
-    """Rule 37 (WARNING): a speech segment's ``out`` is not a sentence end
-    when the next segment's audio comes from somewhere else — the thought is
-    cut, whether or not a nearby word would have let rule 32's narrower "true
-    break" check complete it.
-
-    Unlike rule 32 (:func:`_check_sentence_breaks`, which only fires when the
-    transcript has more words within ``pacing.sentence_gap_max`` to finish the
-    sentence with), this fires on *any* non-final last word — including one
-    where the rest of the sentence is too far away to ever be reachable. That
-    is exactly the story-continuity rule from the fourth review round: a
-    cutaway must land after the sentence that closes the thought, never in
-    the middle of it, no matter how far the next word actually sits.
-    """
-    try:
-        from .ai.tidy import Word, _inside, _is_continuous_handoff, ends_sentence, load_words
-    except ImportError:  # pragma: no cover - AI layer not installed
-        log.debug("ytedit.ai.tidy is unavailable; skipping the mid-thought-cut rule")
-        return []
-
-    cfg = project.settings
-    merge_gap = max(0.0, float(cfg.get("pacing.merge_gap", 0.15)))
-    words_cache: dict[str, list[Word]] = {}
-    video = timeline.tracks.video
-    issues: list[str] = []
-
-    def words_for(clip_id: str) -> list[Word]:
-        if clip_id not in words_cache:
-            words_cache[clip_id] = load_words(project, clip_id)
-        return words_cache[clip_id]
-
-    for index, seg in enumerate(video):
-        if seg.mute_source:
-            continue
-        words = words_for(seg.clip)
-        if not words:
-            continue
-        indices = _inside(seg, words)
-        if not indices:
-            continue
-        last = words[indices[-1]]
-        if ends_sentence(last):
-            continue
-        next_seg = video[index + 1] if index + 1 < len(video) else None
-        if next_seg is None:
-            # No hand-off to another source at all — that is rule 8's ending
-            # guard's concern (or simply the programme's own last word), not
-            # a cutaway interrupting a thought.
-            continue
-        if _is_continuous_handoff(seg, next_seg, merge_gap):
-            continue
-        issues.append(
-            f"rule 37: {seg.id} out at {_mmss(seg.out)} ends mid-thought (last word "
-            f"'{last.text}' doesn't close the sentence) while {next_seg.id} carries "
-            "different audio"
-        )
-    return issues
 
 
 # ----------------------------------------------------------------------
@@ -1198,12 +944,16 @@ def qc(
 ) -> dict[str, Any]:
     """Check a project's timeline (and its rendered master) against the playbook.
 
+    The cut is checked first (:func:`check_cut`), which also re-resolves
+    ``plan/timeline.json`` when ``plan/cut.json`` is newer — so what the
+    timeline and file rules run against is always the current cut.
+
     Args:
         project: Project to check.
         rendered: Rendered file to inspect. When omitted the newest
             ``exports/master_*.mp4`` is used, falling back to
-            ``renders/preview.mp4``; when nothing is rendered only the
-            timeline rules run.
+            ``renders/preview.mp4``; when nothing is rendered only the cut
+            and timeline rules run.
         timeline_path: Timeline to check (default ``plan/timeline.json``).
         show_table: Print the rich summary table.
 
@@ -1213,27 +963,56 @@ def qc(
         ``exports/qc_report.json`` alongside ``exports/qc_report.md``.
 
     Raises:
-        QCError: When there is no timeline to check.
+        QCError: When there is neither a cut nor a timeline to check.
     """
-    source = Path(timeline_path) if timeline_path else project.timeline_file
-    if not source.exists():
-        raise QCError(f"no timeline at {source} — run the plan stage first")
-
     project.ensure_dirs()
-    project.set_stage("qc", "running")
     report = Report()
-    try:
-        timeline = Timeline.load(source)
-        log.info("qc [stage]timeline[/] · %s", project.rel(source))
-        check_timeline(project, timeline, report)
+    log.info("qc [stage]cut[/]")
+    resolved = check_cut(project, report)
 
-        target = Path(rendered) if rendered else find_rendered(project)
-        if target is not None and target.exists():
-            master = target.parent == project.exports_dir
-            log.info("qc [stage]rendered[/] · %s", project.rel(target))
-            check_rendered(project, timeline, target, report, master=master)
+    from .cut import cut_path
+
+    source = Path(timeline_path) if timeline_path else project.timeline_file
+    if not source.exists() and not cut_path(project).exists():
+        raise QCError(
+            f"no timeline at {source} — run `ytedit plan {project.slug}` first"
+        )
+
+    project.set_stage("qc", "running")
+    try:
+        timeline: Timeline | None = None
+        if resolved and source.exists():
+            try:
+                timeline = Timeline.load(source)
+            except TimelineVersionError as exc:
+                # A v1 timeline that survived next to a cut (or a project that
+                # was never migrated): a version mismatch is not a playbook
+                # failure, it is a "nothing to check here" condition.
+                raise QCError(str(exc)) from exc
+
+        if timeline is None:
+            # The cut did not resolve (or there is none), so `timeline.json`
+            # is stale by design — see ytedit.cut.ensure_resolved. Judging the
+            # cut by a file it no longer describes is worse than not judging
+            # it, so the timeline and render rules are skipped and the cut
+            # errors above are the whole report.
+            report.warn(
+                "timeline and render rules skipped — fix the cut errors above and "
+                f"re-run `ytedit qc {project.slug}`"
+            )
         else:
-            report.warn("no rendered file found — run `ytedit render` before the file checks")
+            log.info("qc [stage]timeline[/] · %s", project.rel(source))
+            check_timeline(project, timeline, report)
+
+            target = Path(rendered) if rendered else find_rendered(project)
+            if target is not None and target.exists():
+                master = target.parent == project.exports_dir
+                log.info("qc [stage]rendered[/] · %s", project.rel(target))
+                check_rendered(project, timeline, target, report, master=master)
+            else:
+                report.warn(
+                    "no rendered file found — run `ytedit render` before the file checks"
+                )
 
         document = report.to_dict()
         document["project"] = project.slug

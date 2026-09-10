@@ -29,6 +29,8 @@ from ytedit.ai.music import (
     resolve_cues,
     styles_table,
 )
+from ytedit.cut import Beat, Cut, cut_path, load_cut, save_cut
+from ytedit.cut import MusicCue as CutMusicCue
 from ytedit.project import Project
 
 FAKE_MP3 = b"ID3\x03\x00" + b"\x00" * 512
@@ -80,9 +82,46 @@ def music_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Project:
 
 
 def write_plan(project: Project, cues: list[dict[str, Any]]) -> None:
+    """Write ``plan/edit_plan.json`` — only the *wording* fallback lives here."""
     project.edit_plan_file.write_text(
         json.dumps({"music_cues": cues}, ensure_ascii=False), encoding="utf-8"
     )
+
+
+def write_cut(project: Project, cues: list[dict[str, Any]]) -> None:
+    """Write ``plan/cut.json`` with one broll beat per cue, sized to its length.
+
+    Since cut v2 a cue's length is a fact about the cut — the start of its
+    ``from`` beat to the end of its ``to`` beat — so a cue can only be tested
+    against real beats. Each cue dict takes ``length_s`` plus whatever
+    style/mood/section wording it wants to carry.
+    """
+    project.save_state(
+        {
+            **project.load_state(),
+            "clips": {"c001": {"id": "c001", "duration": 600.0, "has_audio": False}},
+        }
+    )
+    beats: list[Beat] = []
+    music: list[CutMusicCue] = []
+    at = 0.0
+    for i, cue in enumerate(cues, 1):
+        length = float(cue.get("length_s", 30.0))
+        beat = Beat(kind="broll", clip="c001", **{"in": at}, out=at + length, audio="mute")
+        beats.append(beat)
+        at += length
+        extra = {k: v for k, v in cue.items() if k in ("style", "mood", "section", "prompt")}
+        music.append(
+            CutMusicCue(
+                id=str(cue.get("id") or f"m{i:03d}"),
+                file=str(cue.get("file") or f"music/m{i:03d}.mp3"),
+                **{"from": beat.uid},
+                to=beat.uid,
+                gain_db=float(cue.get("gain_db", -18.0)),
+                **extra,
+            )
+        )
+    save_cut(Cut(beats=beats, music=music), cut_path(project))
 
 
 # --------------------------------------------------------------------------- #
@@ -154,20 +193,55 @@ def test_normalize_cue_accepts_the_planner_cue_sheet_shape(music_project: Projec
     assert cue.style == "city-energy"  # picked from the mood tags
 
 
-def test_cues_come_from_the_edit_plan(music_project: Project) -> None:
-    write_plan(music_project, [{"section": "outro", "s": 0.0, "e": 30.0, "mood": "hopeful warm"}])
+def test_cues_come_from_the_cut(music_project: Project) -> None:
+    write_cut(music_project, [{"id": "m001", "section": "outro", "length_s": 30.0,
+                               "mood": "hopeful warm"}])
     assert len(cues_from_plan(music_project)) == 1
     cues = resolve_cues(music_project)
-    assert [c.id for c in cues] == ["01-outro"]
+    assert [c.id for c in cues] == ["m001"]
     assert cues[0].style == "outro-hopeful" and cues[0].length_s == 30.0
 
 
-def test_cues_from_nested_edit_plan_object(music_project: Project) -> None:
-    music_project.edit_plan_file.write_text(
-        json.dumps({"edit_plan": {"music_cues": [{"section": "a", "s": 0, "e": 10, "mood": "calm"}]}}),
-        encoding="utf-8",
-    )
-    assert len(cues_from_plan(music_project)) == 1
+def test_a_cue_length_is_its_beat_range_not_the_edit_plans_guess(music_project: Project) -> None:
+    """The edit plan's seconds are a planning guess; the cut is the fact."""
+    write_cut(music_project, [{"id": "m001", "section": "outro", "length_s": 42.0,
+                               "mood": "hopeful warm"}])
+    write_plan(music_project, [{"id": "m001", "section": "outro", "s": 0.0, "e": 999.0}])
+    assert cues_from_plan(music_project)[0]["length_s"] == pytest.approx(42.0)
+
+
+def test_a_cue_spanning_several_beats_is_as_long_as_the_whole_range(
+    music_project: Project,
+) -> None:
+    write_cut(music_project, [{"id": "m001", "length_s": 20.0}, {"id": "m002", "length_s": 30.0}])
+    cut = load_cut(cut_path(music_project))
+    cut.music = [cut.music[0]]
+    cut.music[0].to = cut.beats[1].uid
+    save_cut(cut, cut_path(music_project))
+    assert cues_from_plan(music_project)[0]["length_s"] == pytest.approx(50.0)
+
+
+def test_a_cue_whose_beats_are_gone_is_skipped(music_project: Project) -> None:
+    """A bed of the wrong length is worse than no bed — and is paid for."""
+    write_cut(music_project, [{"id": "m001", "length_s": 20.0}])
+    cut = load_cut(cut_path(music_project))
+    cut.music[0].from_ = cut.music[0].to = "deadbeef"
+    save_cut(cut, cut_path(music_project))
+    assert cues_from_plan(music_project) == []
+
+
+def test_cue_wording_falls_back_to_the_edit_plan(music_project: Project) -> None:
+    """A migrated cut keeps only file/gain/fades; the direction comes from the plan."""
+    write_cut(music_project, [{"id": "m001", "length_s": 30.0}])
+    write_plan(music_project, [{"id": "m001", "section": "outro", "mood": "hopeful warm"}])
+    cue = cues_from_plan(music_project)[0]
+    assert cue["section"] == "outro" and cue["mood"] == "hopeful warm"
+    assert resolve_cues(music_project)[0].style == "outro-hopeful"
+
+
+def test_no_cut_means_no_cues(music_project: Project) -> None:
+    write_plan(music_project, [{"section": "outro", "s": 0.0, "e": 30.0}])
+    assert cues_from_plan(music_project) == []
 
 
 def test_styles_argument_used_without_a_plan(music_project: Project) -> None:
@@ -185,7 +259,8 @@ def test_default_single_cue_from_project_mood(music_project: Project) -> None:
 
 
 def test_explicit_cues_win_over_the_plan(music_project: Project) -> None:
-    write_plan(music_project, [{"section": "outro", "s": 0, "e": 30, "mood": "hopeful"}])
+    write_cut(music_project, [{"id": "m001", "section": "outro", "length_s": 30.0,
+                               "mood": "hopeful"}])
     cues = resolve_cues(music_project, cues=[{"id": "manual", "style": "market-bustle", "length_s": 12}])
     assert [(c.id, c.style, c.length_s) for c in cues] == [("manual", "market-bustle", 30.0)]  # clamped to min_length_s
 
@@ -201,7 +276,8 @@ def test_estimate_cues_matches_the_published_rate() -> None:
 
 
 def test_generate_music_writes_track_sidecar_and_manifest(music_project: Project) -> None:
-    write_plan(music_project, [{"id": "arrival", "style": "arrival-warm", "length_s": 60, "section": "intro", "mood": "warm"}])
+    write_cut(music_project, [{"id": "arrival", "style": "arrival-warm", "length_s": 60,
+                               "section": "intro", "mood": "warm"}])
     results = generate_music(music_project)
     assert [r.status for r in results] == ["done"]
 

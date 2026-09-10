@@ -13,7 +13,7 @@ can be resumed and a preview can be diffed against a master):
    takes its audio from ``media/audio/<clip>.denoised.wav`` instead of the
    mezzanine's own stream (that file's mtime is in the key too). A segment
    carrying ``audio_from`` keeps its own picture but reads its audio from
-   another clip's range (an overlay cutaway with the narration running on
+   another clip's range (a shot with the beat's narration running on
    underneath); that range is trimmed or padded to the segment's own frame
    count, and the audio clip's mute ranges, denoised WAV and mtime all take part
    in the cache key.
@@ -437,8 +437,8 @@ def segment_mute_ranges(
 
     ``mute_ranges`` are expressed in the *clip*'s own time base and apply
     wherever that clip range is used. A segment only sees the intersection with
-    ``[in, out)``, shifted by ``in`` and divided by ``speed``. For an overlay
-    cutaway (``audio_from`` set) the ranges are read in the **audio** clip's
+    ``[in, out)``, shifted by ``in`` and divided by ``speed``. For a shot
+    (``audio_from`` set) the ranges are read in the **audio** clip's
     time base — that is the audio the filter graph actually attenuates.
 
     Args:
@@ -466,6 +466,48 @@ def segment_mute_ranges(
             )
         )
     return sorted(out)
+
+
+def segment_audio_window(seg: VideoSegment) -> tuple[float, float] | None:
+    """The segment's audible window in post-speed segment-local time.
+
+    Mirrors :func:`segment_mute_ranges`: :attr:`VideoSegment.audio_window` is
+    stored in the time base of whichever clip the segment's audio is read
+    from, while the filter graph runs after ``-ss <audio in>`` and ``atempo``.
+    Everything outside the returned window is silenced (see
+    :func:`audio_window_expr`).
+
+    Args:
+        seg: Segment being rendered.
+
+    Returns:
+        ``(start, end)`` seconds from the segment's own audio start, or
+        ``None`` when the whole segment is heard (no window, or one that
+        already covers the segment).
+    """
+    if seg.audio_window is None:
+        return None
+    speed = seg.speed if seg.speed > 0 else 1.0
+    _clip, src_in, src_out = seg.audio_source
+    start = max(float(seg.audio_window.in_), src_in)
+    end = min(float(seg.audio_window.out), src_out)
+    if start <= src_in + 1e-6 and end >= src_out - 1e-6:
+        return None
+    return round((start - src_in) / speed, 4), round((max(end, start) - src_in) / speed, 4)
+
+
+def audio_window_expr(window: tuple[float, float]) -> str:
+    """A ``volume`` filter that silences everything outside ``window``.
+
+    Args:
+        window: ``(start, end)`` in the time base of the stream the chain is
+            applied to (see :func:`segment_audio_window`).
+
+    Returns:
+        A single ``volume`` filter, ready to join into the segment's chain.
+    """
+    start, end = window
+    return f"volume=enable='not(between(t,{start:.4f},{end:.4f}))':volume=0"
 
 
 @functools.lru_cache(maxsize=256)
@@ -499,10 +541,15 @@ def segment_speech_ranges(project: Project, seg: VideoSegment) -> list[tuple[flo
 
     Mirrors :func:`segment_mute_ranges`: words come from the transcript of
     whichever clip the segment's audio is actually read from
-    (:attr:`VideoSegment.audio_source` — the ``audio_from`` clip for an overlay
-    cutaway), intersected with the borrowed range and divided by ``speed`` so
+    (:attr:`VideoSegment.audio_source` — the ``audio_from`` clip for a shot),
+    intersected with the borrowed range and divided by ``speed`` so
     the ranges land in the *post-``atempo``* time base the segment's mute and
     speech-leveling filters run in (see :func:`render_segment`).
+
+    A word the segment shows but silences — one outside its
+    :attr:`VideoSegment.audio_window` — is not speech as far as the render is
+    concerned: it must neither pull the cut's speech leveling nor duck the
+    music, so the words are clipped to the audible window as well.
 
     Args:
         project: Owning project (for the transcript file).
@@ -514,10 +561,14 @@ def segment_speech_ranges(project: Project, seg: VideoSegment) -> list[tuple[flo
     """
     speed = seg.speed if seg.speed > 0 else 1.0
     clip_id, src_in, src_out = seg.audio_source
+    heard_in, heard_out = src_in, src_out
+    if seg.audio_window is not None:
+        heard_in = max(heard_in, float(seg.audio_window.in_))
+        heard_out = min(heard_out, float(seg.audio_window.out))
     out: list[tuple[float, float]] = []
     for w_start, w_end in _clip_word_spans(project.transcript_path(clip_id)):
-        start = max(w_start, src_in)
-        end = min(w_end, src_out)
+        start = max(w_start, heard_in)
+        end = min(w_end, heard_out)
         if end <= start:
             continue
         out.append((round((start - src_in) / speed, 4), round((end - src_in) / speed, 4)))
@@ -593,7 +644,7 @@ def segment_key(
         mtime, size = 0, 0
     # Re-denoising a clip must invalidate every segment cut from it.
     denoise_stamp = _denoise_stamp(project, seg.clip)
-    # An overlay cutaway is only as fresh as the clip it borrows its audio from.
+    # A shot is only as fresh as the clip it borrows its audio from.
     audio_stamp: list[Any] | None = None
     audio_denoise_stamp: list[Any] | None = None
     if seg.audio_from is not None:
@@ -638,6 +689,14 @@ def segment_key(
         ),
         "audio_source": audio_stamp,
         "audio_denoised": audio_denoise_stamp,
+        # v2: narrowing (or widening) the audible window changes the sound of
+        # the cut without touching a single range, so it must invalidate it.
+        "audio_window": (
+            seg.audio_window.model_dump(by_alias=True, mode="json")
+            if seg.audio_window is not None
+            else None
+        ),
+        "audio_window_local": segment_audio_window(seg),
         "transcript": transcript_stamp,
         "speech_target_lufs": float(project.settings.get("audio.speech_target_lufs", -16.0)),
         "speech_gain_max_db": float(project.settings.get("audio.speech_gain_max_db", 10.0)),
@@ -829,7 +888,7 @@ def render_segment(
         f":channel_layouts={'stereo' if channels == 2 else 'mono'}"
     )
 
-    # An overlay cutaway keeps this picture but borrows its sound (and its
+    # A shot keeps this picture but borrows its sound (and its
     # denoise state, and the time base of its mute ranges) from another clip.
     audio_clip, audio_in, audio_out = seg.audio_source
     if seg.audio_from is not None:
@@ -891,6 +950,14 @@ def render_segment(
         achain.append(_atempo(speed))
         if abs(seg.source_audio_gain_db) > 1e-6:
             achain.append(f"volume={audio_mod.db_to_linear(seg.source_audio_gain_db):.6f}")
+        # v2: silence whatever this segment shows but must not be heard (the
+        # fraction of a neighbouring word the picture extension put on
+        # screen). Applied in the same post-atempo, post--ss time base as the
+        # mute ranges, and *before* the speech measurement below so a silenced
+        # word never pulls the cut's level.
+        window = segment_audio_window(seg)
+        if window is not None:
+            achain.append(audio_window_expr(window))
         mutes = segment_mute_ranges(timeline, seg)
         if mutes:
             achain.append(audio_mod.mute_ranges_expr(mutes))
@@ -1125,27 +1192,13 @@ def preflight(
     """
     issues = timeline.validate(project, skip_music=no_music, skip_voice=no_voice)
 
-    # Same checks as ``ytedit qc`` rules 33/34/36 (not a copy): an anchor that
-    # never resolved to a stable segment (rule 34, whatever track it is on),
-    # a voice pickup sitting over a segment's own narration unless this render
-    # ignores the voice track entirely (rule 33), and a muted cutaway run
-    # stranding the narrator mid-take with no audio at all (rule 36) — a
-    # silent interruption is exactly the defect ``ytedit tidy`` is supposed to
-    # have already closed, so refusing to render it forces a re-tidy rather
-    # than shipping the mute. Better to catch the
-    # Chinchero-street party-over-the-pole-raising class of bug before rendering
-    # than after.
-    from ..qc import (
-        anchor_issue_messages,
-        silent_interruption_issues,
-        voice_pickup_overlap_issues,
-    )
-
-    timeline.resolve_anchors()
-    issues += anchor_issue_messages(timeline)
-    issues += silent_interruption_issues(project, timeline)
-    if not no_voice:
-        issues += voice_pickup_overlap_issues(project, timeline)
+    # The defects preflight used to look for here — a pickup over a segment's
+    # own narration, a dangling anchor, a muted run stranding the narrator —
+    # cannot be expressed in the cut model at all: every sentence range is
+    # used by exactly one beat, a shot never carries audio of its own, and a
+    # voice beat's picture is checked by the resolver (``voice_picture_short``).
+    # ``ytedit.cut.validate`` is the gate, run by ``ytedit validate``/``qc``
+    # and implicitly by ``ensure_resolved`` before this function is reached.
 
     checked: set[str] = set()
     for seg in timeline.tracks.video:

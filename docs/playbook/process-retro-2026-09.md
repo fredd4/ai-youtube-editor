@@ -80,8 +80,44 @@ ingest ~2 h (HLG tonemap), each full render 25–45 min.
 
 1. **Draft first, always.** Every review round is a light draft from proxies (`render --draft`; measured on the 18:27 The reference project cut: 10.6 min cold with a test suite running alongside, of which 8.3 min was the segment pass — subsequent drafts reuse the draft cache and take ~2–3 min), never a master. The master is rendered once, after the user's OK, on the hardware tier. Rationale: three masters were rendered on this project, each an hour of machine time, and every one was superseded by a note that a draft would have surfaced.
 2. **Identity, not position.** Anything that must stay attached to a picture (pickups, captions, chapters) references a stable segment uid, never an absolute time or an ordinal. Two of the three correction rounds were drift bugs of this kind.
-3. **Machine-checkable gates before every hand-over.** QC 31–35 (no audio twice, sentence boundaries, pickup over speech, anchors) plus the script check and the reports of `voice`/`captions`. If a class of error reaches the user, the fix is a rule, not a manual check.
-4. **No scratch scripts on the timeline.** Every splice goes through `Timeline.insert_segments/remove_segments/replace_segment` or a CLI stage. The scratch script that renumbered segments is exactly how round three happened.
+3. **Machine-checkable gates before every hand-over.** QC 31–35 (no audio twice, sentence boundaries, pickup over speech, anchors) plus the script check and the reports of `voice`/`captions`. If a class of error reaches the user, the fix is a rule, not a manual check. *(Superseded by §5: those four rules describe defects the v2 model cannot express, so they were deleted rather than kept — `ytedit validate` is the gate now.)*
+4. **No scratch scripts on the timeline.** Every splice goes through a CLI stage or the editor. The scratch script that renumbered segments is exactly how round three happened. *(Superseded by §5: the timeline has no edit API any more because nothing edits a timeline — edits are beats in `plan/cut.json` and the file is re-resolved from scratch.)*
 5. **Ask for the timecode, then look it up.** `ytedit at` turns "at 4:27" into segment and sentence ids; guessing from memory of the cut is how narration was moved to the wrong place.
 6. **Cost and disk are budgets, not surprises.** Denoise everything the user speaks in (about $0.12 per clip minute), generate music once the cut is stable, `clean` after every master, keep 20 GB free.
 7. **The story is a script, and story beats dynamics.** A cutaway never mutes the narrator mid-thought: either the narration continues underneath or the cut comes after the closing sentence; shot-length ceilings are soft. Compression drops whole thoughts, never words. Sentences are the unit; retakes and semantic repeats are removed before picture exists; a summary-level callback is fine, a restated fact is not.
+
+## 5. Why the v1 edit model was replaced (2026-09-09)
+
+The three correction rounds above were all one bug wearing different clothes, and §4.2 named
+the symptom rather than the cause. v1 stored the edit as an EDL in **seconds**
+(`plan/timeline.json`) and made that file the source of truth. Nothing in seconds knows where
+a word starts, so every producer and every fixer — the planner, the speech pad, the sentence
+snap, the overlay cutaways, the audio ledger, the anchors, the web editor — had to re-derive
+the word boundaries from the transcript in order not to chop one, and each of them moved the
+others' cuts. About 4 000 lines existed only to police cuts given in seconds, and they
+disagreed: the cutaway hand-off that replayed 0.05–0.15 s of a word, the cut landing on the
+last syllable, the voice-over ending inside "początkowo" were all two correct passes
+arriving at different numbers for the same boundary.
+
+Cut v2 removes the class instead of adding a sixth pass. `plan/cut.json` is the edit and
+addresses speech by **sentence id**; `ytedit/cut.py: resolve()` is the only code in the system
+that turns a sentence into a second, and `plan/timeline.json` is its derived output — safe to
+delete, never edited. What used to be checked is now structural: a sentence can be claimed by
+one beat only, so no audio can play twice (the ledger and QC rules 31–36 are deleted, not
+ported); a speech beat *is* whole sentences, so no cut can land mid-sentence; a shot carries
+no audio of its own, so no insert can mute the narrator mid-thought; and a pickup or a caption
+names a beat rather than a time, so there is nothing left for an anchor to drift against
+(§4.2's fix, one level deeper). The one rule that survives as a *setting* is the air around
+speech, and it moved into the resolver: the picture always gets the full pad, and only the
+audible window is pulled back off a neighbouring word.
+
+It is not a smaller codebase — `ytedit/cut.py` (1 416 lines) plus `ytedit/migrate.py`
+(1 136, a one-off) and `ytedit/words.py` (97) roughly replace the 2 325 lines of
+`ai/tidy.py` + `ai/overlay.py` + `ai/ledger.py` and the 337 that came off `timeline.py`.
+The win is not line count, it is that the remaining code is in **one** place instead of six
+that had to agree with each other.
+
+The lesson for the next design decision of this size: when the same defect keeps coming back
+in a new pass's clothing, the passes are not the problem — the representation they are all
+guessing against is. Making the ambiguity unrepresentable was cheaper than making six passes
+agree, and it is the only version of the fix that stays fixed.

@@ -2,8 +2,8 @@
 
 the user records narration requests (``n001``...) and extra "gap pickups" on his
 phone at home and drops the WAVs into ``voice/incoming/``. This module turns
-each one into a placed :class:`~ytedit.timeline.VoiceItem`, doing by machine
-what the editor-in-chief was doing by hand with scratch scripts:
+each one into a ``voice`` beat of ``plan/cut.json``, doing by machine what the
+editor-in-chief was doing by hand with scratch scripts:
 
 1. Transcribe the WAV (ElevenLabs Scribe, word timestamps) — see
    :func:`_transcribe_voice_file`, reusing the cost-logged pattern of
@@ -16,21 +16,22 @@ what the editor-in-chief was doing by hand with scratch scripts:
    usual pads (``pacing.speech_pad_before``/``_after``). The kept ranges are
    cut from the source with one ffmpeg ``aselect``/``asetpts`` chain
    (:func:`_render_voice_wav`) into ``voice/<label>.wav``.
-3. Place it: a manifest entry either names an explicit ``anchor`` (a video
-   segment id) or a narration ``request`` id from ``plan/edit_plan.json``,
-   resolved against ``plan/timeline.json`` best-effort
-   (:func:`resolve_anchor`). When the pickup runs longer than the muted
-   picture underneath it, the last muted/ambient segment in the run is grown
-   and, if still short, extra muted B-roll from the manifest's ``broll_pool``
-   is inserted, until the narration is fully covered
-   (:func:`_cover_voice_item`) — reusing
-   :func:`ytedit.ai.tidy._shift_map`/``_retime_absolute_tracks`` so every
-   other absolute-time track (captions, music, chapters, markers, other
-   voice items) re-times exactly like a ``ytedit tidy`` pass would.
+3. Place it (:func:`resolve_beat`, :func:`place_voice_beat`): a manifest entry
+   either names an explicit ``after`` (a beat of ``plan/cut.json``) or a
+   narration ``request`` id from ``plan/edit_plan.json``, whose
+   ``place_after_segment`` text is matched to a beat best-effort. A ``voice``
+   beat is inserted **immediately after** that beat and takes its picture from
+   the ``broll`` beats that follow: they are moved out of the beat list and
+   into the pickup's ``shots`` until they cover the WAV, keeping their own
+   sound only if all of them had it. Nothing else moves —
+   in cut v2 music, captions, chapters and markers are all positioned *by
+   beat*, so inserting one shifts no other track's timing and there is no
+   shift map to maintain.
 
-A timeline with ``meta.edited_by_human`` is never overwritten directly — a
-fresh ``voice`` run writes ``plan/timeline.draft.json`` instead, same as
-``plan``/``tidy`` (playbook §1.5), unless ``--force``.
+Everything downstream is derived: ``ytedit.cut.resolve`` turns the edited cut
+into ``plan/timeline.json`` at the end of the run. A cut with
+``meta.edited_by_human`` is never overwritten directly — a fresh ``voice`` run
+writes ``plan/cut.draft.json`` instead (playbook §1.5), unless ``--force``.
 
 See ``docs/playbook/editing-playbook.md`` §5 for the manifest format and what
 the user still reviews by hand (``voice/incoming/report.md``).
@@ -47,20 +48,13 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from ytedit.ai.sentences import split_words_into_sentences
-from ytedit.ai.tidy import Word, load_words
-from ytedit.config import Settings
+from ytedit import cut as cutlib
+from ytedit.ai.sentences import load_sentence_index, split_words_into_sentences
+from ytedit.cut import Beat, Cut, Shot
 from ytedit.log import get_logger
 from ytedit.media.ffmpeg import FFmpegError, ff
 from ytedit.project import Project
-from ytedit.timeline import (
-    AnchorSignature,
-    Timeline,
-    Transform,
-    VideoSegment,
-    VoiceAnchor,
-    VoiceItem,
-)
+from ytedit.words import Word
 
 log = get_logger(__name__)
 
@@ -98,8 +92,11 @@ INSTRUCTION_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-_SEGMENT_ID_RE = re.compile(r"\bs\d{3,}\b")
+_BEAT_ID_RE = re.compile(r"\bb\d{3,}\b")
 _CLIP_ID_RE = re.compile(r"\bc\d{3,}\b")
+
+#: How much of a beat's first sentence the draft manifest's beat listing shows.
+_CATALOGUE_TEXT_CHARS = 64
 
 
 class VoiceError(RuntimeError):
@@ -111,16 +108,21 @@ class VoiceError(RuntimeError):
 # ----------------------------------------------------------------------
 @dataclass
 class ManifestEntry:
-    """One row of ``voice/incoming/manifest.yaml``."""
+    """One row of ``voice/incoming/manifest.yaml``.
+
+    A pickup is placed *between* beats, so there is no ``offset``: ``after``
+    names the beat the pickup follows and that is the only position a
+    ``voice`` beat can have. (``anchor``, the v1 video-segment id, is gone
+    with the segments it referenced.)
+    """
 
     file: str
     request: str | None = None
-    anchor: str | None = None
-    offset: float = 0.0
+    #: A beat of ``plan/cut.json``: its display id (``b012``) or its uid.
+    after: str | None = None
     label: str | None = None
     cuts: list[tuple[float, float]] = field(default_factory=list)
     keep_takes: str = "last"
-    broll_pool: list[tuple[str, float, float]] = field(default_factory=list)
 
     @property
     def target_label(self) -> str:
@@ -134,9 +136,77 @@ def manifest_path(project: Project) -> Path:
 
 
 def _draft_manifest_entries(project: Project) -> list[dict[str, Any]]:
+    """One blank row per WAV sitting in ``voice/incoming/``."""
     incoming = project.voice_incoming_dir
     names = sorted(p.name for p in incoming.glob("*.wav")) if incoming.exists() else []
-    return [{"file": name, "request": None} for name in names]
+    return [{"file": name, "request": None, "after": None} for name in names]
+
+
+def _beat_catalogue_lines(project: Project, cut: Cut) -> list[str]:
+    """One readable line per beat, for the draft manifest's comment block.
+
+    the user fills ``after:`` in by hand, so the draft has to tell him what the
+    beats *are* — a bare ``b047`` is unanswerable without opening the editor.
+    A speech beat is named by the text of its first sentence, a B-roll beat by
+    its clip range, a pickup by its file.
+    """
+    index = load_sentence_index(project)
+    lines: list[str] = []
+    for beat in cut.beats:
+        label = beat.id or beat.uid
+        clip = beat.clip or "-"
+        if beat.kind == "speech":
+            what = _first_sentence_text(beat, index)
+            body = f"{clip:<6} {what}"
+        elif beat.kind == "broll":
+            body = f"{clip:<6} {float(beat.in_ or 0.0):.2f}-{float(beat.out or 0.0):.2f}s"
+        else:
+            body = f"{'-':<6} {beat.file or '(no file)'}"
+        lines.append(f"{label}  {beat.kind:<6} {body}".rstrip())
+    return lines
+
+
+def _first_sentence_text(beat: Beat, index: Mapping[str, Mapping[str, Any]]) -> str:
+    """The quoted opening of a speech beat, truncated for the beat listing."""
+    if beat.sentences:
+        sent = index.get(beat.sentences[0])
+        text = str((sent or {}).get("text", "")).strip()
+        if not text:
+            return f"({beat.sentences[0]})"
+        if len(text) > _CATALOGUE_TEXT_CHARS:
+            text = text[: _CATALOGUE_TEXT_CHARS - 1].rstrip() + "…"
+        return f'"{text}"'
+    if beat.words is not None:
+        return f"words {int(beat.words[0])}-{int(beat.words[1])}"
+    return "(no sentences)"
+
+
+def _draft_manifest_text(project: Project, cut: Cut | None) -> str:
+    """The full text of a drafted ``manifest.yaml``: help, beat listing, rows."""
+    rows = _draft_manifest_entries(project)
+    head = [
+        "# voice/incoming/manifest.yaml — one entry per WAV in voice/incoming/.",
+        "#",
+        "#   request:    a narration request id from plan/edit_plan.json (nNNN)",
+        "#   after:      a beat of plan/cut.json (b012, or a beat uid) — the pickup",
+        "#               is inserted right after it and takes its picture from the",
+        "#               B-roll beats that follow. `after` wins over `request`.",
+        "#   label:      output basename -> voice/<label>.wav (default: the request",
+        "#               id, else the file stem)",
+        "#   cuts:       [[s, e], ...] extra manual cuts, in source seconds",
+        "#   keep_takes: last (default) | first",
+        "#",
+        "# There is no `offset:` — a voice beat sits *between* beats, so a pickup",
+        "# can only start where a beat starts.",
+        "#",
+    ]
+    if cut is not None and cut.beats:
+        head.append("# Beats of plan/cut.json:")
+        head.append("#")
+        head.extend(f"#   {line}" for line in _beat_catalogue_lines(project, cut))
+        head.append("#")
+    body = yaml.safe_dump(rows, allow_unicode=True, sort_keys=False) if rows else "[]\n"
+    return "\n".join(head) + "\n" + body
 
 
 def _as_pair(raw: Any) -> tuple[float, float] | None:
@@ -148,17 +218,14 @@ def _as_pair(raw: Any) -> tuple[float, float] | None:
     return None
 
 
-def _as_triple(raw: Any) -> tuple[str, float, float] | None:
-    if isinstance(raw, (list, tuple)) and len(raw) == 3:
-        try:
-            return str(raw[0]), float(raw[1]), float(raw[2])
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def load_manifest(project: Project) -> list[ManifestEntry]:
+def load_manifest(project: Project, cut: Cut | None = None) -> list[ManifestEntry]:
     """Read ``voice/incoming/manifest.yaml``, writing a draft when it's missing.
+
+    Args:
+        project: The owning project.
+        cut: The cut the pickups will be placed on. Only used to list the
+            beats the user can choose from in the drafted manifest's comment
+            block; ``None`` simply omits that listing.
 
     Raises:
         VoiceError: When the manifest does not exist yet (a draft listing
@@ -170,15 +237,15 @@ def load_manifest(project: Project) -> list[ManifestEntry]:
     path = manifest_path(project)
     if not path.exists():
         drafted = _draft_manifest_entries(project)
-        path.write_text(
-            yaml.safe_dump(drafted, allow_unicode=True, sort_keys=False) if drafted else "[]\n",
-            encoding="utf-8",
-        )
+        path.write_text(_draft_manifest_text(project, cut), encoding="utf-8")
         raise VoiceError(
             f"no manifest at {path} — wrote a draft listing {len(drafted)} wav(s) with "
-            "`request: null`. Fill in `request: nNNN` (a narration request id from "
-            "plan/edit_plan.json) or `anchor: sNNN` + `label:` for each file, then "
-            f"re-run `ytedit voice {project.slug}`."
+            "`request: null` and `after: null`, above a listing of the cut's beats. "
+            "Fill in `request: nNNN` (a narration request id from plan/edit_plan.json) "
+            "or `after: bNNN` (the beat of plan/cut.json the pickup follows) + "
+            "`label:` for each file, then re-run "
+            f"`ytedit voice {project.slug}`. There is no `offset:` any more: a voice "
+            "beat sits between beats."
         )
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
@@ -192,17 +259,14 @@ def load_manifest(project: Project) -> list[ManifestEntry]:
         if not isinstance(item, dict) or not item.get("file"):
             continue
         cuts = [p for p in (_as_pair(c) for c in (item.get("cuts") or [])) if p is not None]
-        pool = [t for t in (_as_triple(c) for c in (item.get("broll_pool") or [])) if t is not None]
         entries.append(
             ManifestEntry(
                 file=str(item["file"]),
                 request=str(item["request"]) if item.get("request") else None,
-                anchor=str(item["anchor"]) if item.get("anchor") else None,
-                offset=float(item.get("offset", 0.0) or 0.0),
+                after=str(item["after"]) if item.get("after") else None,
                 label=str(item["label"]) if item.get("label") else None,
                 cuts=cuts,
                 keep_takes=str(item.get("keep_takes", "last") or "last").strip().lower(),
-                broll_pool=pool,
             )
         )
     return entries
@@ -494,7 +558,7 @@ def _render_voice_wav(src: Path, ranges: Sequence[tuple[float, float]], out_path
 
 
 # ----------------------------------------------------------------------
-# placement: narration request / explicit anchor -> VoiceAnchor
+# placement: narration request / explicit `after` -> a beat of the cut
 # ----------------------------------------------------------------------
 def _load_edit_plan(project: Project) -> dict[str, Any]:
     path = project.edit_plan_file
@@ -515,291 +579,161 @@ def _narration_requests(edit_plan: Mapping[str, Any]) -> dict[str, dict[str, Any
     return out
 
 
-def _target_segment(timeline: Timeline, text: str) -> VideoSegment | None:
-    """Best-effort: an exact segment id in ``text``, else its first clip's
-    segment, else the segment starting at a beat marker named in ``text``."""
-    video = timeline.tracks.video
-    match = _SEGMENT_ID_RE.search(text)
+def _target_beat(cut: Cut, text: str) -> Beat | None:
+    """Best-effort: the beat a narration request's prose describes.
+
+    Tried in order: an explicit beat id (``b012``) in the text, the first beat
+    cut from the clip it names (``c048``), and finally the beat carrying a
+    marker whose label occurs in the text ("bridge to Porto"). The planner
+    writes ``place_after_segment`` as free prose, so this stays deliberately
+    forgiving — an unresolved entry is reported, never guessed at.
+    """
+    match = _BEAT_ID_RE.search(text)
     if match:
-        seg = next((s for s in video if s.id == match.group(0)), None)
-        if seg is not None:
-            return seg
+        beat = cut.beat_by_ref(match.group(0))
+        if beat is not None:
+            return beat
     match = _CLIP_ID_RE.search(text)
     if match:
-        seg = next((s for s in video if s.clip == match.group(0)), None)
-        if seg is not None:
-            return seg
+        beat = next((b for b in cut.beats if b.clip == match.group(0)), None)
+        if beat is not None:
+            return beat
     lowered = text.lower()
-    for marker in timeline.markers:
+    for marker in cut.markers:
         label = str(marker.label or "").strip().lower()
         if label and label in lowered:
-            pos = timeline.segment_at(marker.at)
-            if pos is not None:
-                return pos.segment
+            beat = cut.beat_by_ref(marker.beat)
+            if beat is not None:
+                return beat
     return None
 
 
-def _make_anchor(segment: VideoSegment, offset: float) -> VoiceAnchor:
-    """Build a :class:`VoiceAnchor` pinned to ``segment`` by uid + signature."""
-    return VoiceAnchor(
-        segment=segment.id,
-        offset=offset,
-        uid=segment.uid,
-        signature=AnchorSignature(clip=segment.clip, **{"in": segment.in_}),
-    )
+def resolve_beat(
+    cut: Cut, edit_plan: Mapping[str, Any], entry: ManifestEntry
+) -> tuple[Beat | None, str]:
+    """Resolve one manifest entry's placement to the beat the pickup follows.
 
+    An explicit ``after`` wins over a ``request``: it is what the user wrote by
+    hand after reading the report, and it must not be second-guessed by a
+    text match.
 
-def _anchor_after(timeline: Timeline, target: VideoSegment) -> VoiceAnchor:
-    video = timeline.tracks.video
-    idx = next(i for i, s in enumerate(video) if s.id == target.id)
-    if idx + 1 < len(video):
-        return _make_anchor(video[idx + 1], 0.0)
-    return _make_anchor(target, round(target.duration, 3))
-
-
-def resolve_anchor(
-    timeline: Timeline, edit_plan: Mapping[str, Any], entry: ManifestEntry
-) -> tuple[VoiceAnchor | None, str]:
-    """Resolve one manifest entry's placement to a :class:`VoiceAnchor`.
+    Args:
+        cut: The cut to place against.
+        edit_plan: ``plan/edit_plan.json`` (or ``{}``), for its narration
+            requests.
+        entry: The manifest row.
 
     Returns:
-        ``(anchor, reason)`` — ``anchor`` is ``None`` when unresolved, and
-        ``reason`` explains either the resolution or the failure (for the
-        report).
+        ``(beat, reason)`` — ``beat`` is ``None`` when unresolved, and
+        ``reason`` explains either the resolution or the failure (it goes
+        straight into ``voice/incoming/report.md``).
     """
-    if entry.anchor:
-        seg = next((s for s in timeline.tracks.video if s.id == entry.anchor), None)
-        if seg is None:
-            return None, f"anchor segment {entry.anchor!r} not found in timeline.json"
-        return (
-            _make_anchor(seg, entry.offset),
-            f"explicit anchor {entry.anchor} +{entry.offset:.2f}s",
-        )
+    if entry.after:
+        beat = cut.beat_by_ref(entry.after)
+        if beat is None:
+            return None, f"beat {entry.after!r} is not in plan/cut.json"
+        return beat, f"explicit after {beat.id or beat.uid}"
     if entry.request:
         req = _narration_requests(edit_plan).get(entry.request)
         if req is None:
             return None, f"narration request {entry.request!r} not found in plan/edit_plan.json"
         text = str(req.get("place_after_segment", ""))
-        target = _target_segment(timeline, text)
+        target = _target_beat(cut, text)
         if target is None:
             return None, f"could not resolve place_after_segment {text!r} for {entry.request}"
-        anchor = _anchor_after(timeline, target)
-        return anchor, f"{entry.request} -> after {target.id} (matched {text!r})"
-    return None, "manifest entry has neither `request` nor `anchor` yet"
+        return target, f"{entry.request} -> after {target.id or target.uid} (matched {text!r})"
+    return None, "manifest entry has neither `request` nor `after` yet"
 
 
-# ----------------------------------------------------------------------
-# overlap: grow the muted picture under an overlong pickup
-# ----------------------------------------------------------------------
-def _is_coverable(project: Project, seg: VideoSegment) -> bool:
-    """True when ``seg`` is muted/ambient — safe for a narration pickup to run over."""
-    if seg.mute_source:
-        return True
-    if seg.audio_from is not None:
-        return False
-    words = load_words(project, seg.clip)
-    return not any(w.s < seg.out - _EPS and w.e > seg.in_ + _EPS for w in words)
+def _shot_from_broll(beat: Beat) -> Shot:
+    """Turn a ``broll`` beat into a picture-only shot of a pickup.
 
-
-def _new_segment_id(video: Sequence[VideoSegment]) -> str:
-    """A fresh ``sNNN`` id that collides with nothing already in ``video``.
-
-    Deliberately does *not* renumber existing segments (unlike ``plan.py``'s
-    passes) — an anchor elsewhere in the timeline may already reference one
-    of their ids, and this stage runs after theirs, not before.
+    Everything that describes the *picture* travels with it (clip, range,
+    transform, grade, notes). The beat's ``audio`` does not: a shot has no
+    say over sound, the pickup's own ``audio`` decides for all of them —
+    see :func:`place_voice_beat`.
     """
-    existing = {seg.id for seg in video}
-    nums = [int(m.group(1)) for seg in video if (m := re.fullmatch(r"s(\d+)", seg.id))]
-    n = (max(nums) + 1) if nums else 1
-    while f"s{n:03d}" in existing:
-        n += 1
-    return f"s{n:03d}"
+    return Shot(
+        clip=beat.clip or "",
+        **{"in": float(beat.in_ or 0.0)},
+        out=float(beat.out or 0.0),
+        transform=beat.transform.model_copy(deep=True),
+        grade=beat.grade,
+        notes=beat.notes,
+    )
 
 
-def _undo_growth(timeline: Timeline, growth: Mapping[str, Any] | None) -> None:
-    """Revert a previous :func:`_cover_voice_item` result before recomputing it.
+def place_voice_beat(
+    cut: Cut, target: Beat, file: str, length: float, notes: str = "", gain_db: float = 0.0
+) -> tuple[Beat, list[str]]:
+    """Insert (or refresh) the ``voice`` beat for one pickup, right after ``target``.
 
-    Matches by ``uid`` (stable across a renumbering elsewhere, e.g. a fresh
-    ``ytedit plan``/``ytedit tidy`` run between two ``ytedit voice`` runs) —
-    with a fallback to the old cached value as a display id, for a
-    ``voice_incoming/state.json`` written before this field existed.
-    """
-    if not growth:
-        return
-    inserted = set(growth.get("inserted_segments") or [])
-    if inserted:
-        timeline.tracks.video = [
-            s for s in timeline.tracks.video if s.uid not in inserted and s.id not in inserted
-        ]
-    ext_ref = growth.get("extended_segment")
-    ext_by = float(growth.get("extended_by") or 0.0)
-    if ext_ref and ext_by > _EPS:
-        seg = next(
-            (s for s in timeline.tracks.video if s.uid == ext_ref or s.id == ext_ref), None
-        )
-        if seg is not None:
-            seg.out = round(seg.out - ext_by, 3)
+    The pickup's picture comes from the ``broll`` beats that already follow
+    ``target``: they are *moved* into the new beat's ``shots`` — whole beats,
+    in order — until they cover ``length``. Moving rather than copying is what
+    keeps the programme's length honest: the same footage plays once, now
+    under narration. The resolver trims the last shot to the WAV (and stretches
+    it when the clip has room), so covering ``length`` is enough; nothing here
+    cuts a broll beat in half.
 
+    The beat's ``audio`` mirrors the picture it took over: it is set to
+    ``ambient`` only when every absorbed beat was heard, so a pickup never
+    silences sound the cut deliberately kept and never resurrects sound it
+    deliberately muted (wind, a car radio). Otherwise it is left unset — a
+    voice beat is silent by default, which is what a pickup recorded at home
+    over a location wants.
 
-def _cover_voice_item(
-    project: Project,
-    timeline: Timeline,
-    settings: Settings,
-    item: VoiceItem,
-    broll_pool: Sequence[tuple[str, float, float]],
-) -> tuple[bool, list[str], dict[str, Any]]:
-    """Grow the muted/ambient picture under ``item`` until it covers its length.
+    Re-running is idempotent: a ``voice`` beat that already carries ``file``
+    is refreshed in place — same position, same shots — instead of a second
+    one being inserted and more B-roll swallowed. A gain set by hand in the
+    editor survives, since only its length can have changed.
 
-    Walks forward from the segment ``item`` starts under, summing the
-    duration of each further segment that is muted or has no transcribed
-    speech of its own (:func:`_is_coverable`). If the run isn't long enough
-    before hitting a segment with its own narration (or the end of the
-    timeline), the last coverable segment is extended (clamped to its own
-    clip's duration) and, if still short, muted B-roll from ``broll_pool``
-    (``[clip, in, out]`` triples) is inserted until the shortfall is covered
-    or the pool runs out.
-
-    Every absolute-time track is re-timed exactly like a ``ytedit tidy`` pass
-    would (:meth:`ytedit.timeline.Timeline.insert_segments`, the same
-    shift-map machinery), and anchored voice items (including ``item``
-    itself) are re-resolved.
+    Args:
+        cut: The cut to edit, in place.
+        target: The beat the pickup follows.
+        file: Project-relative path of the cleaned WAV (``voice/<label>.wav``).
+        length: The WAV's length in seconds — how much picture to absorb.
+        notes: Free text for the beat.
+        gain_db: Manual level trim, used only for a newly inserted beat.
 
     Returns:
-        ``(covered, changes, growth_record)`` — ``growth_record`` is what
-        :func:`_undo_growth` needs to revert this on a later re-run.
+        ``(beat, absorbed)`` — the voice beat, and one description per B-roll
+        beat that became one of its shots (empty on a refresh, and empty when
+        no B-roll followed: then ``beat.shots`` is empty too and the cut has a
+        ``voice_picture_short`` error for the user to fix in the editor).
     """
-    changes: list[str] = []
-    record: dict[str, Any] = {"extended_segment": None, "extended_by": 0.0, "inserted_segments": []}
-    if item.end is None:
-        return True, changes, record
-    voice_duration = item.end - item.at
-    if voice_duration <= _EPS:
-        return True, changes, record
-
-    before = timeline.segment_positions()
-    if not before:
-        return False, ["timeline has no video segments"], record
-
-    start_idx = None
-    for i, pos in enumerate(before):
-        if pos.start - _EPS <= item.at < pos.end + _EPS:
-            start_idx = i
-            break
-    if start_idx is None:
-        if item.at >= before[-1].end - _EPS:
-            return True, [
-                "voice item starts after the last video segment — nothing to grow "
-                "into; add picture manually"
-            ], record
-        return False, ["voice item start does not fall on any video segment"], record
-
-    covered = 0.0
-    last_ok = None
-    i = start_idx
-    while i < len(before):
-        seg = before[i].segment
-        if not _is_coverable(project, seg):
-            break
-        covered += before[i].end - max(before[i].start, item.at)
-        last_ok = i
-        if covered >= voice_duration - _EPS:
-            return True, changes, record
-        i += 1
-
-    shortfall = voice_duration - covered
-    video = timeline.tracks.video
-    clips = project.load_state().get("clips", {})
-
-    if last_ok is not None:
-        seg = video[last_ok]
-        clip_duration = float((clips.get(seg.clip) or {}).get("duration") or 0.0)
-        room = max(0.0, clip_duration - seg.out) if clip_duration > 0 else shortfall
-        extend = min(shortfall, room)
-        if extend > _EPS:
-            seg.out = round(seg.out + extend, 3)
-            shortfall -= extend
-            record["extended_segment"] = seg.uid
-            record["extended_by"] = round(extend, 3)
-            changes.append(f"grew {seg.id} ({seg.clip}) by {extend:.2f}s to cover the pickup")
-
-    insert_at = (last_ok + 1) if last_ok is not None else start_idx
-    new_segments: list[VideoSegment] = []
-    if insert_at is not None:
-        from ytedit.ai.plan import _vertical_fit  # local: avoids a module-load cycle risk
-
-        default_fit = str(settings.get("fit.default_mode", "blur-fill"))
-        pool = list(broll_pool)
-        while shortfall > _EPS and pool:
-            clip_id, in_s, out_s = pool.pop(0)
-            dur = out_s - in_s
-            if dur <= _EPS:
-                continue
-            use_out = out_s if dur <= shortfall + _EPS else in_s + shortfall
-            clip_meta = clips.get(clip_id) or {}
-            new_seg = VideoSegment(
-                id=_new_segment_id(video + new_segments),
-                clip=clip_id,
-                **{"in": round(in_s, 3)},
-                out=round(use_out, 3),
-                role="b-roll",
-                transform=Transform(fit=_vertical_fit(clip_meta, default_fit)),
-                mute_source=True,
-                notes="voice: broll_pool fill for an overlong pickup",
-            )
-            new_segments.append(new_seg)
-            added = new_seg.duration
-            shortfall -= added
-            changes.append(
-                f"inserted {clip_id}[{in_s:.2f}-{use_out:.2f}] ({added:.2f}s) from broll_pool"
-            )
-
-    # A single edit-API call, diffed against ``before`` (captured at the top
-    # of this function, ahead of the extend above too) so this one re-time
-    # covers both the extend and the insert — exactly what a single
-    # before/after shift-map would have produced. ``renumber=False``: voice.py
-    # deliberately never renumbers ids other stages already anchored against
-    # (see :func:`_new_segment_id`); it always resolves anchors internally.
-    timeline.insert_segments(insert_at, new_segments, before=before, renumber=False)
-    record["inserted_segments"] = [s.uid for s in new_segments]
-
-    ok = shortfall <= _EPS
-    if not ok:
-        changes.append(
-            f"still short by {shortfall:.2f}s after the broll_pool ran out — "
-            "overlap unresolved, add more B-roll or trim the pickup"
-        )
-    return ok, changes, record
-
-
-def _next_voice_id(timeline: Timeline) -> str:
-    nums = [int(m.group(1)) for item in timeline.tracks.voice if (m := re.fullmatch(r"v(\d+)", item.id))]
-    n = (max(nums) + 1) if nums else 1
-    return f"v{n:03d}"
-
-
-def _upsert_voice_item(
-    timeline: Timeline, rel_file: str, duration: float, anchor: VoiceAnchor
-) -> str:
-    """Place (or replace, by ``file``) the :class:`VoiceItem` for one pickup."""
-    positions = timeline.segment_positions()
-    starts_by_uid = {pos.segment.uid: pos.start for pos in positions if pos.segment.uid}
-    starts_by_id = {pos.segment.id: pos.start for pos in positions}
-    start = starts_by_uid.get(anchor.uid) if anchor.uid else None
-    if start is None:
-        start = starts_by_id.get(anchor.segment, 0.0)
-    at = round(start + anchor.offset, 3)
-    end = round(at + duration, 3)
-    existing = next((v for v in timeline.tracks.voice if v.file == rel_file), None)
+    existing = next((b for b in cut.beats if b.kind == "voice" and b.file == file), None)
     if existing is not None:
-        existing.anchor = anchor
-        existing.at = at
-        existing.end = end
-        return existing.id
-    item_id = _next_voice_id(timeline)
-    timeline.tracks.voice.append(
-        VoiceItem(id=item_id, file=rel_file, at=at, end=end, anchor=anchor)
+        existing.notes = notes or existing.notes
+        return existing, []
+
+    index = next((i for i, b in enumerate(cut.beats) if b.uid == target.uid), len(cut.beats) - 1)
+    absorbed: list[str] = []
+    shots: list[Shot] = []
+    ambient = True
+    covered = 0.0
+    end = index + 1
+    while covered < length - _EPS and end < len(cut.beats) and cut.beats[end].kind == "broll":
+        donor = cut.beats[end]
+        shots.append(_shot_from_broll(donor))
+        covered += max(0.0, float(donor.out or 0.0) - float(donor.in_ or 0.0))
+        ambient = ambient and donor.keeps_source_audio
+        absorbed.append(
+            f"{donor.id or donor.uid} {donor.clip} "
+            f"{float(donor.in_ or 0.0):.2f}-{float(donor.out or 0.0):.2f}s "
+            f"({'ambient' if donor.keeps_source_audio else 'mute'})"
+        )
+        end += 1
+    del cut.beats[index + 1 : end]
+
+    beat = Beat(
+        kind="voice", file=file, shots=shots, gain_db=gain_db, role="b-roll", notes=notes,
+        # Only a deliberate choice is written: a voice beat is silent by
+        # default, so `audio` is set solely to *keep* ambience that was there.
+        audio="ambient" if (shots and ambient) else None,
     )
-    return item_id
+    cut.beats.insert(index + 1, beat)
+    return beat, absorbed
 
 
 # ----------------------------------------------------------------------
@@ -820,8 +754,8 @@ def _write_report(project: Project, rows: list[dict[str, Any]]) -> Path:
             lines.append(f"- final duration: {row['duration']:.2f}s")
         if row.get("placement"):
             lines.append(f"- placement: {row['placement']}")
-        if row.get("voice_item"):
-            lines.append(f"- voice item: `{row['voice_item']}`")
+        if row.get("beat"):
+            lines.append(f"- beat: `{row['beat']}`")
         cuts = row.get("cuts") or []
         if cuts:
             lines.append("- cuts:")
@@ -831,11 +765,15 @@ def _write_report(project: Project, rows: list[dict[str, Any]]) -> Path:
                 text = c.get("text", "")
                 suffix = f': "{text}"' if text else ""
                 lines.append(f"  - {c.get('reason', '?')}{where}{suffix}")
-        overlap = row.get("overlap") or []
-        if overlap:
-            lines.append("- overlap handling:")
-            for change in overlap:
+        absorbed = row.get("absorbed") or []
+        if absorbed:
+            lines.append("- picture absorbed into the pickup (was B-roll of its own):")
+            for change in absorbed:
                 lines.append(f"  - {change}")
+        if row.get("picture_audio"):
+            lines.append(f"- picture audio under the pickup: {row['picture_audio']}")
+        if row.get("action"):
+            lines.append(f"- **action needed:** {row['action']}")
         lines.append("")
     path = project.voice_incoming_dir / "report.md"
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -849,27 +787,33 @@ def run_voice(project: Project, force: bool = False) -> dict[str, Any]:
     """Run the ``voice`` stage: manifest -> transcribe -> clean -> place.
 
     Args:
-        project: Project whose ``plan/timeline.json`` and
+        project: Project whose ``plan/cut.json`` and
             ``voice/incoming/manifest.yaml`` are ready.
         force: Re-process every manifest entry (ignore the incoming-state
-            cache) and overwrite a human-edited timeline instead of writing
-            ``timeline.draft.json``.
+            cache) and overwrite a human-edited cut instead of writing
+            ``cut.draft.json``.
 
     Returns:
-        ``{"rows", "written", "backup", "edited_by_human", "report", "issues"}``.
+        ``{"rows", "written", "backup", "edited_by_human", "report",
+        "issues"}`` — ``written``/``backup`` are project-relative paths (or
+        ``None`` when nothing changed), and ``issues`` are the cut validator's
+        findings as strings.
 
     Raises:
-        VoiceError: No manifest yet (a draft is written first), or no
-            ``plan/timeline.json`` to place pickups against.
+        VoiceError: No ``plan/cut.json`` to place pickups against, or no
+            manifest yet (a draft is written first).
     """
     settings = project.settings
-    entries = load_manifest(project)
-    if not project.timeline_file.exists():
+    source = cutlib.cut_path(project)
+    if not source.exists():
         raise VoiceError(
-            f"no timeline at {project.timeline_file} — run `ytedit plan {project.slug}` first"
+            f"no cut at {source} — run `ytedit plan {project.slug}` first"
         )
-    timeline = Timeline.load(project.timeline_file)
-    human_edited = bool(timeline.meta.edited_by_human)
+    cut = cutlib.load_cut(source)
+    # The beat listing in a drafted manifest needs the cut, so it is read
+    # first; a project with no cut at all cannot place a pickup anyway.
+    entries = load_manifest(project, cut)
+    human_edited = bool(cut.meta.edited_by_human)
     edit_plan = _load_edit_plan(project)
     state = _load_incoming_state(project)
     incoming = project.voice_incoming_dir
@@ -881,7 +825,7 @@ def run_voice(project: Project, force: bool = False) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     processed_any = False
-    timeline_changed = False
+    cut_changed = False
 
     for entry in entries:
         row: dict[str, Any] = {"file": entry.file, "label": entry.target_label}
@@ -890,9 +834,9 @@ def run_voice(project: Project, force: bool = False) -> dict[str, Any]:
             row["status"], row["error"] = "error", f"missing {wav_path}"
             rows.append(row)
             continue
-        if not entry.request and not entry.anchor:
+        if not entry.request and not entry.after:
             row["status"] = "unassigned"
-            row["error"] = "manifest entry has no `request` or `anchor` yet — fill it in"
+            row["error"] = "manifest entry has no `request` or `after` yet — fill it in"
             rows.append(row)
             continue
 
@@ -903,8 +847,6 @@ def run_voice(project: Project, force: bool = False) -> dict[str, Any]:
             row["output"] = cached.get("output")
             rows.append(row)
             continue
-
-        _undo_growth(timeline, (cached or {}).get("growth"))
 
         try:
             transcript_doc = _get_transcript(project, wav_path, entry.file, force)
@@ -951,30 +893,45 @@ def run_voice(project: Project, force: bool = False) -> dict[str, Any]:
 
         row["duration"] = duration
         row["cuts"] = cuts_log
-        anchor, placement_reason = resolve_anchor(timeline, edit_plan, entry)
+        target, placement_reason = resolve_beat(cut, edit_plan, entry)
         row["placement"] = placement_reason
         rel_file = project.rel(out_wav)
 
-        growth_record: dict[str, Any] | None = None
-        if anchor is None:
+        if target is None:
             row["status"] = "unplaced"
-        else:
-            item_id = _upsert_voice_item(timeline, rel_file, duration, anchor)
-            item = next(v for v in timeline.tracks.voice if v.id == item_id)
-            ok, overlap_changes, growth_record = _cover_voice_item(
-                project, timeline, settings, item, entry.broll_pool
+            row["action"] = (
+                "fill in `after: bNNN` in voice/incoming/manifest.yaml and re-run"
             )
-            row["voice_item"] = item_id
-            row["overlap"] = overlap_changes
-            row["status"] = "ok" if ok else "overlap_unresolved"
-            timeline_changed = True
+        else:
+            # The WAV on disk is the length the resolver will use, so absorb
+            # picture against that rather than against the sum of the kept
+            # ranges (which ignores ffmpeg's frame rounding).
+            probed = float(cutlib.probe_voice_duration(out_wav)) or duration
+            beat, absorbed = place_voice_beat(
+                cut, target, rel_file, probed,
+                notes=f"pickup {label}" + (f" ({entry.request})" if entry.request else ""),
+            )
+            if cut.beats.index(beat) != cut.beats.index(target) + 1:
+                # An existing pickup is never dragged across the cut: the
+                # picture it already owns would be stranded where it is.
+                row["placement"] += (
+                    " — but this pickup is already placed elsewhere and was left "
+                    "there; delete its beat in the web editor to move it"
+                )
+            row["beat_uid"] = beat.uid
+            row["absorbed"] = absorbed
+            row["picture_audio"] = "ambient" if beat.keeps_source_audio else "mute"
+            if beat.shots:
+                row["status"] = "ok"
+            else:
+                row["status"] = "voice_picture_short"
+                row["action"] = (
+                    "no B-roll beat follows this pickup — pick its picture in the web "
+                    "editor (the cut will not resolve until you do)"
+                )
+            cut_changed = True
 
-        state[entry.file] = {
-            "hash": file_hash,
-            "label": label,
-            "output": rel_file,
-            "growth": growth_record,
-        }
+        state[entry.file] = {"hash": file_hash, "label": label, "output": rel_file}
         processed_any = True
         rows.append(row)
 
@@ -987,22 +944,41 @@ def run_voice(project: Project, force: bool = False) -> dict[str, Any]:
     }
     if processed_any:
         _save_incoming_state(project, state)
-    if timeline_changed:
-        from ytedit.ai.tidy import backup_timeline
+    if cut_changed:
+        # Display ids only exist once, at the end: renumbering inside the loop
+        # would invalidate every later entry's `after: bNNN`.
+        cut.renumber()
+        by_uid = {beat.uid: beat for beat in cut.beats}
+        for row in rows:
+            beat = by_uid.get(str(row.pop("beat_uid", "")))
+            if beat is not None:
+                row["beat"] = beat.id or beat.uid
 
-        result["issues"] = timeline.validate(project)
-        result["backup"] = backup_timeline(project)
+        # One pass gives both halves: `validate()` *is* a resolve pass (see
+        # ytedit/cut.py), so asking for the issues separately would only mean
+        # resolving the same cut twice.
+        timeline, issues = cutlib.resolve_verbose(project, cut)
+        result["issues"] = [str(issue) for issue in issues]
+        result["backup"] = cutlib.backup_cut(project)
         write_to_draft = human_edited and not force
-        target = project.plan_dir / ("timeline.draft.json" if write_to_draft else "timeline.json")
-        timeline.save(target)
-        result["written"] = project.rel(target)
+        target_path = project.plan_dir / ("cut.draft.json" if write_to_draft else "cut.json")
+        cutlib.save_cut(cut, target_path)
+        result["written"] = project.rel(target_path)
         if write_to_draft:
             log.warning(
-                "[clip]%s[/] timeline.json is human-edited — voice pickups written to %s "
+                "[clip]%s[/] cut.json is human-edited — voice pickups written to %s "
                 "(diff it, or re-run with --force)",
                 project.slug,
-                target.name,
+                target_path.name,
             )
+        elif any(issue.severity == "error" for issue in issues):
+            log.warning(
+                "[clip]%s[/] the cut does not resolve yet — timeline.json left alone; "
+                "see voice/incoming/report.md",
+                project.slug,
+            )
+        else:
+            timeline.save(project.timeline_file)
         project.set_stage(STAGE, "done", processed=len(rows))
 
     report_path = _write_report(project, rows)
@@ -1018,6 +994,7 @@ __all__ = [
     "is_instruction_sentence",
     "load_manifest",
     "manifest_path",
-    "resolve_anchor",
+    "place_voice_beat",
+    "resolve_beat",
     "run_voice",
 ]

@@ -2,7 +2,7 @@
 
 ## What this project is
 
-`ai-youtube-editor` is a semi-automated pipeline plus a local web editor that turns raw phone footage (travel vlogs, Polish narration by default, configurable per project via `project.yaml: language:`) into a finished 16:9 YouTube master. Claude acts as **editor-in-chief**: it reads transcripts and analyses, reviews the LLM-generated edit plan, decides cuts, tells the user what narration to record, checks quality against a research-backed playbook, and produces titles/thumbnails. Deterministic tools (ffmpeg/ffprobe) do all media work from an explicit timeline JSON (EDL); LLMs only ever produce/edit JSON. See `docs/ARCHITECTURE.md` for the full system design.
+`ai-youtube-editor` is a semi-automated pipeline plus a local web editor that turns raw phone footage (travel vlogs, Polish narration by default, configurable per project via `project.yaml: language:`) into a finished 16:9 YouTube master. Claude acts as **editor-in-chief**: it reads transcripts and analyses, reviews the LLM-generated edit plan, decides cuts, tells the user what narration to record, checks quality against a research-backed playbook, and produces titles/thumbnails. Deterministic tools (ffmpeg/ffprobe) do all media work from an explicit timeline JSON (EDL) that is *resolved* from the edit — `plan/cut.json`, where speech is addressed by sentence id and never by seconds; LLMs only ever produce/edit JSON. See `docs/ARCHITECTURE.md` for the full system design.
 
 **Before editing anything inside a `projects/<slug>/` directory, read `docs/playbook/editing-playbook.md` in full.** It is the standing operating manual — workflow per stage, footage-interpretation rules (editor instructions spoken at clip start, last-take rule, audio-only/silent-B-roll handling, vertical clips), structure template, narration-request format, music/audio/visual rules, title/thumbnail validators, AI-footage disclosure policy, the quality-gate checklist, and cost guidance. Don't re-derive these rules from first principles — they're already encoded there and in `docs/research/`.
 
@@ -24,31 +24,34 @@ ytedit ingest <slug>                   # normalize, proxies, audio, peaks, thumb
 ytedit transcribe <slug>               # ElevenLabs Scribe v2 -> transcripts/
 ytedit analyze <slug>                  # transcript+frames -> analysis/ + footage_log.json
 ytedit sentences <slug>                # transcripts+analysis -> analysis/sentences.json (numbered sentence catalogue; auto-runs at the start of plan)
-ytedit plan <slug>                     # footage_log (script-first: sentence ids, not seconds) -> plan/edit_plan.json + timeline draft
-ytedit plan <slug> --from-response     # rebuild the timeline from the last plan/planner_response.json, no LLM call, no cost
-ytedit tidy <slug> [--dry-run]         # pad cuts ~0.3 s before / 0.45 s after speech, merge tiny gaps (auto in plan; use after manual edits)
-ytedit captions <slug> [--force] [--include-cold-open] [--keep-existing]  # location card at every new place, anchored to its segment (run after plan/tidy, and again after re-editing)
+ytedit plan <slug>                     # footage_log (script-first: sentence ids, not seconds) -> plan/cut.json + plan/edit_plan.json (+ resolved timeline)
+ytedit plan <slug> --from-response     # rebuild the cut from the last plan/planner_response.json, no LLM call, no cost
+ytedit validate <slug>                 # check plan/cut.json against the project (sentences, ranges, picture cover) — no writes
+ytedit resolve <slug>                  # plan/cut.json -> the derived plan/timeline.json the renderer reads
+ytedit migrate <slug> [--dry-run]      # one-off: a v1 plan/timeline.json -> plan/cut.json + plan/migrate_report.md
+ytedit captions <slug> [--force] [--include-cold-open] [--keep-existing]  # location card at every new place, on that place's first beat (run after plan, and again after re-editing)
 ytedit denoise <slug> --clip c004 [--engine elevenlabs|local] [--preview] [--off]  # voice isolation for windy clips ($0.12/min ElevenLabs, local free); render uses it automatically
 ytedit noise <slug> [--used-only|--all] [--denoise] [--engine elevenlabs|local] [--yes]  # scan clip audio for wind/noise -> analysis/noise_report.{json,md}; --denoise cleans up the windy list
-ytedit voice <slug> [--force]          # voice/incoming/*.wav (manifest-mapped narration pickups) -> transcribe, cut retakes/instructions/stutters/pauses, place on the timeline
+ytedit voice <slug> [--force]          # voice/incoming/*.wav (manifest-mapped narration pickups) -> transcribe, cut retakes/instructions/stutters/pauses, insert as a voice beat
 ytedit music <slug>                    # generate music beds from the plan's cue sheet
 ytedit render <slug> --draft           # very fast, very low quality 720p pass from the ingest proxy — review the cut before spending time on --preview
 ytedit render <slug> --preview         # fast 720p render (full mezzanine)
 ytedit render <slug> --master          # full master render, hardware tier by default (two-pass loudnorm); add --x264 for the slower libx264 tier on a final upload
-ytedit at <slug> <mm:ss> [--around 10] [--json]  # map a rendered timecode to its exact segment/audio/caption/chapter — turns the user's timestamped feedback into a precise edit
+ytedit at <slug> <mm:ss> [--around 10] [--json]  # map a rendered timecode to its beat (id, kind, clip, sentences, shot on screen) and segment/audio/caption/chapter — turns the user's timestamped feedback into a precise edit
 ytedit qc <slug>                       # playbook rule checker + measured loudness
+ytedit check-render <slug> [--render draft|preview|master|<path>] [--json]  # transcribe the finished render and check how every cut actually sounds (air, chopped words, replayed audio)
 ytedit publish <slug>                  # titles, description, chapters, thumbnails
-ytedit run <slug> [--until music]      # ingest -> transcribe -> analyze -> plan in order, skipping what's done
-ytedit serve                           # web editor at http://localhost:8765
+ytedit run <slug> [--until plan]       # ingest -> transcribe -> analyze -> sentences -> plan in order, skipping what's done
+ytedit serve                           # web editor at http://localhost:8765 — BROKEN until the cut-v2 port (phase 4); edit plan/cut.json + `ytedit validate`/`resolve` instead
 
 make serve                             # same as `ytedit serve`
-make new NAME=<slug>                   # every stage also has a make target: make ingest|transcribe|analyze|sentences|plan|music|preview|master|qc|publish|run NAME=<slug>
+make new NAME=<slug>                   # every stage also has a make target: make ingest|transcribe|analyze|sentences|plan|resolve|validate|music|preview|master|qc|publish|run NAME=<slug>
 make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 ```
 
 ## Where things live
 
-- `docs/ARCHITECTURE.md` — system design, repo layout, data schemas (state.json, transcripts, analysis, timeline, edit_plan), rendering model, AI layer conventions.
+- `docs/ARCHITECTURE.md` — system design, repo layout, data schemas (state.json, transcripts, analysis, **cut.json**, the resolved timeline, edit_plan), the resolver, rendering model, AI layer conventions.
 - `docs/playbook/editing-playbook.md` — the operating manual (read before touching a project).
 - `docs/playbook/prompts.md` — canonical system/user prompt text for every LLM stage (analyze, plan, captions, titles/description, thumbnail prompts). Code loads these; edit prompt wording here, not inline in `ytedit/ai/*.py`.
 - `docs/research/youtube-production-playbook.md` — the retention/production research the playbook's rules are derived from.
@@ -69,7 +72,8 @@ make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 ## Safety rules
 
 - **Never delete anything under a project's `input/`.** That's the user's only copy of the raw footage until he says otherwise.
-- **Never overwrite a human-edited `plan/timeline.json`.** Once it has `edited_by_human: true` (or the user has saved it from the web editor), a fresh `plan` run writes `plan/timeline.draft.json` instead and the diff is presented to the user — it does not silently replace his edits. Same principle applies to anything else the user has hand-edited in the web UI.
+- **Never overwrite a human-edited `plan/cut.json`.** Once it has `meta.edited_by_human: true` (or the user has saved it from the web editor), a fresh `plan`/`voice`/`captions` run writes `plan/cut.draft.json` instead and the diff is presented to the user — it does not silently replace his edits. Same principle applies to anything else the user has hand-edited in the web UI.
+- **`plan/timeline.json` is derived, never edited.** It is the resolver's output (`ytedit resolve`), regenerated from `cut.json` whenever it is stale, and safe to delete. Editing it by hand is always the wrong move: edit the beats in `cut.json` (or the web editor) and re-resolve.
 
 ## When the user drops new clips
 
@@ -79,12 +83,12 @@ The rule that governs every step below: **the user reviews a light draft before 
 2. `ytedit ingest <slug>` (long, CPU-bound: start it and do other work); check `state.json.clips[*]` for anything flagged (VFR jitter, missing audio, corrupt/zero-duration files) before spending money on the next stage.
 3. `ytedit transcribe <slug>` → `ytedit noise <slug>` → denoise the windy list with ElevenLabs (`ytedit noise <slug> --denoise`) before anyone listens. the user's rule: every clip where he speaks gets AI noise reduction; performances and ambience stay untouched.
 4. `ytedit analyze <slug>`; spot-check a few `analysis/<clip>.json` entries against the raw transcript (`kind`, honored editor instructions, take selection — playbook §2.2, §3). `ytedit sentences <slug>` builds the sentence catalogue (retakes, duplicates, instructions) the planner works from.
-5. `ytedit plan <slug> --notes "..."` with the editorial direction (structure, which clips are narration vs. ambient, which are post-trip voice-over, runtime target). Review `plan/edit_plan.md` **and** its script check against the structure template and pacing rules (playbook §2.3, §4) — never forward the LLM's output to the user unreviewed. Tidy (sentence snapping, overlay cutaways, audio ledger, anchors) runs automatically.
-6. `ytedit qc <slug>` must be clean of errors (rules 31–35: no audio twice, no true mid-sentence break, no pickup over on-camera speech, all anchors resolved) — then `ytedit render <slug> --draft --no-music` and send the user the draft with the narration requests (`plan/narration_requests.md`) and a Polish summary: structure, footage gaps, open questions. Point him at `make serve` → Program view for the cut itself; anything he saves there is human-edited (see Safety rules).
-7. Pickups: the user drops WAVs into `voice/incoming/`; fill `voice/incoming/manifest.yaml` (a draft manifest is written on the first run) and run `ytedit voice <slug>`. Review `voice/incoming/report.md` (what was cut and why, where each pickup landed); `unplaced` / `overlap_unresolved` entries need your judgment (playbook §5).
-8. `ytedit captions <slug>` once the cut is settled (a location card at every new place, anchored to its segment). Skim `analysis/captions_report.md`.
-9. `ytedit music <slug>` only when the cut is stable (one or two beds are fine, more → ask). Then `ytedit tidy` → `ytedit qc` → `ytedit render --draft` → send. **Wait for the user's verdict.**
-10. Correction rounds: for each timecoded note, `ytedit at <slug> <mm:ss>` tells you exactly which segment, sentence and pickup is playing there. Apply the change through the CLI stages or the `Timeline` edit API (never renumber segments or splice the video track by hand), then `tidy` → `qc` → `render --draft` → send → wait. Repeat until he says OK.
+5. `ytedit plan <slug> --notes "..."` with the editorial direction (structure, which clips are narration vs. ambient, which are post-trip voice-over, runtime target). It writes `plan/cut.json` and resolves `plan/timeline.json` from it. Review `plan/edit_plan.md` **and** its script check against the structure template and pacing rules (playbook §2.3, §4) — never forward the LLM's output to the user unreviewed.
+6. `ytedit validate <slug>` then `ytedit qc <slug>` must be clean of errors (the cut validator's findings come through QC prefixed `cut:` — `sentence_reused`, `voice_picture_short`, `instruction_sentence`, `unknown_sentence`, a shot range outside its clip) — then `ytedit render <slug> --draft --no-music` and send the user the draft with the narration requests (`plan/narration_requests.md`) and a Polish summary: structure, footage gaps, open questions. (`make serve` → Program view is where he would normally review the cut himself, but the web editor is down until the cut-v2 port lands — until then his notes come back as timecodes and you apply them with `ytedit at` + an edit to `plan/cut.json`. Anything he does save there once it is back is human-edited — see Safety rules.)
+7. Pickups: the user drops WAVs into `voice/incoming/`; fill `voice/incoming/manifest.yaml` (a draft manifest is written on the first run — it lists the beats with their first sentence, so `after: bNNN` is a copy-paste) and run `ytedit voice <slug>`. Review `voice/incoming/report.md` (what was cut and why, which beat each pickup landed after, which B-roll beats became its shots); `unplaced` and `voice_picture_short` entries need your judgment (playbook §5).
+8. `ytedit captions <slug>` once the cut is settled (a location card at every new place, on that place's first beat). Skim `analysis/captions_report.md`.
+9. `ytedit music <slug>` only when the cut is stable (one or two beds are fine, more → ask); bed lengths come from the cues' beat ranges, so re-run it if the cut moves. Then `ytedit qc` → `ytedit render --draft` → `ytedit check-render` → send. **Wait for the user's verdict.**
+10. Correction rounds: for each timecoded note, `ytedit at <slug> <mm:ss>` tells you exactly which beat, shot, sentence and pickup is playing there. Apply the change in the web editor or by editing that beat in `plan/cut.json` (drop a sentence, split a beat, move a shot's `after`, add a shot — never touch `timeline.json`), then `resolve` → `qc` → `render --draft` → `check-render` → send → wait. Repeat until he says OK.
 11. Only then: `ytedit render <slug> --master` (hardware tier by default; `--x264` only if he asks for the slow tier), `ytedit qc`, `ytedit publish` (titles/thumbnails gated by the cost rules; reject any generated thumbnail that is not a real frame of this trip). Refresh the publish pack whenever chapters move. `ytedit clean <slug>` afterwards — renders fill the disk.
 12. Commit only when the user asks; never commit `projects/<slug>/`.
 

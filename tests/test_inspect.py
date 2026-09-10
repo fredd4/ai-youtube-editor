@@ -181,6 +181,113 @@ def test_inspect_moment_ignores_the_voice_pickup_outside_its_window(
 
 
 # ----------------------------------------------------------------------
+# the beat half: which beat, which of its sentences, which shot
+# ----------------------------------------------------------------------
+@pytest.fixture()
+def beated(tmp_path) -> tuple[Project, Timeline]:
+    """A resolved cut: one speech beat with a shot in it, then a B-roll beat.
+
+    No ffmpeg and no ingest — the inspector reads the cut, the timeline and
+    the transcripts, all of which are written here directly.
+    """
+    from ytedit.ai.sentences import write_sentences
+    from ytedit.cut import Beat, Cut, Shot, cut_path, resolve, save_cut
+
+    project = Project.create("beat-test", language="pl", root=tmp_path / "projects")
+    with project.edit_state() as state:
+        state["clips"] = {
+            "c001": {"id": "c001", "duration": 60.0, "width": 1920, "height": 1080},
+            "c009": {"id": "c009", "duration": 30.0, "width": 1920, "height": 1080},
+        }
+    project.transcript_path("c001").write_text(
+        json.dumps({
+            "clip": "c001", "language": "pl",
+            "words": [
+                {"t": "Jedziemy", "s": 10.0, "e": 10.5},
+                {"t": "tramwajem.", "s": 10.6, "e": 11.4},
+                {"t": "Bardzo", "s": 13.0, "e": 13.5},
+                {"t": "zatłoczonym.", "s": 13.6, "e": 17.0},
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    write_sentences(project)
+
+    beat = Beat(
+        kind="speech", clip="c001", sentences=["c001#1", "c001#2"], role="a-roll",
+        shots=[Shot(clip="c009", **{"in": 2.0}, out=5.0, after="c001#1")],
+    )
+    tail = Beat(kind="broll", clip="c009", **{"in": 10.0}, out=14.0, role="b-roll")
+    cut = Cut(beats=[beat, tail])
+    save_cut(cut, cut_path(project))
+    timeline = resolve(project, cut)
+    timeline.save(project.timeline_file)
+    return project, timeline
+
+
+def test_the_moment_names_the_beat_and_its_sentences(
+    beated: tuple[Project, Timeline],
+) -> None:
+    project, timeline = beated
+    moment = inspect_moment(project, timeline, at=0.2)
+    assert moment.beat is not None
+    assert moment.beat["id"] == "b001"
+    assert moment.beat["kind"] == "speech"
+    assert moment.beat["clip"] == "c001"
+    assert moment.beat["sentences"] == ["c001#1", "c001#2"]
+    assert moment.beat["on_screen"]["kind"] == "beat"
+    assert "own picture" in moment.beat["on_screen"]["label"]
+
+
+def test_the_moment_names_the_shot_on_screen(beated: tuple[Project, Timeline]) -> None:
+    project, timeline = beated
+    # The shot is the second segment of the first beat.
+    start = timeline.segment_positions()[1].start
+    moment = inspect_moment(project, timeline, at=start + 0.1)
+    assert moment.segment is not None and moment.segment.clip == "c009"
+    assert moment.beat["id"] == "b001", "a shot belongs to the beat it plays under"
+    assert moment.beat["on_screen"] == {
+        "kind": "shot", "shot": 0, "clip": "c009", "in": 2.0, "out": 5.0,
+        "label": "shot 1/1 (c009 2.00-5.00)",
+    }
+    # The narration keeps running underneath the insert.
+    assert moment.audio_clip == "c001"
+
+
+def test_the_next_beat_is_reported_at_its_own_time(
+    beated: tuple[Project, Timeline],
+) -> None:
+    project, timeline = beated
+    moment = inspect_moment(project, timeline, at=timeline.duration() - 0.2)
+    assert moment.beat["id"] == "b002"
+    assert moment.beat["kind"] == "broll"
+    assert moment.beat["sentences"] == []
+
+
+def test_sentences_heard_is_the_window_search_not_the_whole_beat(
+    beated: tuple[Project, Timeline],
+) -> None:
+    """``sentences_heard`` answers "what is audible here"; the beat answers
+    "what is this cut made of"."""
+    project, timeline = beated
+    moment = inspect_moment(project, timeline, at=0.2, window=0.5)
+    assert moment.sentences_heard == ["c001#1"]
+    assert moment.beat["sentences"] == ["c001#1", "c001#2"]
+    assert moment.to_dict()["sentences_heard"] == ["c001#1"]
+
+
+def test_a_timeline_without_a_cut_still_answers(
+    beated: tuple[Project, Timeline],
+) -> None:
+    """The inspector reports, it never gates — the beat half is just absent."""
+    project, timeline = beated
+    (project.plan_dir / "cut.json").unlink()
+    moment = inspect_moment(project, timeline, at=0.2)
+    assert moment.segment is not None
+    assert moment.beat is None
+
+
+# ----------------------------------------------------------------------
 # empty timeline
 # ----------------------------------------------------------------------
 def test_inspect_moment_handles_an_empty_timeline(tmp_path_factory) -> None:
@@ -188,7 +295,7 @@ def test_inspect_moment_handles_an_empty_timeline(tmp_path_factory) -> None:
         tmp_path_factory.mktemp("inspect-empty"),
         slug="inspect-empty-test",
         document={
-            "version": 1, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
+            "version": 2, "fps": 30, "width": 1920, "height": 1080, "language": "pl",
             "tracks": {"video": [], "voice": [], "music": [], "captions": [], "sfx": []},
             "mute_ranges": [], "markers": [], "chapters": [], "meta": {},
         },

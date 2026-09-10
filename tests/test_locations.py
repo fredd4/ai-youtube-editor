@@ -1,8 +1,14 @@
-"""Tests for ``ytedit.ai.locations``: places normalization + anchored location cards.
+"""Tests for ``ytedit.ai.locations``: places normalization + location cards by beat.
 
 Everything here is offline: the writer call is replaced with a fixed JSON via
 the ``ask_writer`` seam, and the ASS overlap check uses the project's real
 font/styles (already exercised in ``tests/test_captions.py``) but no network.
+
+Card placement is a pure function of a :class:`ytedit.cut.Cut` and the beats'
+resolved spans, so most tests here build a cut plus a hand-written span map
+instead of a project — the resolver has its own tests in ``test_cut.py``. Only
+the stage tests need a real project on disk (see :func:`build_project`, which
+mirrors ``tests/test_cut.py``).
 """
 
 from __future__ import annotations
@@ -15,31 +21,70 @@ from typing import Any
 import pytest
 
 from ytedit.ai import locations as L
+from ytedit.ai.sentences import sentences_path
 from ytedit.config import Settings, load_settings
+from ytedit.cut import Beat, Caption, Cut, Shot, cut_path, load_cut, save_cut
 from ytedit.media.captions import build_ass
 from ytedit.project import Project
-from ytedit.timeline import (
-    Caption,
-    CaptionAnchor,
-    Timeline,
-    Tracks,
-    VideoSegment,
-)
+from ytedit.timeline import Timeline
 
 
 # ----------------------------------------------------------------------
-# helpers
+# helpers: cuts and spans
 # ----------------------------------------------------------------------
-def seg(seg_id: str, clip: str, start: float, end: float, **extra: Any) -> VideoSegment:
-    return VideoSegment(id=seg_id, clip=clip, **{"in": start}, out=end, **extra)
+def broll(clip: str, **kwargs: Any) -> Beat:
+    """A B-roll beat on ``clip`` (its length comes from the span map)."""
+    return Beat(kind="broll", clip=clip, **{"in": 0.0}, out=10.0, **kwargs)
 
 
-def timeline_of(*segments: VideoSegment, **kw: Any) -> Timeline:
-    return Timeline(tracks=Tracks(video=list(segments)), **kw)
+def voice(*clips: str, **kwargs: Any) -> Beat:
+    """A narration beat whose picture is one shot per clip."""
+    return Beat(
+        kind="voice",
+        file="voice/n001.wav",
+        shots=[Shot(clip=c, **{"in": 0.0}, out=2.0) for c in clips],
+        **kwargs,
+    )
+
+
+def cut_of(*beats: Beat) -> Cut:
+    """A cut of ``beats`` with display ids already assigned."""
+    cut = Cut(beats=list(beats))
+    cut.renumber()
+    return cut
+
+
+def spans_of(cut: Cut, *lengths: float) -> dict[str, tuple[float, float]]:
+    """Lay the cut's beats end to end, ``lengths[i]`` seconds each.
+
+    A beat with no length left over is absent from the map — exactly what
+    :func:`ytedit.cut.beat_spans` does for a beat that produced no picture.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    at = 0.0
+    for beat, length in zip(cut.beats, lengths):
+        out[beat.uid] = (at, at + length)
+        at += length
+    return out
 
 
 def place(place_id: str, label: str | None = None, region: str = "") -> dict[str, Any]:
     return {"place_id": place_id, "label": label or place_id, "region": region}
+
+
+PLACES = {
+    "c001": place("a", "Place A"),
+    "c002": place("b", "Place B"),
+    "c003": place("c", "Place C"),
+    "c004": place("d", "Place D"),
+}
+
+
+def cards(cut: Cut, spans: dict[str, tuple[float, float]], **kwargs: Any) -> list[dict[str, Any]]:
+    """:func:`L.generate_location_cards` with the fixtures' usual defaults."""
+    kwargs.setdefault("skip_cold_open_s", 0.0)
+    kwargs.setdefault("end_screen_s", 0.0)
+    return L.generate_location_cards(cut, spans, PLACES, **kwargs)
 
 
 def write_footage_log(project: Project, clips: list[dict[str, Any]]) -> None:
@@ -70,6 +115,73 @@ def fake_ask_writer(answer: dict[str, Any]) -> Any:
         return {"json": answer, "model": "test-writer", "cost_usd": 0.0}
 
     return _asker
+
+
+# ----------------------------------------------------------------------
+# a project the stage can actually run against (mirrors test_cut.py)
+# ----------------------------------------------------------------------
+CLIPS = ("c001", "c002", "c003", "c004")
+
+
+def build_project(tmp_path: Path) -> Project:
+    """A project of silent 60 s clips, one per place: no speech to resolve."""
+    project = Project.create("t-loc", language="pl", root=tmp_path / "projects")
+    for order, clip_id in enumerate(CLIPS, 1):
+        project.add_clip({
+            "id": clip_id, "order": order, "duration": 60.0,
+            "width": 1920, "height": 1080, "orientation": "horizontal", "has_audio": True,
+        })
+        project.transcript_path(clip_id).write_text(
+            json.dumps({"clip": clip_id, "language": "pl", "words": []}), encoding="utf-8"
+        )
+        project.analysis_path(clip_id).write_text(
+            json.dumps({"clip": clip_id, "instructions": [], "takes": []}), encoding="utf-8"
+        )
+    sentences_path(project).write_text(
+        json.dumps({
+            "project": project.slug, "language": "pl", "clips_count": len(CLIPS),
+            "sentences_count": 0,
+            "clips": [{"id": c, "sentences": []} for c in CLIPS],
+        }),
+        encoding="utf-8",
+    )
+    return project
+
+
+@pytest.fixture()
+def loc_project(tmp_path: Path) -> Project:
+    return build_project(tmp_path)
+
+
+def write_cut(project: Project, cut: Cut) -> Cut:
+    """Save ``cut`` as the project's ``plan/cut.json`` and read it back."""
+    save_cut(cut, cut_path(project))
+    return load_cut(cut_path(project))
+
+
+def staged_cut(project: Project) -> Cut:
+    """A four-beat cut, 10 s per beat, one clip (= one place) each."""
+    cut = cut_of(*(Beat(kind="broll", clip=c, **{"in": 0.0}, out=10.0) for c in CLIPS))
+    return write_cut(project, cut)
+
+
+PLACES_ANSWER = {
+    "places": [
+        {"group_ids": [0], "place_id": "alfama", "label": "Alfama", "region": "Lisboa"},
+        {"group_ids": [1], "place_id": "belem", "label": "Belém", "region": "Lisboa"},
+        {"group_ids": [2], "place_id": "baixa", "label": "Baixa", "region": "Lisboa"},
+        {"group_ids": [3], "place_id": "vila-douro", "label": "Vila d'Ouro", "region": "Lisboa"},
+    ]
+}
+
+
+def write_places_footage_log(project: Project) -> None:
+    write_footage_log(project, [
+        clip_entry("c001", "Alfama", "Lisboa", "Portugal", 0.9),
+        clip_entry("c002", "Belém", "Lisboa", "Portugal", 0.9),
+        clip_entry("c003", "Baixa", "Lisboa", "Portugal", 0.9),
+        clip_entry("c004", "Vila d'Ouro", "Lisboa", "Portugal", 0.9),
+    ])
 
 
 # ----------------------------------------------------------------------
@@ -189,210 +301,271 @@ def test_ensure_places_caches_and_force_reasks(project: Project) -> None:
 
 
 # ----------------------------------------------------------------------
+# which clip a beat's place comes from
+# ----------------------------------------------------------------------
+def test_a_beat_takes_its_place_from_its_main_clip() -> None:
+    assert L.beat_clip(broll("c001")) == "c001"
+    assert L.beat_clip(Beat(kind="speech", clip="c002", sentences=["c002#1"])) == "c002"
+    # A voice beat is narration over borrowed picture: the first shot is what
+    # the viewer actually sees when the card would appear.
+    assert L.beat_clip(voice("c003", "c004")) == "c003"
+    assert L.beat_clip(voice()) is None
+
+
+# ----------------------------------------------------------------------
 # card placement
 # ----------------------------------------------------------------------
-def test_basic_place_change_emits_an_anchored_card() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c002", 10.0, 20.0),
-    )
-    places = {"c001": place("a", "Place A"), "c002": place("b", "Place B")}
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=0.0, end_screen_s=0.0, card_offset_s=0.3,
-    )
-    # The very first eligible segment always cards (nothing shown yet), and
-    # the change into c002's place cards too.
-    assert [r["segment"] for r in rows] == ["s001", "s002"]
+def test_a_new_place_gets_a_card_on_its_first_beat() -> None:
+    cut = cut_of(broll("c001"), broll("c002"))
+    rows = cards(cut, spans_of(cut, 10.0, 10.0), card_offset_s=0.3)
+    # The very first eligible beat always cards (nothing shown yet), and the
+    # change into c002's place cards too.
+    assert [r["beat_id"] for r in rows] == ["b001", "b002"]
+    assert [r["beat"] for r in rows] == [cut.beats[0].uid, cut.beats[1].uid]
     assert rows[0]["at"] == pytest.approx(0.3)
     assert rows[1]["at"] == pytest.approx(10.3)
     assert rows[1]["label"] == "Place B"
 
 
+def test_a_new_place_mid_cut_gets_its_own_card() -> None:
+    cut = cut_of(broll("c001"), broll("c001"), broll("c002"), broll("c002"))
+    rows = cards(cut, spans_of(cut, 10.0, 10.0, 10.0, 10.0))
+    # One card per place, each on the *first* beat at that place.
+    assert [(r["beat_id"], r["place_id"]) for r in rows] == [("b001", "a"), ("b003", "b")]
+
+
+def test_a_voice_beat_cards_the_place_of_its_first_shot() -> None:
+    cut = cut_of(broll("c001"), voice("c002", "c003"))
+    rows = cards(cut, spans_of(cut, 10.0, 10.0))
+    assert [(r["beat_id"], r["label"]) for r in rows] == [("b001", "Place A"), ("b002", "Place B")]
+    assert rows[1]["clip"] == "c002"
+
+
 def test_place_shown_recently_is_suppressed_within_min_gap() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),   # place A cards at 0.3
-        seg("s002", "c002", 10.0, 20.0),  # place B cards at 10.3
-        seg("s003", "c001", 20.0, 30.0),  # back to A after only 10s: suppressed (min_gap=90)
-    )
-    places = {"c001": place("a", "Place A"), "c002": place("b", "Place B")}
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=0.0, end_screen_s=0.0, min_gap_s=90.0,
-    )
-    assert [r["segment"] for r in rows] == ["s001", "s002"]
+    cut = cut_of(broll("c001"), broll("c002"), broll("c001"))
+    # back to A after only 20 s: suppressed (min_gap = 90 s)
+    rows = cards(cut, spans_of(cut, 10.0, 10.0, 10.0), min_gap_s=90.0)
+    assert [r["beat_id"] for r in rows] == ["b001", "b002"]
 
 
 def test_place_shown_long_ago_cards_again_past_min_gap() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c002", 10.0, 200.0),
-        seg("s003", "c001", 200.0, 210.0),  # 200s after A's card: past min_gap
-    )
-    places = {"c001": place("a", "Place A"), "c002": place("b", "Place B")}
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=0.0, end_screen_s=0.0, min_gap_s=90.0,
-    )
-    assert [r["segment"] for r in rows] == ["s001", "s002", "s003"]
+    cut = cut_of(broll("c001"), broll("c002"), broll("c001"))
+    rows = cards(cut, spans_of(cut, 10.0, 190.0, 10.0), min_gap_s=90.0)
+    assert [r["beat_id"] for r in rows] == ["b001", "b002", "b003"]
 
 
-def test_short_segment_defers_to_the_next_segment_of_the_same_place() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c002", 10.0, 11.5),  # place change, but only 1.5s: too short
-        seg("s003", "c002", 11.5, 16.0),  # still place B, 4.5s: long enough
-    )
-    places = {"c001": place("a", "Place A"), "c002": place("b", "Place B")}
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=0.0, end_screen_s=0.0, min_segment_s=2.5,
-    )
+def test_a_short_beat_defers_to_the_next_beat_of_the_same_place() -> None:
+    cut = cut_of(broll("c001"), broll("c002"), broll("c002"))
+    rows = cards(cut, spans_of(cut, 10.0, 1.5, 4.5), min_segment_s=2.5)
     b_rows = [r for r in rows if r["place_id"] == "b"]
     assert len(b_rows) == 1
-    assert b_rows[0]["segment"] == "s003"
+    assert b_rows[0]["beat_id"] == "b003"
     assert b_rows[0]["at"] == pytest.approx(11.5 + 0.3)
 
 
-def test_short_segment_with_no_long_enough_followup_is_skipped() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c002", 10.0, 11.0),  # place B, short
-        seg("s003", "c002", 11.0, 12.5),  # still B, still short (1.5s)
-        seg("s004", "c003", 12.5, 20.0),  # place changes to C before B ever got long enough
-    )
-    places = {
-        "c001": place("a", "Place A"), "c002": place("b", "Place B"), "c003": place("c", "Place C"),
-    }
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=0.0, end_screen_s=0.0, min_segment_s=2.5,
-    )
-    assert "b" not in [r["place_id"] for r in rows]
+def test_a_short_beat_with_no_long_enough_followup_is_skipped() -> None:
+    cut = cut_of(broll("c001"), broll("c002"), broll("c002"), broll("c003"))
+    # Place B is on screen for 1.0 s + 1.5 s and then it's gone: no card at
+    # all rather than a card flashed onto a 1 s cut.
+    rows = cards(cut, spans_of(cut, 10.0, 1.0, 1.5, 7.5), min_segment_s=2.5)
     assert [r["place_id"] for r in rows] == ["a", "c"]
 
 
-def test_cold_open_and_end_screen_are_never_carded() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 5.0),    # cold open: place A, no card
-        seg("s002", "c002", 5.0, 15.0),   # first eligible segment: cards even though
-                                           # it's a genuinely new place vs. the cold open
-        seg("s003", "c003", 15.0, 95.0),  # place C, eligible, cards
-        seg("s004", "c004", 95.0, 100.0),  # inside the last 15s of a 100s programme: no card
+def test_the_cold_open_and_the_end_screen_are_never_carded() -> None:
+    cut = cut_of(broll("c001"), broll("c002"), broll("c003"), broll("c004"))
+    rows = L.generate_location_cards(
+        cut, spans_of(cut, 5.0, 10.0, 80.0, 5.0), PLACES,
+        skip_cold_open_s=5.0, end_screen_s=15.0,
     )
-    places = {
-        "c001": place("a", "Place A"), "c002": place("b", "Place B"),
-        "c003": place("c", "Place C"), "c004": place("d", "Place D"),
-    }
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=5.0, end_screen_s=15.0,
-    )
-    assert [r["segment"] for r in rows] == ["s002", "s003"]
+    # b001 is the cold open; b004 starts inside the last 15 s of a 100 s
+    # programme. b002 cards even though it only differs from the cold open.
+    assert [r["beat_id"] for r in rows] == ["b002", "b003"]
 
 
-def test_unassigned_clip_does_not_crash_and_breaks_continuity() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c999", 10.0, 100.0),  # no place assigned at all
-        seg("s003", "c001", 100.0, 110.0),  # back to A well past min_gap (90s)
+def test_include_cold_open_cards_the_opening_beat() -> None:
+    cut = cut_of(broll("c001"), broll("c002"), broll("c003"), broll("c004"))
+    rows = L.generate_location_cards(
+        cut, spans_of(cut, 5.0, 10.0, 80.0, 5.0), PLACES,
+        skip_cold_open_s=5.0, end_screen_s=15.0, include_cold_open=True,
     )
-    places = {"c001": place("a", "Place A")}
-    rows = L.generate_location_captions(
-        tl, places, skip_cold_open_s=0.0, end_screen_s=0.0, min_gap_s=90.0,
-    )
-    assert [r["segment"] for r in rows] == ["s001", "s003"]
+    assert [r["beat_id"] for r in rows] == ["b001", "b002", "b003"]
+
+
+def test_a_clip_with_no_place_does_not_crash_and_breaks_continuity() -> None:
+    cut = cut_of(broll("c001"), broll("c999"), broll("c001"))
+    rows = cards(cut, spans_of(cut, 10.0, 90.0, 10.0), min_gap_s=90.0)
+    assert [r["beat_id"] for r in rows] == ["b001", "b003"]
+
+
+def test_an_excluded_clip_never_carries_a_place() -> None:
+    cut = cut_of(broll("c001"), broll("c002"))
+    rows = cards(cut, spans_of(cut, 10.0, 10.0), exclude_clips=["c002"])
+    assert [r["beat_id"] for r in rows] == ["b001"]
+
+
+def test_a_cutaway_beat_is_an_illustration_not_a_visit() -> None:
+    cut = cut_of(broll("c001"), broll("c002", role=L.CUTAWAY_ROLE), broll("c001"))
+    rows = cards(cut, spans_of(cut, 10.0, 10.0, 10.0), min_gap_s=90.0)
+    # The cutaway gets no card of its own, and it does not count as leaving
+    # place A, so returning to A is not a new arrival either.
+    assert [r["beat_id"] for r in rows] == ["b001"]
+
+
+def test_a_beat_that_produced_no_picture_is_skipped() -> None:
+    cut = cut_of(broll("c001"), broll("c002"), broll("c003"))
+    spans = spans_of(cut, 10.0, 10.0, 10.0)
+    del spans[cut.beats[1].uid]          # b002 resolved to nothing
+    rows = cards(cut, spans, min_gap_s=90.0)
+    assert [r["beat_id"] for r in rows] == ["b001", "b003"]
 
 
 # ----------------------------------------------------------------------
-# applying to the timeline: hook anchoring + location replacement
+# applying to the cut
 # ----------------------------------------------------------------------
-def test_build_timeline_captions_anchors_hooks_and_replaces_locations() -> None:
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c002", 10.0, 20.0),
-    )
-    tl.tracks.captions = [
-        Caption(id="t001", at=1.0, end=4.0, text="A HOOK", style="hook"),
-        Caption(id="t002", at=11.0, end=13.0, text="stale location", style="location"),
+def document_for(*clips: str) -> dict[str, Any]:
+    return {"clips": [dict(PLACES[c], clip=c) for c in clips]}
+
+
+def test_build_cut_captions_keeps_hooks_and_replaces_locations() -> None:
+    cut = cut_of(broll("c001"), broll("c002"))
+    hook_beat = cut.beats[0].uid
+    cut.captions = [
+        Caption(id="t001", beat=hook_beat, offset=1.0, duration=3.0, text="A HOOK", style="hook"),
+        Caption(id="t002", beat=cut.beats[1].uid, offset=0.5, duration=2.0,
+                text="stale location", style="location"),
     ]
-    places = {"c001": place("a", "Place A"), "c002": place("b", "Place B")}
-    document = {"clips": [
-        {"clip": "c001", "place_id": "a", "label": "Place A", "region": ""},
-        {"clip": "c002", "place_id": "b", "label": "Place B", "region": ""},
-    ]}
-    tl, rows = L.build_timeline_captions(
-        tl, document, settings=ZERO_WINDOW_SETTINGS,
-    )
-    # planner's hook survives and is now anchored to s001, offset 1.0 - 0 = 1.0
-    hook = next(c for c in tl.tracks.captions if c.text == "A HOOK")
-    assert hook.anchor is not None
-    assert hook.anchor.segment == "s001"
-    assert hook.anchor.offset == pytest.approx(1.0)
-    assert hook.at == pytest.approx(1.0)
+    spans = spans_of(cut, 10.0, 10.0)
+    cut, rows = L.build_cut_captions(cut, spans, document_for("c001", "c002"),
+                                     settings=ZERO_WINDOW_SETTINGS)
 
-    # planner's stale location caption is gone, replaced by generated cards
-    assert "stale location" not in [c.text for c in tl.tracks.captions]
-    labels = {c.text for c in tl.tracks.captions if c.style == "location"}
-    assert labels == {"Place A", "Place B"}
-    for c in tl.tracks.captions:
-        if c.style == "location":
-            assert c.anchor is not None
+    hook = next(c for c in cut.captions if c.text == "A HOOK")
+    assert (hook.beat, hook.offset, hook.style) == (hook_beat, 1.0, "hook")
+    assert "stale location" not in [c.text for c in cut.captions]
+    assert {c.text for c in cut.captions if c.style == "location"} == {"Place A", "Place B"}
 
-    # ids are sequential and report rows are in time order
-    assert [c.id for c in tl.tracks.captions] == [f"t{i:03d}" for i in range(1, len(tl.tracks.captions) + 1)]
-    ats = [r["at"] for r in rows]
-    assert ats == sorted(ats)
+    # ids are sequential in screen order, and so are the report rows
+    assert [c.id for c in cut.captions] == [f"t{i:03d}" for i in range(1, len(cut.captions) + 1)]
+    assert [r["at"] for r in rows] == sorted(r["at"] for r in rows)
+    card = next(r for r in rows if r["text"] == "Place B")
+    assert (card["beat"], card["kind"], card["clip"]) == ("b002", "broll", "c002")
+    assert card["where"] == "b002 broll c002"
+    assert card["at"] == pytest.approx(10.3)
 
 
-def test_build_timeline_captions_keep_existing_preserves_old_location_cards() -> None:
-    tl = timeline_of(seg("s001", "c001", 0.0, 10.0))
-    tl.tracks.captions = [Caption(id="t001", at=1.0, end=2.0, text="old", style="location")]
-    document = {"clips": [{"clip": "c001", "place_id": "a", "label": "Place A", "region": ""}]}
-    tl, _rows = L.build_timeline_captions(
-        tl, document, settings=ZERO_WINDOW_SETTINGS, keep_existing=True
-    )
-    assert "old" in [c.text for c in tl.tracks.captions]
-    assert "Place A" in [c.text for c in tl.tracks.captions]
+def test_a_card_takes_its_offset_and_duration_from_the_settings() -> None:
+    cut = cut_of(broll("c001"))
+    settings = Settings(data={"captions": {
+        "skip_cold_open_s": 0.0, "end_screen_s": 0.0,
+        "card_offset_s": 1.25, "location_seconds": 4.0,
+    }})
+    cut, rows = L.build_cut_captions(cut, spans_of(cut, 10.0), document_for("c001"),
+                                     settings=settings)
+    card = cut.captions[0]
+    assert (card.offset, card.duration) == (1.25, 4.0)
+    assert card.style == "location" and card.position == "lower-left"
+    assert rows[0]["at"] == pytest.approx(1.25)
+    assert rows[0]["end"] == pytest.approx(5.25)
+
+
+def test_build_cut_captions_leaves_other_styles_alone() -> None:
+    cut = cut_of(broll("c001"))
+    cut.captions = [Caption(id="t001", beat=cut.beats[0].uid, offset=2.0, duration=1.0,
+                            text="a note", style="subtitle")]
+    cut, _rows = L.build_cut_captions(cut, spans_of(cut, 10.0), document_for("c001"),
+                                      settings=ZERO_WINDOW_SETTINGS)
+    note = next(c for c in cut.captions if c.style == "subtitle")
+    assert (note.text, note.offset) == ("a note", 2.0)
+
+
+def test_keep_existing_preserves_the_old_location_cards() -> None:
+    cut = cut_of(broll("c001"))
+    cut.captions = [Caption(id="t001", beat=cut.beats[0].uid, offset=1.0, duration=2.0,
+                            text="old", style="location")]
+    cut, _rows = L.build_cut_captions(cut, spans_of(cut, 10.0), document_for("c001"),
+                                      settings=ZERO_WINDOW_SETTINGS, keep_existing=True)
+    texts = [c.text for c in cut.captions]
+    assert "old" in texts and "Place A" in texts
 
 
 # ----------------------------------------------------------------------
-# end-to-end: run_captions_stage against a real project + real ASS writer
+# the stage: cut.json in, cut.json + timeline.json out
 # ----------------------------------------------------------------------
-def test_run_captions_stage_writes_timeline_and_report(project: Project) -> None:
-    write_footage_log(
-        project,
-        [
-            clip_entry("c001", "Alfama", "Lisboa", "Portugal", 0.9),
-            clip_entry("c002", "Belém", "Lisboa", "Portugal", 0.9),
-        ],
-    )
-    tl = timeline_of(seg("s001", "c001", 0.0, 10.0), seg("s002", "c002", 10.0, 20.0))
-    tl.tracks.captions = [Caption(id="t001", at=1.0, end=4.0, text="HOOK", style="hook")]
-    tl.save(project.timeline_file)
+def test_run_captions_stage_writes_the_cut_the_timeline_and_the_report(
+    loc_project: Project,
+) -> None:
+    write_places_footage_log(loc_project)
+    staged_cut(loc_project)
 
-    answer = {
-        "places": [
-            {"group_ids": [0], "place_id": "alfama", "label": "Alfama", "region": "Lisboa"},
-            {"group_ids": [1], "place_id": "belem", "label": "Belém", "region": "Lisboa"},
-        ]
-    }
-    # Override the (project-wide default) 10s cold-open / 15s end-screen
-    # exclusion windows -- this fixture's programme is only 20s long, so the
-    # defaults would leave no eligible window at all.
     result = L.run_captions_stage(
-        project, ask_writer=fake_ask_writer(answer), settings=ZERO_WINDOW_SETTINGS
+        loc_project, ask_writer=fake_ask_writer(PLACES_ANSWER), settings=ZERO_WINDOW_SETTINGS
     )
 
-    assert result["cards_added"] == 2
-    assert Path(project.path / result["written"]).exists()
-    assert Path(project.path / result["report_path"]).exists()
-    assert L.places_path(project).exists()
+    assert result["written"] == "plan/cut.json"
+    assert result["timeline"] == "plan/timeline.json"
+    assert result["cards_added"] == 4
+    assert result["backup"] is None or result["backup"].startswith("cut_")
+    assert not [i for i in result["issues"] if i.severity == "error"]
+    assert L.places_path(loc_project).exists()
+    assert Path(loc_project.path / result["report_path"]).exists()
 
-    saved = Timeline.load(project.timeline_file)
-    locations = [c for c in saved.tracks.captions if c.style == "location"]
-    assert {c.text for c in locations} == {"Alfama", "Belém"}
-    assert all(c.anchor is not None for c in locations)
+    saved = load_cut(cut_path(loc_project))
+    labels = [c.text for c in saved.captions if c.style == "location"]
+    assert labels == ["Alfama", "Belém", "Baixa", "Vila d'Ouro"]
+    # every card names a beat of the cut, by uid, with no absolute time at all
+    uids = {b.uid for b in saved.beats}
+    assert all(c.beat in uids for c in saved.captions)
+    assert all(not hasattr(c, "at") or c.at is None for c in saved.captions)
+
+    timeline = Timeline.load(loc_project.timeline_file)
+    resolved = [c for c in timeline.tracks.captions if c.style == "location"]
+    assert [c.at for c in resolved] == [pytest.approx(x) for x in (0.3, 10.3, 20.3, 30.3)]
+
+    report = (loc_project.analysis_dir / "captions_report.md").read_text(encoding="utf-8")
+    assert "| time | beat | style | text |" in report
+    assert "b002 broll c002" in report
 
 
-def test_run_captions_stage_needs_a_timeline(project: Project) -> None:
-    write_footage_log(project, [clip_entry("c001", "Baixa", "Lisboa", "Portugal", 0.9)])
+def test_run_captions_stage_does_not_overwrite_a_human_edited_cut(
+    loc_project: Project,
+) -> None:
+    write_places_footage_log(loc_project)
+    cut = staged_cut(loc_project)
+    cut.meta.edited_by_human = True
+    save_cut(cut, cut_path(loc_project))
+
+    result = L.run_captions_stage(
+        loc_project, ask_writer=fake_ask_writer(PLACES_ANSWER), settings=ZERO_WINDOW_SETTINGS
+    )
+    assert result["edited_by_human"] is True
+    assert result["written"] == "plan/cut.draft.json"
+    assert result["timeline"] is None
+    assert not loc_project.timeline_file.exists()
+
+    assert not load_cut(cut_path(loc_project)).captions          # the real cut is untouched
+    draft = load_cut(loc_project.plan_dir / "cut.draft.json")
+    assert len([c for c in draft.captions if c.style == "location"]) == 4
+
+
+def test_run_captions_stage_force_overwrites_a_human_edited_cut(
+    loc_project: Project,
+) -> None:
+    write_places_footage_log(loc_project)
+    cut = staged_cut(loc_project)
+    cut.meta.edited_by_human = True
+    save_cut(cut, cut_path(loc_project))
+
+    result = L.run_captions_stage(
+        loc_project, ask_writer=fake_ask_writer(PLACES_ANSWER),
+        settings=ZERO_WINDOW_SETTINGS, force=True,
+    )
+    assert result["written"] == "plan/cut.json"
+    assert len(load_cut(cut_path(loc_project)).captions) == 4
+
+
+def test_run_captions_stage_needs_a_cut(loc_project: Project) -> None:
+    write_places_footage_log(loc_project)
     with pytest.raises(L.LocationsError):
-        L.run_captions_stage(project, ask_writer=fake_ask_writer({"places": []}))
+        L.run_captions_stage(loc_project, ask_writer=fake_ask_writer(PLACES_ANSWER))
 
 
 # ----------------------------------------------------------------------
@@ -406,29 +579,25 @@ def _ass_seconds(value: str) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + float(rest)
 
 
-def test_generated_cards_never_overlap_in_the_ass_output() -> None:
-    # A hook line anchored right where a location card would also land: build_ass
+def test_generated_cards_never_overlap_in_the_ass_output(loc_project: Project) -> None:
+    # A hook line on the same beat as a generated location card: build_ass
     # must shift the later cue rather than let them overlap on screen.
-    tl = timeline_of(
-        seg("s001", "c001", 0.0, 10.0),
-        seg("s002", "c002", 10.0, 20.0),
-    )
-    tl.tracks.captions = [
-        # Anchored 0.1s into s002, 3s long -- overlaps the generated location
-        # card at s002+0.3s (2.4s long) once both are resolved to absolute time.
-        Caption(id="t000", at=0.0, end=3.0, text="HOOK", style="hook",
-                anchor=CaptionAnchor(segment="s002", offset=0.1)),
+    write_places_footage_log(loc_project)
+    cut = staged_cut(loc_project)
+    cut.captions = [
+        Caption(id="t000", beat=cut.beats[1].uid, offset=0.1, duration=3.0,
+                text="HOOK", style="hook"),
     ]
-    document = {"clips": [
-        {"clip": "c001", "place_id": "a", "label": "Place A", "region": ""},
-        {"clip": "c002", "place_id": "b", "label": "Place B", "region": ""},
-    ]}
-    tl, _rows = L.build_timeline_captions(tl, document, settings=ZERO_WINDOW_SETTINGS)
+    save_cut(cut, cut_path(loc_project))
+    L.run_captions_stage(
+        loc_project, ask_writer=fake_ask_writer(PLACES_ANSWER), settings=ZERO_WINDOW_SETTINGS
+    )
 
+    timeline = Timeline.load(loc_project.timeline_file)
     settings = load_settings()
     ass_text = build_ass(
-        tl.tracks.captions, tl.width, tl.height, settings.caption_styles, settings.caption_font(),
-        duration=tl.duration(),
+        timeline.tracks.captions, timeline.width, timeline.height,
+        settings.caption_styles, settings.caption_font(), duration=timeline.duration(),
     )
     cues = []
     for line in ass_text.splitlines():
@@ -437,7 +606,7 @@ def test_generated_cards_never_overlap_in_the_ass_output() -> None:
             cues.append((_ass_seconds(m.group(1)), _ass_seconds(m.group(2)), m.group(3)))
     cues.sort()
     assert len(cues) >= 2
-    for (a_start, a_end, a_style), (b_start, b_end, b_style) in zip(cues, cues[1:]):
+    for (_a_start, a_end, a_style), (b_start, _b_end, b_style) in zip(cues, cues[1:]):
         if a_style == "subtitle" or b_style == "subtitle":
             continue
         assert b_start >= a_end - 1e-6, f"{a_style}@{a_end} overlaps {b_style}@{b_start}"

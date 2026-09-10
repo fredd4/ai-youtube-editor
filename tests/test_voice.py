@@ -1,10 +1,18 @@
 """Tests for ``ytedit.ai.voice`` — narration pickup cleanup and placement.
 
-Most cases exercise the pure functions directly (plain ``Word`` lists, no
-media, no network). The end-to-end tests generate a short synthetic WAV with
-ffmpeg and monkeypatch the STT call (same pattern as ``test_transcribe.py``)
-to exercise the full manifest -> transcribe -> clean -> render -> place
-pipeline offline.
+The cleanup cases exercise the pure functions directly (plain ``Word`` lists,
+no media, no network). The end-to-end tests build a synthetic project the way
+``tests/test_cut.py`` does (clip registry, transcripts, analyses, sentence
+catalogue), generate a short WAV with ffmpeg and monkeypatch the STT call
+(same pattern as ``test_transcribe.py``) plus
+:func:`ytedit.cut.probe_voice_duration`, so the whole manifest -> transcribe
+-> clean -> render -> place pipeline runs offline.
+
+The clip layout every placement test shares (see :func:`build_project`):
+
+* ``c001`` — 10 s of narration, two sentences.
+* ``c010``/``c011`` — 10 s of silent B-roll each.
+* ``c012`` — 1 s of B-roll: too short to cover a pickup on its own.
 """
 
 from __future__ import annotations
@@ -12,20 +20,88 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 import yaml
 
+from ytedit import cut as cutlib
 from ytedit.ai import voice as V
-from ytedit.ai.tidy import Word
+from ytedit.ai.sentences import build_clip_sentences, flag_instructions, sentences_path
+from ytedit.cut import Beat, Cut, Marker, Shot, load_cut, save_cut
 from ytedit.project import Project
-from ytedit.timeline import Timeline, VideoSegment, VoiceAnchor, VoiceItem, new_timeline
+from ytedit.words import Word
+
+WORDS: dict[str, list[tuple[float, float, str]]] = {
+    "c001": [
+        (1.0, 1.4, "Cześć"), (1.45, 1.55, "z"), (1.6, 2.2, "Lisboa."),        # c001#1
+        (3.0, 3.3, "Jest"), (3.35, 3.9, "pięknie."),                          # c001#2
+    ],
+}
+
+DURATIONS: dict[str, float] = {"c001": 10.0, "c010": 10.0, "c011": 10.0, "c012": 1.0}
 
 
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+def build_project(tmp_path: Path) -> Project:
+    """The synthetic project the placement tests edit the cut of."""
+    project = Project.create("t-voice", language="pl", root=tmp_path / "projects")
+    catalogue: list[dict[str, Any]] = []
+    for order, (clip_id, duration) in enumerate(DURATIONS.items(), 1):
+        project.add_clip({
+            "id": clip_id, "order": order, "duration": duration,
+            "width": 1920, "height": 1080, "orientation": "horizontal", "has_audio": True,
+        })
+        words = WORDS.get(clip_id, [])
+        project.transcript_path(clip_id).write_text(
+            json.dumps({
+                "clip": clip_id, "language": "pl",
+                "words": [{"t": t, "s": s, "e": e} for s, e, t in words],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        analysis = {"clip": clip_id, "instructions": [], "takes": []}
+        project.analysis_path(clip_id).write_text(
+            json.dumps(analysis, ensure_ascii=False), encoding="utf-8"
+        )
+        sentences = build_clip_sentences(clip_id, [Word(s, e, t) for s, e, t in words], "pl")
+        flag_instructions(sentences, analysis)
+        catalogue.append({"id": clip_id, "sentences": sentences})
+
+    sentences_path(project).write_text(
+        json.dumps({
+            "project": project.slug, "language": "pl", "clips": catalogue,
+            "clips_count": len(catalogue),
+            "sentences_count": sum(len(c["sentences"]) for c in catalogue),
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return project
+
+
+@pytest.fixture()
+def cut_project(tmp_path: Path) -> Project:
+    """A project with clips, transcripts and a sentence catalogue, but no cut."""
+    return build_project(tmp_path)
+
+
+def speech(clip: str, sentences: Sequence[str], **kwargs: Any) -> Beat:
+    return Beat(kind="speech", clip=clip, sentences=list(sentences), **kwargs)
+
+
+def broll(clip: str, in_: float, out: float, **kwargs: Any) -> Beat:
+    return Beat(kind="broll", clip=clip, **{"in": in_}, out=out, **kwargs)
+
+
+def write_cut(project: Project, *beats: Beat, **kwargs: Any) -> Cut:
+    """Save a cut of ``beats`` as ``plan/cut.json`` and hand it back."""
+    cut = Cut(beats=list(beats), **kwargs)
+    save_cut(cut, cutlib.cut_path(project))
+    return cut
+
+
 def sine(path: Path, seconds: float = 4.0, freq: int = 440) -> Path:
     """Write a short mono wav with ffmpeg (content doesn't matter, only length)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -38,29 +114,6 @@ def sine(path: Path, seconds: float = 4.0, freq: int = 440) -> Path:
     return path
 
 
-def seg(seg_id: str, clip: str, start: float, end: float, **extra: Any) -> VideoSegment:
-    return VideoSegment(id=seg_id, clip=clip, **{"in": start}, out=end, **extra)
-
-
-def add_clip(
-    project: Project,
-    clip_id: str,
-    duration: float,
-    words: list[tuple[float, float, str]] = (),
-    order: int = 1,
-) -> None:
-    project.add_clip(
-        {"id": clip_id, "order": order, "duration": duration,
-         "width": 1920, "height": 1080, "orientation": "horizontal", "has_audio": True}
-    )
-    if words:
-        project.transcript_path(clip_id).write_text(
-            json.dumps({"clip": clip_id, "language": "pl",
-                        "words": [{"t": t, "s": s, "e": e} for s, e, t in words]}),
-            encoding="utf-8",
-        )
-
-
 def transcript_doc(pairs: list[tuple[float, float, str]]) -> dict[str, Any]:
     return {
         "language": "pl",
@@ -69,6 +122,27 @@ def transcript_doc(pairs: list[tuple[float, float, str]]) -> dict[str, Any]:
         "duration": pairs[-1][1] if pairs else 0.0,
         "engine": "elevenlabs",
     }
+
+
+def stage_pickup(
+    project: Project, monkeypatch: pytest.MonkeyPatch, entry: dict[str, Any],
+    wav_seconds: float = 4.0, pickup_seconds: float = 4.0,
+) -> None:
+    """Write a one-row manifest + its WAV, and stub the STT / probe seams."""
+    project.voice_incoming_dir.mkdir(parents=True, exist_ok=True)
+    V.manifest_path(project).write_text(
+        yaml.safe_dump([entry], allow_unicode=True), encoding="utf-8"
+    )
+    sine(project.voice_incoming_dir / str(entry["file"]), seconds=wav_seconds)
+    monkeypatch.setattr(
+        V, "_transcribe_voice_file",
+        lambda proj, path: transcript_doc([(0.3, 0.8, "Cześć,"), (1.0, 1.6, "jedziemy.")]),
+    )
+    monkeypatch.setattr(cutlib, "probe_voice_duration", lambda _p: pickup_seconds)
+
+
+def kinds(cut: Cut) -> list[str]:
+    return [beat.kind for beat in cut.beats]
 
 
 #: Two attempts at the same line, close enough (Jaccard 4/6 = 0.667 >= 0.6)
@@ -180,188 +254,334 @@ def test_a_dropped_word_hard_cuts_with_no_filler_pause() -> None:
 
 
 # ----------------------------------------------------------------------
-# placement
+# resolving a manifest entry to a beat
 # ----------------------------------------------------------------------
-def test_resolve_anchor_explicit() -> None:
-    tl = new_timeline()
-    tl.tracks.video = [seg("s001", "c001", 0.0, 5.0)]
-    entry = V.ManifestEntry(file="a.wav", anchor="s001", offset=1.5)
-    anchor, reason = V.resolve_anchor(tl, {}, entry)
-    # anchors now carry the segment's stable uid and a clip/in signature
-    assert anchor is not None
-    assert (anchor.segment, anchor.offset) == ("s001", 1.5)
-    assert anchor.uid == tl.tracks.video[0].uid
-    assert anchor.signature is not None and anchor.signature.clip == "c001"
-    assert "explicit anchor" in reason
+def test_resolve_beat_explicit_after() -> None:
+    cut = Cut(beats=[broll("c010", 0.0, 2.0), broll("c011", 0.0, 2.0)])
+    cut.renumber()
+    beat, reason = V.resolve_beat(cut, {}, V.ManifestEntry(file="a.wav", after="b002"))
+    assert beat is cut.beats[1]
+    assert "explicit after b002" in reason
 
 
-def test_resolve_anchor_by_request_via_clip_reference() -> None:
-    tl = new_timeline()
-    tl.tracks.video = [
-        seg("s001", "c001", 0.0, 5.0),
-        seg("s002", "c002", 0.0, 5.0),
-        seg("s003", "c003", 0.0, 5.0),
-    ]
-    edit_plan = {
-        "plan": {"narration_requests": [
-            {"id": "n001", "place_after_segment": "cold-open segment 1 (c001)"}
-        ]}
-    }
-    entry = V.ManifestEntry(file="a.wav", request="n001")
-    anchor, reason = V.resolve_anchor(tl, edit_plan, entry)
-    assert anchor is not None and (anchor.segment, anchor.offset) == ("s002", 0.0)
+def test_resolve_beat_accepts_a_uid_as_well_as_a_display_id() -> None:
+    cut = Cut(beats=[broll("c010", 0.0, 2.0), broll("c011", 0.0, 2.0)])
+    cut.renumber()
+    entry = V.ManifestEntry(file="a.wav", after=cut.beats[1].uid)
+    beat, _reason = V.resolve_beat(cut, {}, entry)
+    assert beat is cut.beats[1]
+
+
+def test_resolve_beat_by_request_via_clip_reference() -> None:
+    cut = Cut(beats=[broll("c010", 0.0, 2.0), broll("c011", 0.0, 2.0)])
+    cut.renumber()
+    edit_plan = {"plan": {"narration_requests": [
+        {"id": "n001", "place_after_segment": "after the second B-roll (c011)"}
+    ]}}
+    beat, reason = V.resolve_beat(cut, edit_plan, V.ManifestEntry(file="a.wav", request="n001"))
+    assert beat is cut.beats[1]
     assert "n001" in reason
 
 
-def test_resolve_anchor_unresolved_is_reported_not_raised() -> None:
-    tl = new_timeline()
-    tl.tracks.video = [seg("s001", "c001", 0.0, 5.0)]
-    entry = V.ManifestEntry(file="a.wav", request="n404")
-    anchor, reason = V.resolve_anchor(tl, {}, entry)
-    assert anchor is None
+def test_resolve_beat_by_request_via_marker_label() -> None:
+    cut = Cut(beats=[broll("c010", 0.0, 2.0), broll("c011", 0.0, 2.0)])
+    cut.renumber()
+    cut.markers = [Marker(beat=cut.beats[1].uid, label="hook")]
+    edit_plan = {"plan": {"narration_requests": [
+        {"id": "n001", "place_after_segment": "right after the hook"}
+    ]}}
+    beat, _reason = V.resolve_beat(cut, edit_plan, V.ManifestEntry(file="a.wav", request="n001"))
+    assert beat is cut.beats[1]
+
+
+def test_resolve_beat_unresolved_is_reported_not_raised() -> None:
+    cut = Cut(beats=[broll("c010", 0.0, 2.0)])
+    cut.renumber()
+    beat, reason = V.resolve_beat(cut, {}, V.ManifestEntry(file="a.wav", request="n404"))
+    assert beat is None
     assert "n404" in reason
 
 
 # ----------------------------------------------------------------------
-# overlap: grow the muted picture, then pull from broll_pool
+# inserting the voice beat and absorbing the picture under it
 # ----------------------------------------------------------------------
-def test_overlong_pickup_grows_picture_then_uses_broll_pool(project: Project) -> None:
-    add_clip(project, "c001", 3.0, order=1)   # muted picture, only 1s of room to grow
-    add_clip(project, "c002", 5.0, words=[(0.0, 1.0, "Mówię.")], order=2)  # blocks further growth
-    add_clip(project, "c003", 10.0, order=3)  # broll_pool source
+def test_place_voice_beat_absorbs_the_following_broll(cut_project: Project) -> None:
+    cut = Cut(beats=[
+        speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0), speech("c001", ["c001#2"]),
+    ])
+    cut.renumber()
+    beat, absorbed = V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 4.0)
 
-    tl = new_timeline()
-    tl.tracks.video = [
-        seg("s001", "c001", 0.0, 2.0, mute_source=True),
-        seg("s002", "c002", 0.0, 3.0),
-    ]
-    item = VoiceItem(id="v001", file="voice/x.wav", at=0.0, end=6.0,
-                      anchor=VoiceAnchor(segment="s001", offset=0.0))
-    tl.tracks.voice = [item]
-
-    ok, changes, record = V._cover_voice_item(
-        project, tl, project.settings, item, [("c003", 0.0, 5.0)]
-    )
-
-    assert ok, changes
-    assert tl.tracks.video[0].out == pytest.approx(3.0)  # grown to clip c001's own duration
-    assert len(tl.tracks.video) == 3
-    inserted = tl.tracks.video[1]
-    assert inserted.clip == "c003"
-    assert inserted.mute_source is True
-    assert inserted.out - inserted.in_ == pytest.approx(3.0)
-    assert record["extended_segment"] in ("s001", tl.tracks.video[0].uid)
-    assert record["extended_by"] == pytest.approx(1.0)
-    assert record["inserted_segments"] == [inserted.uid]
-    # the original s002 shifted right by the amount inserted+grown ahead of it
-    positions = {p.segment.id: p.start for p in tl.segment_positions()}
-    assert positions["s002"] == pytest.approx(6.0)
-    # length preserved
-    assert item.end - item.at == pytest.approx(6.0)
+    assert kinds(cut) == ["speech", "voice", "speech"]        # the B-roll beat is gone
+    assert cut.beats[1] is beat
+    assert [(s.clip, s.in_, s.out) for s in beat.shots] == [("c010", 0.0, 6.0)]
+    assert len(absorbed) == 1 and "c010" in absorbed[0]
 
 
-def test_overlong_pickup_reports_when_broll_pool_runs_out(project: Project) -> None:
-    add_clip(project, "c001", 2.0, order=1)  # no room to grow at all
-    add_clip(project, "c002", 5.0, words=[(0.0, 1.0, "Mówię.")], order=2)
+def test_place_voice_beat_absorbs_two_broll_beats_for_a_long_pickup(
+    cut_project: Project,
+) -> None:
+    cut = Cut(beats=[
+        speech("c001", ["c001#1"]),
+        broll("c010", 0.0, 3.0), broll("c011", 0.0, 5.0), broll("c012", 0.0, 1.0),
+    ])
+    cut.renumber()
+    beat, absorbed = V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 7.0)
 
-    tl = new_timeline()
-    tl.tracks.video = [
-        seg("s001", "c001", 0.0, 2.0, mute_source=True),
-        seg("s002", "c002", 0.0, 3.0),
-    ]
-    item = VoiceItem(id="v001", file="voice/x.wav", at=0.0, end=6.0,
-                      anchor=VoiceAnchor(segment="s001", offset=0.0))
-    tl.tracks.voice = [item]
+    assert [s.clip for s in beat.shots] == ["c010", "c011"]   # 3 + 5 >= 7, stop there
+    assert len(absorbed) == 2
+    assert kinds(cut) == ["speech", "voice", "broll"]         # c012 stays a beat of its own
 
-    ok, changes, record = V._cover_voice_item(project, tl, project.settings, item, [])
-    assert not ok
-    assert any("overlap unresolved" in c for c in changes)
+
+def test_place_voice_beat_with_no_broll_after_it_takes_no_shots(cut_project: Project) -> None:
+    cut = Cut(beats=[speech("c001", ["c001#1"]), speech("c001", ["c001#2"])])
+    cut.renumber()
+    beat, absorbed = V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 4.0)
+
+    assert beat.shots == [] and absorbed == []
+    assert not beat.keeps_source_audio
+    assert kinds(cut) == ["speech", "voice", "speech"]
+
+
+def test_place_voice_beat_keeps_ambient_picture_ambient(cut_project: Project) -> None:
+    cut = Cut(beats=[speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0)])
+    cut.renumber()
+    beat, _absorbed = V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 4.0)
+    assert beat.keeps_source_audio       # the B-roll was heard; it still is
+
+
+def test_place_voice_beat_keeps_muted_picture_muted(cut_project: Project) -> None:
+    cut = Cut(beats=[speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0, audio="mute")])
+    cut.renumber()
+    beat, _absorbed = V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 4.0)
+    assert not beat.keeps_source_audio
+
+
+def test_place_voice_beat_is_idempotent_for_the_same_file(cut_project: Project) -> None:
+    cut = Cut(beats=[
+        speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0), broll("c011", 0.0, 6.0),
+    ])
+    cut.renumber()
+    V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 4.0)
+    before = kinds(cut)
+
+    beat, absorbed = V.place_voice_beat(cut, cut.beats[0], "voice/n001.wav", 4.0)
+    assert kinds(cut) == before                    # no second voice beat
+    assert absorbed == []                          # and no more B-roll swallowed
+    assert [s.clip for s in beat.shots] == ["c010"]
 
 
 # ----------------------------------------------------------------------
 # end to end: manifest -> transcribe (monkeypatched) -> clean -> render -> place
 # ----------------------------------------------------------------------
-def _write_minimal_timeline(project: Project, duration: float = 8.0) -> None:
-    add_clip(project, "c001", duration, order=1)
-    tl = new_timeline()
-    tl.tracks.video = [seg("s001", "c001", 0.0, duration, mute_source=True)]
-    tl.save(project.timeline_file)
+def test_full_pipeline_places_a_pickup_after_the_named_beat(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_cut(cut_project, speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0))
+    stage_pickup(cut_project, monkeypatch,
+                 {"file": "pickup.wav", "after": "b001", "label": "intro"})
 
-
-def test_full_pipeline_places_a_clean_pickup(project: Project, tmp_path: Path, monkeypatch) -> None:
-    _write_minimal_timeline(project)
-
-    manifest = [{"file": "pickup.wav", "anchor": "s001", "offset": 0.0, "label": "intro"}]
-    project.voice_incoming_dir.mkdir(parents=True, exist_ok=True)
-    V.manifest_path(project).write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
-    sine(project.voice_incoming_dir / "pickup.wav", seconds=4.0)
-
-    doc = transcript_doc([(0.3, 0.8, "Cześć,"), (1.0, 1.6, "jedziemy.")])
-    monkeypatch.setattr(V, "_transcribe_voice_file", lambda proj, path: doc)
-
-    result = V.run_voice(project)
+    result = V.run_voice(cut_project)
     row = result["rows"][0]
     assert row["status"] == "ok"
-    assert row["voice_item"] == "v001"
+    assert row["beat"] == "b002"
 
-    out_wav = project.voice_dir / "intro.wav"
-    assert out_wav.exists()
-    assert (project.voice_dir / "intro.json").exists()
-    assert Path(project.path / result["written"]).exists()
+    assert (cut_project.voice_dir / "intro.wav").exists()
+    assert (cut_project.voice_dir / "intro.json").exists()
+    assert result["written"] == "plan/cut.json"
+    assert result["backup"]
+    # 6 s of B-roll under a 4 s pickup: the resolver trims the last shot and
+    # says so, but nothing errors.
+    assert not [issue for issue in result["issues"] if issue.startswith("error")]
+    assert any("shot_trimmed" in issue for issue in result["issues"])
 
-    timeline = Timeline.load(project.timeline_file)
-    assert len(timeline.tracks.voice) == 1
-    assert timeline.tracks.voice[0].file == "voice/intro.wav"
-    placed = timeline.tracks.voice[0].anchor
-    assert placed is not None and (placed.segment, placed.offset) == ("s001", 0.0)
-    assert placed.uid == timeline.tracks.video[0].uid
+    cut = load_cut(cutlib.cut_path(cut_project))
+    assert kinds(cut) == ["speech", "voice"]
+    voice_beat = cut.beats[1]
+    assert voice_beat.file == "voice/intro.wav"
+    assert [s.clip for s in voice_beat.shots] == ["c010"]
 
-    report = project.voice_incoming_dir / "report.md"
-    assert report.exists()
-    assert "intro" in report.read_text(encoding="utf-8")
+    # the derived timeline was rewritten from the edited cut
+    from ytedit.timeline import Timeline
+
+    timeline = Timeline.load(cut_project.timeline_file)
+    assert [item.file for item in timeline.tracks.voice] == ["voice/intro.wav"]
+
+    report = (cut_project.voice_incoming_dir / "report.md").read_text(encoding="utf-8")
+    assert "intro" in report
+    assert "c010" in report
 
 
-def test_rerun_is_idempotent_when_source_is_unchanged(
-    project: Project, tmp_path: Path, monkeypatch
+def test_full_pipeline_resolves_a_request_and_absorbs_two_broll_beats(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_minimal_timeline(project)
-    manifest = [{"file": "pickup.wav", "anchor": "s001", "offset": 0.0, "label": "intro"}]
-    project.voice_incoming_dir.mkdir(parents=True, exist_ok=True)
-    V.manifest_path(project).write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
-    sine(project.voice_incoming_dir / "pickup.wav", seconds=4.0)
+    write_cut(
+        cut_project,
+        speech("c001", ["c001#1"]), broll("c010", 0.0, 3.0), broll("c011", 0.0, 5.0),
+    )
+    cut_project.edit_plan_file.write_text(
+        json.dumps({"plan": {"narration_requests": [
+            {"id": "n001", "place_after_segment": "after the opening line (c001)"}
+        ]}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    stage_pickup(cut_project, monkeypatch, {"file": "pickup.wav", "request": "n001"},
+                 wav_seconds=7.0, pickup_seconds=7.0)
 
-    doc = transcript_doc([(0.3, 0.8, "Cześć,"), (1.0, 1.6, "jedziemy.")])
+    result = V.run_voice(cut_project)
+    assert result["rows"][0]["status"] == "ok"
+    assert len(result["rows"][0]["absorbed"]) == 2
+
+    cut = load_cut(cutlib.cut_path(cut_project))
+    assert kinds(cut) == ["speech", "voice"]
+    assert [s.clip for s in cut.beats[1].shots] == ["c010", "c011"]
+    assert cut.beats[1].file == "voice/n001.wav"     # label defaults to the request id
+
+
+def test_a_pickup_with_no_picture_after_it_is_flagged_in_the_report(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_cut(cut_project, broll("c010", 0.0, 6.0), speech("c001", ["c001#1"]))
+    stage_pickup(cut_project, monkeypatch,
+                 {"file": "pickup.wav", "after": "b002", "label": "outro"})
+
+    result = V.run_voice(cut_project)
+    row = result["rows"][0]
+    assert row["status"] == "voice_picture_short"
+
+    cut = load_cut(cutlib.cut_path(cut_project))
+    assert cut.beats[-1].kind == "voice" and cut.beats[-1].shots == []
+    assert any("voice_picture_short" in issue for issue in result["issues"])
+
+    report = (cut_project.voice_incoming_dir / "report.md").read_text(encoding="utf-8")
+    assert "voice_picture_short" in report
+    assert "action needed" in report
+
+
+def test_an_unresolvable_entry_is_unplaced_and_leaves_the_cut_alone(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_cut(cut_project, speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0))
+    before = cutlib.cut_path(cut_project).read_text(encoding="utf-8")
+    stage_pickup(cut_project, monkeypatch,
+                 {"file": "pickup.wav", "request": "n404", "label": "orphan"})
+
+    result = V.run_voice(cut_project)
+    row = result["rows"][0]
+    assert row["status"] == "unplaced"
+    assert "n404" in row["placement"]
+    assert result["written"] is None
+    assert cutlib.cut_path(cut_project).read_text(encoding="utf-8") == before
+    assert (cut_project.voice_dir / "orphan.wav").exists()   # the clean-up still ran
+
+
+def test_rerun_is_idempotent(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_cut(
+        cut_project,
+        speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0), broll("c011", 0.0, 6.0),
+    )
+    stage_pickup(cut_project, monkeypatch,
+                 {"file": "pickup.wav", "after": "b001", "label": "intro"})
     calls = {"n": 0}
 
-    def fake_transcribe(proj, path):
+    def fake_transcribe(proj: Project, path: Path) -> dict[str, Any]:
         calls["n"] += 1
-        return doc
+        return transcript_doc([(0.3, 0.8, "Cześć,"), (1.0, 1.6, "jedziemy.")])
 
     monkeypatch.setattr(V, "_transcribe_voice_file", fake_transcribe)
 
-    V.run_voice(project)
-    first_timeline = Timeline.load(project.timeline_file)
-    assert len(first_timeline.tracks.voice) == 1
+    V.run_voice(cut_project)
+    first = load_cut(cutlib.cut_path(cut_project))
     assert calls["n"] == 1
 
-    result2 = V.run_voice(project)
-    assert result2["rows"][0]["status"] == "skipped (cached)"
-    assert calls["n"] == 1  # no re-transcription
+    result = V.run_voice(cut_project)
+    assert result["rows"][0]["status"] == "skipped (cached)"
+    assert calls["n"] == 1                                   # no re-transcription
+    assert kinds(load_cut(cutlib.cut_path(cut_project))) == kinds(first)
 
-    second_timeline = Timeline.load(project.timeline_file)
-    assert len(second_timeline.tracks.voice) == 1  # no duplicate
-    assert len(second_timeline.tracks.video) == len(first_timeline.tracks.video)
+    # --force re-processes the same WAV: still one voice beat, same shots.
+    result = V.run_voice(cut_project, force=True)
+    assert result["rows"][0]["status"] == "ok"
+    again = load_cut(cutlib.cut_path(cut_project))
+    assert kinds(again) == kinds(first)
+    assert [s.clip for s in again.beats[1].shots] == [
+        s.clip for s in first.beats[1].shots
+    ]
 
 
-def test_missing_manifest_writes_a_draft_and_raises(project: Project) -> None:
-    (project.voice_incoming_dir / "a.wav").parent.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(V.VoiceError):
-        V.load_manifest(project)
-    assert V.manifest_path(project).exists()
+def test_a_placed_pickup_is_never_dragged_across_the_cut(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_cut(
+        cut_project,
+        speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0),
+        speech("c001", ["c001#2"]), broll("c011", 0.0, 6.0),
+    )
+    stage_pickup(cut_project, monkeypatch,
+                 {"file": "pickup.wav", "after": "b001", "label": "intro"})
+    V.run_voice(cut_project)          # -> [speech, voice, speech, broll]
+
+    V.manifest_path(cut_project).write_text(
+        yaml.safe_dump([{"file": "pickup.wav", "after": "b003", "label": "intro"}]),
+        encoding="utf-8",
+    )
+    result = V.run_voice(cut_project, force=True)
+
+    assert "left there" in result["rows"][0]["placement"]
+    cut = load_cut(cutlib.cut_path(cut_project))
+    assert kinds(cut) == ["speech", "voice", "speech", "broll"]
 
 
-def test_missing_timeline_raises(project: Project) -> None:
-    project.voice_incoming_dir.mkdir(parents=True, exist_ok=True)
-    V.manifest_path(project).write_text("[]\n", encoding="utf-8")
-    with pytest.raises(V.VoiceError):
-        V.run_voice(project)
+def test_a_human_edited_cut_is_written_to_a_draft(
+    cut_project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cut = Cut(beats=[speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0)])
+    cut.meta.edited_by_human = True
+    save_cut(cut, cutlib.cut_path(cut_project))
+    before = cutlib.cut_path(cut_project).read_text(encoding="utf-8")
+    stage_pickup(cut_project, monkeypatch,
+                 {"file": "pickup.wav", "after": "b001", "label": "intro"})
+
+    result = V.run_voice(cut_project)
+    assert result["edited_by_human"] is True
+    assert result["written"] == "plan/cut.draft.json"
+    assert (cut_project.plan_dir / "cut.draft.json").exists()
+    assert cutlib.cut_path(cut_project).read_text(encoding="utf-8") == before
+
+    draft = load_cut(cut_project.plan_dir / "cut.draft.json")
+    assert kinds(draft) == ["speech", "voice"]
+
+
+# ----------------------------------------------------------------------
+# manifest drafting and the missing-cut guard
+# ----------------------------------------------------------------------
+def test_missing_manifest_writes_a_draft_listing_the_beats(cut_project: Project) -> None:
+    cut = write_cut(
+        cut_project, speech("c001", ["c001#1"]), broll("c010", 0.0, 6.0),
+        Beat(kind="voice", file="voice/old.wav", shots=[Shot(clip="c011", out=2.0)]),
+    )
+    cut_project.voice_incoming_dir.mkdir(parents=True, exist_ok=True)
+    sine(cut_project.voice_incoming_dir / "pickup.wav", seconds=1.0)
+
+    with pytest.raises(V.VoiceError) as excinfo:
+        V.load_manifest(cut_project, cut)
+    assert "offset" in str(excinfo.value)          # the format change is spelled out
+
+    text = V.manifest_path(cut_project).read_text(encoding="utf-8")
+    assert "# Beats of plan/cut.json:" in text
+    assert "b001  speech c001" in text
+    assert '"Cześć z Lisboa."' in text
+    assert "b002  broll  c010   0.00-6.00s" in text
+    assert "voice/old.wav" in text
+    rows = yaml.safe_load(text)
+    assert rows == [{"file": "pickup.wav", "request": None, "after": None}]
+
+
+def test_missing_cut_raises(cut_project: Project) -> None:
+    cut_project.voice_incoming_dir.mkdir(parents=True, exist_ok=True)
+    V.manifest_path(cut_project).write_text("[]\n", encoding="utf-8")
+    with pytest.raises(V.VoiceError) as excinfo:
+        V.run_voice(cut_project)
+    assert "ytedit plan" in str(excinfo.value)

@@ -8,16 +8,17 @@ import pytest
 
 from ytedit.project import Project
 from ytedit.timeline import (
+    TIMELINE_VERSION,
     AudioFrom,
+    AudioWindow,
     Caption,
-    CaptionAnchor,
     Chapter,
     MusicCue,
     MuteRange,
     Timeline,
+    TimelineVersionError,
     Tracks,
     VideoSegment,
-    VoiceAnchor,
     VoiceItem,
     merge_ranges,
     speech_ranges_from_transcripts,
@@ -151,180 +152,75 @@ def test_segment_at_and_clip_ids() -> None:
 
 
 # ----------------------------------------------------------------------
-# voice anchors
+# version gate — a v1 timeline is not renderable
 # ----------------------------------------------------------------------
-def test_resolve_voice_anchors_moves_at_and_end() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[
-                _segment("s001", "c001", 0.0, 4.0),
-                _segment("s002", "c002", 0.0, 3.0),
-            ],
-            voice=[
-                VoiceItem(
-                    id="v001", file="voice/n001.wav", at=0.0, end=2.0,
-                    anchor=VoiceAnchor(segment="s002", offset=0.5),
-                )
-            ],
-        )
+def test_load_refuses_a_v1_timeline(tmp_path) -> None:
+    path = tmp_path / "timeline.json"
+    path.write_text(json.dumps({"version": 1, "tracks": {"video": []}}), encoding="utf-8")
+    with pytest.raises(TimelineVersionError) as excinfo:
+        Timeline.load(path)
+    assert "ytedit migrate" in str(excinfo.value)
+
+
+def test_load_legacy_reads_a_v1_timeline_with_its_dropped_fields(tmp_path) -> None:
+    """``migrate`` is the one caller allowed to read v1; extras must survive."""
+    path = tmp_path / "timeline.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tracks": {
+                    "video": [
+                        {
+                            "id": "s001", "clip": "c001", "in": 0.0, "out": 4.0,
+                            "sentence_ids": ["c001#1"],
+                        }
+                    ],
+                    "voice": [
+                        {
+                            "id": "v001", "file": "voice/n001.wav", "at": 1.0,
+                            "anchor": {"segment": "s001", "offset": 0.5},
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
     )
-    moved = tl.resolve_voice_anchors()
-    assert moved == 1
-    item = tl.tracks.voice[0]
-    # s002 starts at 4.0s; offset 0.5s -> at 4.5, length (2.0 - 0.0) kept.
-    assert item.at == pytest.approx(4.5)
-    assert item.end == pytest.approx(6.5)
+    tl = Timeline.load_legacy(path)
+    assert tl.version == 1
+    seg = tl.tracks.video[0]
+    assert (seg.model_extra or {})["sentence_ids"] == ["c001#1"]
+    assert (tl.tracks.voice[0].model_extra or {})["anchor"]["segment"] == "s001"
 
 
-def test_resolve_voice_anchors_keeps_length_when_end_is_none() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[_segment("s001", "c001", 0.0, 4.0)],
-            voice=[
-                VoiceItem(
-                    id="v001", file="voice/n001.wav", at=99.0, end=None,
-                    anchor=VoiceAnchor(segment="s001", offset=1.0),
-                )
-            ],
-        )
-    )
-    tl.resolve_voice_anchors()
-    item = tl.tracks.voice[0]
-    assert item.at == pytest.approx(1.0)
-    assert item.end is None
+def test_a_resolved_timeline_defaults_to_version_2() -> None:
+    assert Timeline().version == TIMELINE_VERSION == 2
 
 
-def test_resolve_voice_anchors_dangling_segment_keeps_absolute_time() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[_segment("s001", "c001", 0.0, 4.0)],
-            voice=[
-                VoiceItem(
-                    id="v001", file="voice/n001.wav", at=7.5, end=9.0,
-                    anchor=VoiceAnchor(segment="s999", offset=0.0),
-                )
-            ],
-        )
-    )
-    moved = tl.resolve_voice_anchors()
-    assert moved == 0
-    item = tl.tracks.voice[0]
-    assert item.at == pytest.approx(7.5)
-    assert item.end == pytest.approx(9.0)
-
-
-def test_resolve_voice_anchors_ignores_unanchored_items() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[_segment("s001", "c001", 0.0, 4.0)],
-            voice=[VoiceItem(id="v001", file="voice/n001.wav", at=2.0, end=3.0)],
-        )
-    )
-    moved = tl.resolve_voice_anchors()
-    assert moved == 0
-    assert tl.tracks.voice[0].at == pytest.approx(2.0)
+def test_load_accepts_a_v2_timeline(tmp_path) -> None:
+    saved = _timeline(_segment("s001", "c001", 0.0, 4.0)).save(tmp_path / "timeline.json")
+    assert Timeline.load(saved).tracks.video[0].clip == "c001"
 
 
 # ----------------------------------------------------------------------
-# caption anchors
+# audio_window — the picture is longer than what is heard
 # ----------------------------------------------------------------------
-def test_resolve_anchors_moves_caption_and_keeps_its_duration() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[
-                _segment("s001", "c001", 0.0, 4.0),
-                _segment("s002", "c002", 0.0, 3.0),
-            ],
-            captions=[
-                Caption(
-                    id="t001", at=0.0, end=0.7, text="Lisboa", style="location",
-                    anchor=CaptionAnchor(segment="s002", offset=0.3),
-                )
-            ],
-        )
+def test_audio_window_alias_roundtrips(tmp_path) -> None:
+    seg = _segment(
+        "s001", "c001", 10.0, 15.0, audio_window=AudioWindow(**{"in": 10.2}, out=14.5)
     )
-    moved = tl.resolve_anchors()
-    assert moved == 1
-    cap = tl.tracks.captions[0]
-    # s002 starts at 4.0s; offset 0.3s -> at 4.3, duration (0.7 - 0.0) kept.
-    assert cap.at == pytest.approx(4.3)
-    assert cap.end == pytest.approx(5.0)
+    path = _timeline(seg).save(tmp_path / "timeline.json")
+    raw = json.loads(path.read_text(encoding="utf-8"))["tracks"]["video"][0]
+    assert raw["audio_window"] == {"in": 10.2, "out": 14.5}
+    assert Timeline.load(path).tracks.video[0].audio_window.duration == pytest.approx(4.3)
 
 
-def test_resolve_anchors_resolves_voice_and_captions_together() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[
-                _segment("s001", "c001", 0.0, 4.0),
-                _segment("s002", "c002", 0.0, 3.0),
-            ],
-            voice=[
-                VoiceItem(
-                    id="v001", file="voice/n001.wav", at=0.0, end=2.0,
-                    anchor=VoiceAnchor(segment="s002", offset=0.5),
-                )
-            ],
-            captions=[
-                Caption(
-                    id="t001", at=0.0, end=0.7, text="Lisboa", style="location",
-                    anchor=CaptionAnchor(segment="s002", offset=0.3),
-                )
-            ],
-        )
-    )
-    moved = tl.resolve_anchors()
-    assert moved == 2
-    assert tl.tracks.voice[0].at == pytest.approx(4.5)
-    assert tl.tracks.captions[0].at == pytest.approx(4.3)
+def test_audio_window_defaults_to_none_and_is_not_written(tmp_path) -> None:
+    path = _timeline(_segment("s001", "c001", 0.0, 4.0)).save(tmp_path / "timeline.json")
+    raw = json.loads(path.read_text(encoding="utf-8"))["tracks"]["video"][0]
+    assert raw.get("audio_window") is None
 
-
-def test_resolve_anchors_caption_dangling_segment_keeps_absolute_time() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[_segment("s001", "c001", 0.0, 4.0)],
-            captions=[
-                Caption(
-                    id="t001", at=7.5, end=9.0, text="Lisboa", style="location",
-                    anchor=CaptionAnchor(segment="s999", offset=0.0),
-                )
-            ],
-        )
-    )
-    moved = tl.resolve_anchors()
-    assert moved == 0
-    cap = tl.tracks.captions[0]
-    assert cap.at == pytest.approx(7.5)
-    assert cap.end == pytest.approx(9.0)
-
-
-def test_resolve_anchors_ignores_unanchored_captions() -> None:
-    tl = Timeline(
-        tracks=Tracks(
-            video=[_segment("s001", "c001", 0.0, 4.0)],
-            captions=[Caption(id="t001", at=2.0, end=3.0, text="Lisboa", style="location")],
-        )
-    )
-    moved = tl.resolve_anchors()
-    assert moved == 0
-    assert tl.tracks.captions[0].at == pytest.approx(2.0)
-
-
-def test_resolve_voice_anchors_is_an_alias_for_resolve_anchors() -> None:
-    """The pre-caption-anchor name still works and resolves captions too."""
-    tl = Timeline(
-        tracks=Tracks(
-            video=[_segment("s001", "c001", 0.0, 4.0), _segment("s002", "c002", 0.0, 3.0)],
-            captions=[
-                Caption(
-                    id="t001", at=0.0, end=0.7, text="Lisboa", style="location",
-                    anchor=CaptionAnchor(segment="s002", offset=0.3),
-                )
-            ],
-        )
-    )
-    moved = tl.resolve_voice_anchors()
-    assert moved == 1
-    assert tl.tracks.captions[0].at == pytest.approx(4.3)
 
 
 # ----------------------------------------------------------------------

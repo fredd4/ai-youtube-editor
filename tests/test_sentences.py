@@ -15,6 +15,7 @@ import pytest
 from ytedit.ai.sentences import (
     build_sentence_catalogue,
     compact_footage_log_for_planner,
+    DUPLICATE_MIN_WORDS,
     flag_duplicates,
     flag_retakes,
     load_sentence_index,
@@ -22,7 +23,7 @@ from ytedit.ai.sentences import (
     split_words_into_sentences,
     write_sentences,
 )
-from ytedit.ai.tidy import Word
+from ytedit.words import Word
 from ytedit.project import Project
 
 
@@ -198,14 +199,43 @@ def test_duplicate_of_points_at_the_later_sentence_across_clips(project: Project
     assert by_id["c004#1"]["keep_default"] is True
 
 
+def _sent(sid: str, text: str, **flags: Any) -> dict[str, Any]:
+    base = {
+        "id": sid, "clip": sid.split("#")[0], "s": 0.0, "e": 1.0, "text": text,
+        "instruction": False, "retake_of": None, "duplicate_of": None,
+    }
+    base.update(flags)
+    return base
+
+
 def test_duplicate_of_is_not_set_when_the_later_match_is_an_instruction() -> None:
+    text = "wsiadamy do zatłoczonego tramwaju numer dwadzieścia osiem"
+    ordered = [_sent("c001#1", text), _sent("c001#2", text, instruction=True)]
+    flag_duplicates(ordered)
+    assert ordered[0]["duplicate_of"] is None
+
+
+def test_a_long_enough_repeat_is_still_flagged() -> None:
+    """The control for the two tests below: nothing else changed."""
+    text = "wsiadamy do zatłoczonego tramwaju numer dwadzieścia osiem"
+    ordered = [_sent("c001#1", text), _sent("c001#2", text)]
+    flag_duplicates(ordered)
+    assert ordered[0]["duplicate_of"] == "c001#2"
+
+
+def test_a_short_sentence_is_never_a_duplicate() -> None:
+    """"Zobaczcie." matches every other "Zobaczcie." in the trip."""
+    assert DUPLICATE_MIN_WORDS == 4
+    ordered = [_sent("c001#1", "Zobaczcie to."), _sent("c007#1", "Zobaczcie to.")]
+    flag_duplicates(ordered)
+    assert [s["duplicate_of"] for s in ordered] == [None, None]
+
+
+def test_a_short_later_sentence_does_not_absorb_a_long_earlier_one() -> None:
+    """The length rule applies to *both* sides of the pair."""
     ordered = [
-        {"id": "c001#1", "clip": "c001", "s": 0.0, "e": 1.0,
-         "text": "wsiadamy do tramwaju", "instruction": False, "retake_of": None,
-         "duplicate_of": None},
-        {"id": "c001#2", "clip": "c001", "s": 5.0, "e": 6.0,
-         "text": "wsiadamy do tramwaju", "instruction": True, "retake_of": None,
-         "duplicate_of": None},
+        _sent("c001#1", "bilet kosztuje trzy euro dwadzieścia"),
+        _sent("c007#1", "bilet kosztuje trzy"),
     ]
     flag_duplicates(ordered)
     assert ordered[0]["duplicate_of"] is None

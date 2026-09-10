@@ -3,18 +3,18 @@
 #   make new NAME=x LANG=pl    create a project
 #   make ingest NAME=x         normalize clips, build proxies/audio/peaks/thumbs
 #   make status NAME=x         show clips, stages and spend
-#   make validate NAME=x       validate plan/timeline.json
+#   make validate NAME=x       validate plan/cut.json against the project
 #   make transcribe NAME=x     ElevenLabs Scribe -> transcripts/
 #   make analyze NAME=x        per-clip analysis + footage log
-#   make plan NAME=x           edit plan + draft timeline (NOTES="..." optional)
-#   make tidy NAME=x           pad cuts around speech on the existing timeline
+#   make plan NAME=x           edit plan -> plan/cut.json (NOTES="..." optional)
+#   make resolve NAME=x        plan/cut.json -> the derived plan/timeline.json
 #   make denoise NAME=x CLIP=c004 [ENGINE=elevenlabs|local]  voice isolation for a windy clip
 #   make music NAME=x          generate music beds from the plan
 #   make preview NAME=x        fast 720p render -> renders/preview.mp4
 #   make master NAME=x         full master render -> exports/master_1080p.mp4
 #   make qc NAME=x             playbook rule checker + loudness
 #   make publish NAME=x        titles, description, chapters, thumbnails
-#   make run NAME=x            ingest -> transcribe -> analyze -> plan (UNTIL=music)
+#   make run NAME=x            ingest -> transcribe -> analyze -> sentences -> plan
 #   make list                  list projects
 #   make probe FILE=clip.mov   print probed media properties
 #   make serve                 run the local web editor
@@ -32,7 +32,7 @@ HOST    ?= 127.0.0.1
 PORT    ?= 8765
 
 .DEFAULT_GOAL := help
-.PHONY: help setup guard-name new ingest status validate transcribe analyze sentences plan tidy denoise music preview master qc publish run list probe serve test fixtures clean-fixtures clean
+.PHONY: help setup guard-name new ingest status validate transcribe analyze sentences plan resolve denoise music preview master qc publish run list probe serve test fixtures clean-fixtures clean
 
 help:
 	@grep -E '^#   ' $(MAKEFILE_LIST) | sed 's/^#   //'
@@ -69,8 +69,8 @@ sentences: guard-name
 plan: guard-name
 	$(YTEDIT) plan $(NAME) $(if $(FORCE),--force,) $(if $(NOTES),--notes "$(NOTES)",)
 
-tidy: guard-name
-	$(YTEDIT) tidy $(NAME) $(if $(FORCE),--force,)
+resolve: guard-name
+	$(YTEDIT) resolve $(NAME)
 
 ENGINE ?= elevenlabs
 denoise: guard-name

@@ -1,10 +1,13 @@
-"""Location cards: ``analysis/footage_log.json`` -> canonical places -> timeline captions.
+"""Location cards: ``analysis/footage_log.json`` -> canonical places -> cut captions.
 
 ``ytedit captions <slug>`` is the fix for a specific complaint: location
-captions pinned to absolute time (``Caption.at``/``end``) drift under the
-wrong picture every time a later pass changes segment lengths (speech
-padding, sentence snapping, overlay cutaways, audio dedupe, a hand edit in
-the web editor). Two things happen here:
+captions pinned to absolute time drift under the wrong picture every time a
+later pass changes the cut (a re-plan, a narration pickup, a hand edit in the
+web editor). In cut v2 a caption has no absolute time at all — it is
+``{beat, offset, duration}`` in ``plan/cut.json`` and only
+:func:`ytedit.cut.resolve` ever turns it into seconds — so a card is attached
+to the *beat* it belongs to and follows that beat wherever it ends up. Two
+things happen here:
 
 1. **Normalize places once per project.** The per-clip footage log carries
    free-text, sometimes-hedged location strings ("Belém
@@ -13,19 +16,24 @@ the web editor). Two things happen here:
    ``captions.places.system``/``.user``) turns the distinct raw strings into
    canonical ``place_id``/``label``/``region`` triples, merging near-duplicates.
    The result is cached to ``analysis/places.json`` (``--force`` re-asks) so
-   re-running ``ytedit captions`` after a re-plan/re-tidy never re-spends on
-   this.
-2. **Place a card at every new location, anchored to its segment.** Walking
-   ``tracks.video`` in order, whenever the picture's place changes to one not
-   carded in the last ``captions.min_gap_s``, a :class:`~ytedit.timeline.Caption`
-   is created with a :class:`~ytedit.timeline.CaptionAnchor` pinning it to
-   that segment — so every later pass that moves the segment moves the card
-   with it (:meth:`~ytedit.timeline.Timeline.resolve_anchors`) instead of
-   leaving it a fixed number of seconds into the programme.
+   re-running ``ytedit captions`` after a re-plan never re-spends on this.
+2. **Place a card on the first beat at every new place.** Walking
+   ``cut.beats`` in order, a beat's place is the place of its *main clip* —
+   the ``clip`` of a ``speech``/``broll`` beat, the clip of the first shot of
+   a ``voice`` beat. Whenever that place changes to one not carded in the
+   last ``captions.min_gap_s``, a :class:`ytedit.cut.Caption` is written for
+   that beat with ``offset = captions.card_offset_s`` and
+   ``duration = captions.location_seconds``.
 
-The planner's own ``hook`` captions are kept (anchored to whatever segment
-sits under them right now); its ``location`` captions are dropped and
-replaced by the generated ones, unless ``--keep-existing``.
+The editorial rules (``min_gap_s``, ``min_segment_s``, the cold-open and
+end-screen windows) are all about *how long the viewer has been watching*, so
+they are measured against the beats' resolved seconds
+(:func:`ytedit.cut.beat_spans`) rather than the beat count.
+
+The planner's own ``hook`` captions are already ``{beat, offset}`` and are
+kept exactly as they are; its ``location`` captions are dropped and replaced
+by the generated ones, unless ``--keep-existing``. Every other style is left
+untouched.
 """
 
 from __future__ import annotations
@@ -34,13 +42,24 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ..config import Settings
 from ..costs import charge
+from ..cut import (
+    Beat,
+    Caption,
+    Cut,
+    Issue,
+    backup_cut,
+    beat_spans,
+    cut_path,
+    load_cut,
+    resolve_verbose,
+    save_cut,
+)
 from ..log import get_logger
 from ..project import Project, utcnow
-from ..timeline import AnchorSignature, Caption, CaptionAnchor, Timeline
 from .openrouter import OpenRouter
 from .plan import PlanError, footage_entries, load_footage_log, units_for_ledger
 from .prompts import render
@@ -389,21 +408,39 @@ def places_by_clip(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
 # card placement
 # ----------------------------------------------------------------------
 #: Sentinel distinct from any real place_id (str) or "no place" (None), used
-#: to force the very first eligible segment to be treated as a place change —
+#: to force the very first eligible beat to be treated as a place change —
 #: nothing has actually been shown to the viewer yet, cold open included.
 _UNSEEN = object()
 
-#: Segment notes that mark muted picture cuts laid under a narration pickup or
-#: a voice-over montage — B-roll from many places under one story.
-MONTAGE_NOTE_PREFIXES: tuple[str, ...] = (
-    "VO picture for", "pickup", "a location price pickup", "street party pickup",
-    "n001 bridge", "n002 bridge", "n003 bridge", "n004 bridge", "n005 bridge",
-)
+#: A beat with this ``role`` illustrates the beat around it (a cutaway inside
+#: another scene) rather than taking the viewer somewhere: no card, and it
+#: does not count as leaving the current place.
+CUTAWAY_ROLE = "cutaway"
 
 
-def generate_location_captions(
-    timeline: Timeline,
-    places: dict[str, dict[str, Any]],
+def beat_clip(beat: Beat) -> str | None:
+    """The clip a beat's *place* is read from.
+
+    A ``speech`` or ``broll`` beat is shot at one place: its own ``clip``. A
+    ``voice`` beat is narration recorded at home over borrowed picture, so the
+    place the viewer sees is the clip of its first shot; with no shots at all
+    it shows nothing and therefore has no place.
+
+    Args:
+        beat: The beat to look at.
+
+    Returns:
+        The clip id, or ``None`` when the beat has no picture of its own.
+    """
+    if beat.kind == "voice":
+        return beat.shots[0].clip if beat.shots else None
+    return beat.clip
+
+
+def generate_location_cards(
+    cut: Cut,
+    spans: Mapping[str, tuple[float, float]],
+    places: Mapping[str, dict[str, Any]],
     min_gap_s: float = DEFAULT_MIN_GAP_S,
     location_seconds: float = DEFAULT_LOCATION_SECONDS,
     card_offset_s: float = DEFAULT_CARD_OFFSET_S,
@@ -413,55 +450,66 @@ def generate_location_captions(
     end_screen_s: float = DEFAULT_END_SCREEN_S,
     include_cold_open: bool = False,
 ) -> list[dict[str, Any]]:
-    """Decide where to place a location card, walking ``tracks.video`` in order.
+    """Decide which beats get a location card, walking ``cut.beats`` in order.
 
-    A card fires whenever the picture's place changes to one not carded in
-    the last ``min_gap_s``. If the segment where the change lands is shorter
-    than ``min_segment_s``, placement is deferred to the next segment still
-    of that same place (as long as the place doesn't change again first); if
-    none is long enough before that, the occurrence is skipped rather than
-    forced onto a too-short cut. The cold open (first ``skip_cold_open_s``,
-    unless ``include_cold_open``) and the final ``end_screen_s`` never get a
-    card.
+    A card fires whenever the beat's place changes to one not carded in the
+    last ``min_gap_s``. If the beat where the change lands is shorter than
+    ``min_segment_s``, placement is deferred to the next beat still of that
+    same place (as long as the place doesn't change again first); if none is
+    long enough before that, the occurrence is skipped rather than forced
+    onto a too-short cut. The cold open (first ``skip_cold_open_s``, unless
+    ``include_cold_open``) and the final ``end_screen_s`` never get a card.
+
+    All three windows are measured in *resolved* seconds, which is why
+    ``spans`` is required: "the last 15 seconds" and "a beat shorter than
+    2.5 s" are facts about the finished programme, not about the cut's list
+    of beats. A beat missing from ``spans`` produced no picture and is
+    skipped without breaking the place continuity around it.
+
+    Args:
+        cut: The cut whose beats are walked, in screen order.
+        spans: ``{beat uid: (start, end)}`` from :func:`ytedit.cut.beat_spans`.
+        places: ``{clip id: {"place_id", "label", "region"}}`` — the output of
+            :func:`places_by_clip`.
+        exclude_clips: Clips that never carry a place (home narration).
 
     Returns:
-        Report rows in timeline order: ``[{"segment", "place_id", "label",
-        "region", "at", "end"}, ...]`` — ``at``/``end`` are the card's
-        absolute position *right now* (before being turned into an anchored
-        :class:`~ytedit.timeline.Caption` by the caller).
+        One row per card, in beat order: ``[{"beat", "beat_id", "kind",
+        "clip", "place_id", "label", "region", "offset", "duration", "at",
+        "end"}, ...]``. ``at``/``end`` are where the card *currently* lands in
+        the programme — for the report only; the caption itself stores the
+        beat and the offset.
     """
-    positions = timeline.segment_positions()
-    total = timeline.duration()
+    items = [
+        (beat, spans[beat.uid][0], spans[beat.uid][1])
+        for beat in cut.beats
+        if beat.uid in spans
+    ]
+    total = max((end for _b, _s, end in items), default=0.0)
     eligible_start = 0.0 if include_cold_open else max(0.0, skip_cold_open_s)
     eligible_end = max(eligible_start, total - max(0.0, end_screen_s))
 
     excluded = set(exclude_clips or ())
 
-    def place_of(clip: str) -> dict[str, Any] | None:
-        if clip in excluded:
+    def place_of(beat: Beat) -> dict[str, Any] | None:
+        clip = beat_clip(beat)
+        if not clip or clip in excluded:
             return None
         return places.get(clip)
-
-    def is_montage(segment: Any) -> bool:
-        """Muted picture cuts under a voice pickup or narration montage."""
-        notes = str(getattr(segment, "notes", "") or "")
-        return bool(getattr(segment, "mute_source", False)) and any(
-            notes.startswith(prefix) for prefix in MONTAGE_NOTE_PREFIXES
-        )
 
     rows: list[dict[str, Any]] = []
     last_shown: dict[str, float] = {}
     active_place: Any = _UNSEEN
     entered_eligible = False
 
-    n = len(positions)
+    n = len(items)
     i = 0
     while i < n:
-        pos = positions[i]
-        place = place_of(pos.segment.clip)
+        beat, start, _end = items[i]
+        place = place_of(beat)
         place_id = place["place_id"] if place else None
 
-        eligible = eligible_start <= pos.start < eligible_end
+        eligible = eligible_start <= start < eligible_end
         if not eligible:
             active_place = place_id
             i += 1
@@ -474,35 +522,32 @@ def generate_location_captions(
             active_place = place_id
             i += 1
             continue
-        if is_montage(pos.segment) or str(getattr(pos.segment, "role", "")) == "cutaway":
-            # Montage cuts (B-roll under a pickup or voice-over) and cutaways
-            # inside another scene are illustrations, not visits: no card, and
-            # they do not count as leaving the scene, so the real arrival at
-            # that place still gets its card.
+        if beat.role == CUTAWAY_ROLE:
+            # An illustration, not a visit: no card, and the real arrival at
+            # that place still gets one.
             i += 1
             continue
 
-        # A genuine place change. Mark it active immediately so segments
-        # visited during the forward search below (or later in the main
-        # loop) are never re-detected as the same change again.
-        change_time = pos.start
+        # A genuine place change. Mark it active immediately so beats visited
+        # during the forward search below (or later in the main loop) are
+        # never re-detected as the same change again.
+        change_time = start
         active_place = place_id
         if change_time - last_shown.get(place_id, float("-inf")) < min_gap_s:
             i += 1
             continue
 
-        target = None
+        target: tuple[Beat, float, float] | None = None
         j = i
         while j < n:
-            cand = positions[j]
-            if cand.start >= eligible_end:
+            cand, cand_start, cand_end = items[j]
+            if cand_start >= eligible_end:
                 break
-            cand_place = place_of(cand.segment.clip)
-            cand_place_id = cand_place["place_id"] if cand_place else None
-            if cand_place_id != place_id:
+            cand_place = place_of(cand)
+            if (cand_place["place_id"] if cand_place else None) != place_id:
                 break
-            if (cand.end - cand.start) >= min_segment_s - 1e-6:
-                target = cand
+            if (cand_end - cand_start) >= min_segment_s - 1e-6:
+                target = items[j]
                 break
             j += 1
 
@@ -511,19 +556,21 @@ def generate_location_captions(
             continue
 
         assert place is not None  # place_id is not None here, so place isn't either
-        at = round(target.start + card_offset_s, 3)
-        end = round(at + location_seconds, 3)
+        target_beat, target_start, _target_end = target
+        at = round(target_start + card_offset_s, 3)
         rows.append(
             {
-                "segment": target.segment.id,
-                "segment_uid": target.segment.uid,
-                "segment_clip": target.segment.clip,
-                "segment_in": target.segment.in_,
+                "beat": target_beat.uid,
+                "beat_id": target_beat.id,
+                "kind": target_beat.kind,
+                "clip": beat_clip(target_beat) or "",
                 "place_id": place_id,
                 "label": place["label"],
                 "region": place.get("region", ""),
+                "offset": round(card_offset_s, 3),
+                "duration": round(location_seconds, 3),
                 "at": at,
-                "end": end,
+                "end": round(at + location_seconds, 3),
             }
         )
         last_shown[place_id] = at
@@ -533,94 +580,110 @@ def generate_location_captions(
 
 
 # ----------------------------------------------------------------------
-# applying to the timeline
+# applying to the cut
 # ----------------------------------------------------------------------
-def build_timeline_captions(
-    timeline: Timeline,
+def _beat_order(cut: Cut) -> dict[str, int]:
+    """``{beat uid: position}`` — the sort key a caption inherits from its beat."""
+    return {beat.uid: i for i, beat in enumerate(cut.beats)}
+
+
+def build_cut_captions(
+    cut: Cut,
+    spans: Mapping[str, tuple[float, float]],
     document: dict[str, Any],
     settings: Settings | None = None,
     include_cold_open: bool = False,
     keep_existing: bool = False,
     exclude_clips: Sequence[str] | None = None,
-) -> tuple[Timeline, list[dict[str, Any]]]:
-    """Replace the planner's location captions with generated, anchored cards.
+) -> tuple[Cut, list[dict[str, Any]]]:
+    """Replace the cut's location captions with freshly generated cards.
 
-    The planner's ``hook`` captions are kept but anchored to whatever segment
-    is under them right now (``offset = at - segment.start``); its
-    ``location`` captions are dropped unless ``keep_existing``. Every other
-    caption style (e.g. a hand-added ``subtitle`` cue) is left untouched.
+    The planner's ``hook`` captions (and any other style) are already
+    ``{beat, offset}`` and are carried over untouched — there is nothing to
+    re-anchor any more. Its ``location`` captions are dropped unless
+    ``keep_existing``.
+
+    Args:
+        cut: The cut to rewrite (modified in place and returned).
+        spans: ``{beat uid: (start, end)}`` from :func:`ytedit.cut.beat_spans`.
+        document: The ``analysis/places.json`` document.
+        keep_existing: Keep the cut's own ``location`` captions as well.
 
     Returns:
-        ``(timeline, report_rows)`` — ``report_rows`` cover every caption now
-        on the timeline, in time order: ``[{"id", "style", "text", "segment",
-        "at", "end"}, ...]``. The timeline is modified in place and returned.
+        ``(cut, report_rows)`` — one report row per caption now on the cut, in
+        screen order: ``[{"id", "style", "text", "beat", "beat_uid", "kind",
+        "clip", "where", "at", "end"}, ...]``. ``at``/``end`` are resolved
+        seconds (``0.0`` for a caption whose beat produced no picture); the
+        resolver clamps a card that outlasts its beat, so ``end`` here is the
+        requested end, not necessarily the burned-in one.
     """
     cfg = settings or Settings()
     places = places_by_clip(document)
+    card_offset_s = float(cfg.get("captions.card_offset_s", DEFAULT_CARD_OFFSET_S))
+    location_seconds = float(cfg.get("captions.location_seconds", DEFAULT_LOCATION_SECONDS))
 
-    rows = generate_location_captions(
-        timeline,
+    rows = generate_location_cards(
+        cut,
+        spans,
         places,
         min_gap_s=float(cfg.get("captions.min_gap_s", DEFAULT_MIN_GAP_S)),
-        location_seconds=float(cfg.get("captions.location_seconds", DEFAULT_LOCATION_SECONDS)),
-        card_offset_s=float(cfg.get("captions.card_offset_s", DEFAULT_CARD_OFFSET_S)),
+        location_seconds=location_seconds,
+        card_offset_s=card_offset_s,
         min_segment_s=float(cfg.get("captions.min_segment_s", DEFAULT_MIN_SEGMENT_S)),
         skip_cold_open_s=float(cfg.get("captions.skip_cold_open_s", DEFAULT_SKIP_COLD_OPEN_S)),
         end_screen_s=float(cfg.get("captions.end_screen_s", DEFAULT_END_SCREEN_S)),
         include_cold_open=include_cold_open,
         exclude_clips=exclude_clips,
     )
-    card_offset_s = float(cfg.get("captions.card_offset_s", DEFAULT_CARD_OFFSET_S))
     new_cards = [
         Caption(
-            id="", at=r["at"], end=r["end"], text=r["label"], style="location",
+            id="",
+            beat=r["beat"],
+            offset=r["offset"],
+            duration=r["duration"],
+            text=r["label"],
+            style="location",
             position="lower-left",
-            anchor=CaptionAnchor(
-                segment=r["segment"], offset=card_offset_s, uid=r["segment_uid"],
-                signature=AnchorSignature(clip=r["segment_clip"], **{"in": r["segment_in"]}),
-            ),
         )
         for r in rows
     ]
 
-    kept: list[Caption] = []
-    for cap in timeline.tracks.captions:
-        if cap.style == "location":
-            if keep_existing:
-                kept.append(cap)
-            continue
-        if cap.style == "hook" and cap.anchor is None:
-            seg_pos = timeline.segment_at(cap.at)
-            if seg_pos is not None:
-                cap.anchor = CaptionAnchor(
-                    segment=seg_pos.segment.id, offset=round(cap.at - seg_pos.start, 3),
-                    uid=seg_pos.segment.uid,
-                    signature=AnchorSignature(
-                        clip=seg_pos.segment.clip, **{"in": seg_pos.segment.in_}
-                    ),
-                )
-            kept.append(cap)
-            continue
-        kept.append(cap)
+    kept = [
+        cap for cap in cut.captions if cap.style != "location" or keep_existing
+    ]
 
-    combined = sorted(kept + new_cards, key=lambda c: c.at)
+    order = _beat_order(cut)
+    last = len(cut.beats)
+    combined = sorted(
+        kept + new_cards, key=lambda c: (order.get(c.beat, last), c.offset)
+    )
     for index, cap in enumerate(combined, start=1):
         cap.id = f"t{index:03d}"
-    timeline.tracks.captions = combined
-    timeline.resolve_anchors()
+    cut.captions = combined
 
-    report_rows = [
-        {
-            "id": cap.id,
-            "style": cap.style,
-            "text": cap.text,
-            "segment": cap.anchor.segment if cap.anchor else "",
-            "at": cap.at,
-            "end": cap.end,
-        }
-        for cap in sorted(timeline.tracks.captions, key=lambda c: c.at)
-    ]
-    return timeline, report_rows
+    by_uid = {beat.uid: beat for beat in cut.beats}
+    report_rows: list[dict[str, Any]] = []
+    for cap in combined:
+        beat = by_uid.get(cap.beat)
+        start = spans.get(cap.beat, (0.0, 0.0))[0]
+        kind = beat.kind if beat else ""
+        clip = (beat_clip(beat) or "") if beat else ""
+        beat_id = beat.id if beat else ""
+        report_rows.append(
+            {
+                "id": cap.id,
+                "style": cap.style,
+                "text": cap.text,
+                "beat": beat_id,
+                "beat_uid": cap.beat,
+                "kind": kind,
+                "clip": clip,
+                "where": " ".join(x for x in (beat_id, kind, clip) if x),
+                "at": round(start + cap.offset, 3),
+                "end": round(start + cap.offset + cap.duration, 3),
+            }
+        )
+    return cut, report_rows
 
 
 # ----------------------------------------------------------------------
@@ -629,20 +692,21 @@ def build_timeline_captions(
 def write_captions_report(
     project: Project, rows: Sequence[dict[str, Any]], document: dict[str, Any]
 ) -> Path:
-    """Write ``analysis/captions_report.md`` — time, segment, style, text."""
+    """Write ``analysis/captions_report.md`` — time, beat, style, text."""
     lines = [
         f"# Captions report — {project.slug}",
         "",
         f"Generated: {utcnow()} · places model: `{document.get('model') or '—'}` · "
         f"places cost: ${float(document.get('cost_usd') or 0.0):.4f}",
         "",
-        "| time | segment | style | text |",
+        "| time | beat | style | text |",
         "|---|---|---|---|",
     ]
     for row in rows:
         text = str(row["text"]).replace("|", "\\|")
+        where = str(row.get("where") or row.get("beat") or "")
         lines.append(
-            f"| {format_timecode(row['at'])} | {row['segment'] or '—'} | {row['style']} | {text} |"
+            f"| {format_timecode(row['at'])} | {where or '—'} | {row['style']} | {text} |"
         )
     content = "\n".join(lines) + "\n"
     path = project.analysis_dir / "captions_report.md"
@@ -662,35 +726,41 @@ def run_captions_stage(
     client: OpenRouter | None = None,
     ask_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Generate location cards for ``project`` and save them onto its timeline.
+    """Generate location cards for ``project`` and save them into its cut.
+
+    The cut is backed up, its ``captions`` are rewritten and it is saved; then
+    it is resolved so ``plan/timeline.json`` matches again. A cut the user has
+    edited by hand (``meta.edited_by_human``) is never overwritten: without
+    ``--force`` the result goes to ``plan/cut.draft.json`` and nothing is
+    resolved, so the rendered timeline keeps matching the cut on disk.
 
     Args:
         force: Re-ask the writer for places (ignoring the ``places.json``
-            cache) AND overwrite a human-edited ``timeline.json`` directly
-            instead of writing ``timeline.draft.json``.
+            cache) AND overwrite a human-edited ``cut.json`` directly instead
+            of writing ``cut.draft.json``.
         include_cold_open: Also allow a card during the opening
             ``captions.skip_cold_open_s`` seconds.
-        keep_existing: Keep the planner's own ``location`` captions instead of
+        keep_existing: Keep the cut's own ``location`` captions instead of
             dropping them.
         ask_writer: Test seam — replaces the OpenRouter call for the places
             normalization (see :func:`_ask_writer`).
 
     Returns:
-        ``{"written", "backup", "edited_by_human", "issues", "report",
-        "report_path", "cards_added", "places_cost_usd", "places_path"}``.
+        ``{"written", "timeline", "backup", "edited_by_human", "issues",
+        "report", "report_path", "cards_added", "places_cost_usd",
+        "places_path"}``. ``written`` is the cut that was written
+        (``plan/cut.json`` or ``plan/cut.draft.json``), ``timeline`` the
+        resolved timeline or ``None`` when nothing was resolved, and
+        ``issues`` a list of :class:`ytedit.cut.Issue`.
 
     Raises:
-        LocationsError: No timeline or no footage log yet.
+        LocationsError: No cut or no footage log yet.
     """
-    # Imported lazily: ai.tidy imports ai.overlay/ai.ledger which are heavier
-    # than this stage needs on every import, and this avoids any import cycle
-    # with ai.plan (already imported above at module level).
-    from .tidy import backup_timeline
-
     cfg = settings or project.settings
-    if not project.timeline_file.exists():
+    source = cut_path(project)
+    if not source.exists():
         raise LocationsError(
-            f"no timeline at {project.timeline_file} — run `ytedit plan {project.slug}` first"
+            f"no cut at {source} — run `ytedit plan {project.slug}` first"
         )
     try:
         footage_log = load_footage_log(project)
@@ -701,32 +771,51 @@ def run_captions_stage(
         project, footage_log, settings=cfg, client=client, ask_writer=ask_writer, force=force
     )
 
-    timeline = Timeline.load(project.timeline_file)
-    human_edited = bool(timeline.meta.edited_by_human)
+    cut = load_cut(source)
+    human_edited = bool(cut.meta.edited_by_human)
+    issues: list[Issue]
+    spans, issues = beat_spans(project, cut)
 
     # Clips recorded after the trip (home narration) have no place to card.
     home_clips = [
         str(c.get("id")) for c in project.clips_in_order()
         if "post recording" in str(c.get("source_file", "")).lower()
     ]
-    timeline, report_rows = build_timeline_captions(
-        timeline, document, settings=cfg,
+    cut, report_rows = build_cut_captions(
+        cut, spans, document, settings=cfg,
         include_cold_open=include_cold_open, keep_existing=keep_existing,
         exclude_clips=home_clips,
     )
     cards_added = sum(1 for r in report_rows if r["style"] == "location")
-    issues = timeline.validate(project)
 
-    backup = backup_timeline(project)
+    backup = backup_cut(project)
     write_to_draft = human_edited and not force
-    target = project.plan_dir / ("timeline.draft.json" if write_to_draft else "timeline.json")
-    timeline.save(target)
+    target = project.plan_dir / ("cut.draft.json" if write_to_draft else "cut.json")
+    save_cut(cut, target)
+
+    timeline_rel: str | None = None
+    if write_to_draft:
+        log.warning(
+            "cut.json is human-edited — wrote %s and left timeline.json alone",
+            project.rel(target),
+        )
+    else:
+        timeline, issues = resolve_verbose(project, cut)
+        if any(issue.severity == "error" for issue in issues):
+            log.error(
+                "the cut no longer resolves — timeline.json left untouched (%d error(s))",
+                sum(1 for i in issues if i.severity == "error"),
+            )
+        else:
+            timeline.save(project.timeline_file)
+            timeline_rel = project.rel(project.timeline_file)
 
     report_path = write_captions_report(project, report_rows, document)
     project.set_stage(STAGE, "done", cards=cards_added)
 
     return {
         "written": project.rel(target),
+        "timeline": timeline_rel,
         "backup": backup,
         "edited_by_human": human_edited,
         "issues": issues,
@@ -739,6 +828,7 @@ def run_captions_stage(
 
 
 __all__ = [
+    "CUTAWAY_ROLE",
     "DEFAULT_CARD_OFFSET_S",
     "DEFAULT_END_SCREEN_S",
     "DEFAULT_LOCATION_SECONDS",
@@ -747,10 +837,11 @@ __all__ = [
     "DEFAULT_SKIP_COLD_OPEN_S",
     "LOW_CONFIDENCE",
     "LocationsError",
+    "beat_clip",
+    "build_cut_captions",
     "build_places_document",
-    "build_timeline_captions",
     "ensure_places",
-    "generate_location_captions",
+    "generate_location_cards",
     "group_raw_locations",
     "places_by_clip",
     "places_path",

@@ -160,7 +160,11 @@ SEGMENTS
 - Speech (a-roll/b-roll dialogue): set "sentences" to the contiguous id run; omit
   "in"/"out" — the pipeline derives them from the sentence boundaries plus air.
 - B-roll, silent-broll, audio-only, cold-open picks: no "sentences" — set "in"/"out"
-  as clip-relative seconds inside that clip's real duration, as before.
+  as clip-relative seconds inside that clip's real duration. Seconds are allowed
+  here only because there is no speech to protect: a segment given as in/out whose
+  range covers transcript words, without "mute_source": true, is REJECTED and the
+  whole answer comes back to you to fix. Want that picture silent on purpose? Say
+  so with "mute_source": true.
 - cutaways[] (optional, on a "sentences" segment only): a picture-only insert placed
   "after_sentence" one of that segment's own ids — {"clip", "in", "out",
   "after_sentence"}. The narration keeps playing underneath it; do not also try to
@@ -200,12 +204,13 @@ PACING
 - An A-roll run longer than 10 s needs a cutaway; aim at roughly 60/40 B-roll/A-roll.
 - Air around speech (~0.3 s before the first word, ~0.5 s after the last) is added
   automatically from the sentence boundaries — never something you compute.
-- Cut narration only at sentence boundaries (guaranteed when you reference whole
-  sentence ids). Want a cutaway mid-take? Use cutaways[] with "after_sentence" —
-  never split one take into two segments with a manual seconds gap. Skipping a
-  sentence inside one take is fine; the post-processor keeps it audible under the
-  cutaway or moves the cut to the sentence boundary either side of it — you never
-  need to silence the narrator to make a cutaway fit.
+- Cut narration only at sentence boundaries — guaranteed, because whole sentence
+  ids are the only way you can address speech at all. Want a cutaway mid-take? Use
+  cutaways[] with "after_sentence"; the narration keeps playing underneath it, so
+  you never need to silence the narrator to make a cutaway fit. Never split one
+  take into two segments with a manual seconds gap. Skipping a sentence inside one
+  take is fine — the run is simply no longer contiguous, so it becomes two
+  segments' worth of picture and the skipped sentence is never heard.
 
 ALSO PRODUCE
 - cold_open: 2-4 visually distinct picks from anywhere in the log, ~10 s total.
