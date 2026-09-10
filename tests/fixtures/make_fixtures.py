@@ -13,6 +13,10 @@ Fixtures
 ``silent.mp4``      1280x720, 30 fps, 4 s, no audio stream at all
 ``hlg.mp4``         1920x1080 10-bit, tagged HLG / bt2020
 ``vfr.mp4``         variable frame rate (r_frame_rate 60 vs avg_frame_rate 37.5)
+``hlg8.mp4``        1920x1080 *8-bit*, tagged HLG / bt2020 — matches the format
+                    everywhere except the transfer, so ingest reaches the `hdr` rule
+``vfr1080.mp4``     1920x1080 variable frame rate — matches the format everywhere
+                    except the frame timing, so ingest reaches the `vfr` rule
 """
 
 from __future__ import annotations
@@ -75,6 +79,32 @@ RECIPES: dict[str, list[str]] = {
         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         "-an",
         "-metadata", "creation_time=2026-08-12T10:25:00.000000Z",
+    ],
+    # `hlg.mp4` is 10-bit, so ingest stops at the `pix_fmt` rule and never looks
+    # at its transfer. This one is 8-bit yuv420p 1920x1080 30 fps — identical to
+    # the project format except for the HLG tagging, so the `hdr` rule is what
+    # actually decides it.
+    "hlg8.mp4": [
+        "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=320:sample_rate=48000:duration=3",
+        "-vf", "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-color_trc", "arib-std-b67", "-color_primaries", "bt2020", "-colorspace", "bt2020nc",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        "-metadata", "creation_time=2026-08-12T10:30:00.000000Z",
+        "-shortest",
+    ],
+    # Same trick as `vfr.mp4`, at the project's own size: `vfr.mp4` is 720p, so
+    # ingest stops at the `size` rule before it ever asks about frame timing.
+    "vfr1080.mp4": [
+        "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=3",
+        "-vf", "select='if(lt(t,1.5),not(mod(n,4)),1)'",
+        "-fps_mode", "passthrough",
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        "-metadata", "creation_time=2026-08-12T10:35:00.000000Z",
+        "-shortest",
     ],
 }
 

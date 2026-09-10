@@ -143,12 +143,22 @@ def probe(path: Path = typer.Argument(..., help="Media file to inspect.")) -> No
 def ingest(
     slug: str = typer.Argument(..., help="Project slug."),
     force: bool = typer.Option(False, "--force", help="Rebuild assets that already exist."),
+    proxies: bool | None = typer.Option(
+        None, "--proxies/--no-proxies",
+        help="Build 720p browser proxies too (default: config ingest.proxies, off — "
+        "'ytedit serve' builds the ones the web editor needs).",
+    ),
 ) -> None:
-    """Normalize input clips and build proxies, audio, peaks and thumbnails."""
+    """Build the mezzanine, audio, peaks and thumbnails for every input clip.
+
+    A clip that already matches the project's `format` is remuxed (stream
+    copy) instead of re-encoded; the summary says which clips were encoded
+    and why.
+    """
     from .media.ingest import ingest as run_ingest
 
     project = _load(slug)
-    results = run_ingest(project, force=force)
+    results = run_ingest(project, force=force, proxies=proxies)
     errors = [r for r in results if r.status == "error"]
     if errors:
         raise typer.Exit(code=1)
@@ -910,13 +920,40 @@ def publish(slug: str = typer.Argument(..., help="Project slug.")) -> None:
 
 @app.command()
 def serve(
+    slug: str | None = typer.Argument(
+        None, help="Build this project's missing proxies before serving."
+    ),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
     port: int = typer.Option(8765, "--port", help="Port for the web editor."),
 ) -> None:
-    """Run the local web editor."""
+    """Run the local web editor.
+
+    The editor streams the 720p proxies, which ingest no longer builds by
+    default (see ``ingest.proxies``). Naming a project builds the ones it is
+    missing first — a few minutes of ffmpeg for a whole trip, so it is never
+    done for every project at once behind the user's back; without a SLUG the
+    server starts immediately and a project whose proxies were never built
+    shows no video until ``ytedit ingest <slug> --proxies`` has run.
+    """
+    from .media.ingest import ensure_proxies
+
     fn = _lazy("server.app", "serve")
     if fn is None:
         _not_implemented("serve", "server.app")
+
+    if slug:
+        project = _load(slug)
+        built = ensure_proxies(project)
+        if built:
+            console.print(
+                f"[dim]{slug}: built {len(built)} proxy/proxies for the editor "
+                f"({', '.join(built)})[/]"
+            )
+    else:
+        console.print(
+            "[dim]serving without preparing proxies; a project with none shows no "
+            "video — run 'ytedit serve <slug>' or 'ytedit ingest <slug> --proxies'.[/]"
+        )
     fn(host=host, port=port)
 
 

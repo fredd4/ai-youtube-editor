@@ -1,7 +1,7 @@
 # AI YouTube Editor — developer entry points.
 #   make setup                 create .venv and install the package (editable)
 #   make new NAME=x LANG=pl    create a project
-#   make ingest NAME=x         normalize clips, build proxies/audio/peaks/thumbs
+#   make ingest NAME=x         build mezzanines (remux when possible), audio/peaks/thumbs
 #   make status NAME=x         show clips, stages and spend
 #   make validate NAME=x       validate plan/cut.json against the project
 #   make transcribe NAME=x     ElevenLabs Scribe -> transcripts/
@@ -49,7 +49,7 @@ new: guard-name
 	$(YTEDIT) new $(NAME) --language $(LANG) $(if $(TITLE),--title "$(TITLE)",)
 
 ingest: guard-name
-	$(YTEDIT) ingest $(NAME) $(if $(FORCE),--force,)
+	$(YTEDIT) ingest $(NAME) $(if $(FORCE),--force,) $(if $(PROXIES),--proxies,)
 
 status: guard-name
 	$(YTEDIT) status $(NAME)

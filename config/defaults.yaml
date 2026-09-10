@@ -4,12 +4,6 @@
 language: pl
 budget_usd: 20.0
 
-canvas:
-  width: 1920
-  height: 1080
-  fps: 30
-  sar: "1/1"
-
 proxy:
   width: 1280
   height: 720
@@ -17,6 +11,17 @@ proxy:
   videotoolbox_q: 55
   x264_crf: 23
   x264_preset: veryfast
+
+# The output format every project renders to, and the compatibility target
+# ingest measures each clip against: a clip that already matches is remuxed
+# (stream copy), never re-encoded. Override per project in project.yaml.
+format:
+  width: 1920
+  height: 1080
+  fps: 30
+  codec: h264
+  pix_fmt: yuv420p
+  sar: "1/1"
 
 encoding:
   # Mezzanine written by ingest (normalized sources).
@@ -312,6 +317,11 @@ render:
   draft_mb_per_second: 1
 
 ingest:
+  # 720p browser proxies are only needed by the web editor and `render --draft`,
+  # and a remuxed mezzanine is already small, so ingest does not build them by
+  # default. `ytedit serve` builds the missing ones; `ytedit ingest --proxies`
+  # (or this flag) forces them up front.
+  proxies: false
   extensions: [".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".M4V"]
   still_extensions: [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]
   still_duration: 5.0

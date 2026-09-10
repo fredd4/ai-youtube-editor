@@ -176,17 +176,29 @@ def _join(parts: Sequence[str]) -> str:
     return ",".join(p for p in parts if p)
 
 
-def canvas_for(timeline: Timeline, preview: bool) -> Canvas:
+def canvas_for(settings: Settings, preview: bool) -> Canvas:
     """Return the output canvas for a render.
 
-    Previews are scaled to :data:`PREVIEW_HEIGHT` keeping the timeline's aspect
-    ratio; masters use the timeline canvas unchanged.
+    The geometry comes from the project's ``format`` section, not from the
+    timeline: ``timeline.width/height/fps`` are only a copy the resolver made
+    of the same settings, so the project stays the single authority (and a
+    changed format invalidates the segment cache through the canvas).
+
+    Args:
+        settings: Project settings supplying ``format.*``.
+        preview: True for the preview/draft canvas — scaled to
+            :data:`PREVIEW_HEIGHT` keeping the format's aspect ratio, never
+            upscaled. False renders at the format's own size.
+
+    Returns:
+        The :class:`Canvas` to render at.
     """
+    fmt = settings.format
     if not preview:
-        return Canvas(even(timeline.width), even(timeline.height), int(timeline.fps))
-    height = min(PREVIEW_HEIGHT, even(timeline.height))
-    width = even(round(timeline.width * height / max(1, timeline.height)))
-    return Canvas(width, height, int(timeline.fps))
+        return Canvas(even(fmt.width), even(fmt.height), int(fmt.fps))
+    height = min(PREVIEW_HEIGHT, even(fmt.height))
+    width = even(round(fmt.width * height / max(1, fmt.height)))
+    return Canvas(width, height, int(fmt.fps))
 
 
 # ----------------------------------------------------------------------
@@ -617,9 +629,11 @@ def denoised_audio(
     return path
 
 
-def _denoise_stamp(project: Project, clip_id: str) -> list[Any] | None:
+def _denoise_stamp(
+    project: Project, clip_id: str, state: dict[str, Any] | None = None
+) -> list[Any] | None:
     """``[name, mtime]`` of a clip's active denoised WAV, for the segment cache key."""
-    denoised = denoised_audio(project, clip_id)
+    denoised = denoised_audio(project, clip_id, state=state)
     if denoised is None:
         return None
     try:
@@ -642,8 +656,13 @@ def segment_key(
         size = source.stat().st_size
     except OSError:
         mtime, size = 0, 0
+    state = project.load_state()
     # Re-denoising a clip must invalidate every segment cut from it.
-    denoise_stamp = _denoise_stamp(project, seg.clip)
+    denoise_stamp = _denoise_stamp(project, seg.clip, state=state)
+    # A remuxed mezzanine and a re-encoded one are different pictures even at
+    # the same mtime/size, so flipping a clip between the two (a changed
+    # `format`, a re-ingest) has to invalidate the segments cut from it.
+    mezz_mode = str(state.get("clips", {}).get(seg.clip, {}).get("mezzanine") or "")
     # A shot is only as fresh as the clip it borrows its audio from.
     audio_stamp: list[Any] | None = None
     audio_denoise_stamp: list[Any] | None = None
@@ -657,7 +676,7 @@ def segment_key(
             ]
         except OSError:
             audio_stamp = [audio_source.name, 0, 0]
-        audio_denoise_stamp = _denoise_stamp(project, seg.audio_from.clip)
+        audio_denoise_stamp = _denoise_stamp(project, seg.audio_from.clip, state=state)
     # Speech leveling reads the transcript of whichever clip the segment's
     # audio actually comes from, and its target/clamp are config — a
     # re-transcribed clip or a changed audio.speech_target_lufs/
@@ -680,6 +699,7 @@ def segment_key(
         "mode": mode,
         "mute": segment_mute_ranges(timeline, seg),
         "source": [source.name, mtime, size],
+        "mezzanine_mode": mezz_mode,
         "video_source": video_stamp,
         "denoised": denoise_stamp,
         "audio_from": (
@@ -702,7 +722,7 @@ def segment_key(
         "speech_gain_max_db": float(project.settings.get("audio.speech_gain_max_db", 10.0)),
         "grade": project.settings.get(f"grade.presets.{seg.grade}", []),
         "frames": seg.frames(canvas.fps),
-        "version": 6,
+        "version": 7,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
@@ -1771,7 +1791,7 @@ def render(
     if not timeline.tracks.video:
         raise RenderError("timeline has no video segments")
 
-    canvas = canvas_for(timeline, mode != "master")
+    canvas = canvas_for(project.settings, mode != "master")
     duration = render_duration(timeline)
     to_render = build_time_map(timeline)
     timeline_duration = timeline.duration()
@@ -1966,7 +1986,7 @@ def referenced_segment_keys(project: Project, timeline: Timeline) -> set[str]:
     """
     referenced: set[str] = set()
     for is_preview in (True, False):
-        canvas = canvas_for(timeline, is_preview)
+        canvas = canvas_for(project.settings, is_preview)
         mode = "preview" if is_preview else "master"
         for seg in timeline.tracks.video:
             try:
@@ -1984,7 +2004,7 @@ def referenced_draft_segment_keys(project: Project, timeline: Timeline) -> set[s
     draft render would otherwise hit.
     """
     referenced: set[str] = set()
-    canvas = canvas_for(timeline, True)
+    canvas = canvas_for(project.settings, True)
     for seg in timeline.tracks.video:
         try:
             referenced.add(segment_key(project, timeline, seg, canvas, "draft"))

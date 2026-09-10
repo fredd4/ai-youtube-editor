@@ -18,7 +18,8 @@ from ytedit.project import Project, ProjectError, validate_slug
 # ----------------------------------------------------------------------
 def test_defaults_load() -> None:
     cfg = load_settings()
-    assert cfg.canvas == (1920, 1080, 30)
+    assert (cfg.format.width, cfg.format.height, cfg.format.fps) == (1920, 1080, 30)
+    assert (cfg.format.codec, cfg.format.pix_fmt) == ("h264", "yuv420p")
     assert cfg.model("planner") == "anthropic/claude-opus-5"
     assert cfg.model("vision") == "google/gemini-3.8-flash"
     assert cfg.get("audio.loudnorm.I") == -14
@@ -34,12 +35,12 @@ def test_deep_merge_replaces_lists_and_merges_dicts() -> None:
 def test_project_yaml_overrides_defaults(tmp_path: Path) -> None:
     project = Project.create("cfg", language="en", root=tmp_path / "projects")
     (project.path / "project.yaml").write_text(
-        "language: en\nbudget_usd: 3.5\ncanvas:\n  fps: 24\n", encoding="utf-8"
+        "language: en\nbudget_usd: 3.5\nformat:\n  fps: 24\n", encoding="utf-8"
     )
     cfg = load_settings(project.path)
     assert cfg.language == "en"
     assert cfg.budget_usd == 3.5
-    assert cfg.canvas == (1920, 1080, 24)
+    assert (cfg.format.width, cfg.format.height, cfg.format.fps) == (1920, 1080, 24)
 
 
 def test_caption_font_exists_and_covers_polish() -> None:

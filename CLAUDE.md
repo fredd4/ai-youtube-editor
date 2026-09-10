@@ -20,7 +20,7 @@ You are the orchestrator, not a solo implementer for large work. Delegate implem
 
 ```
 ytedit new <slug> --language pl        # scaffold a project
-ytedit ingest <slug>                   # normalize, proxies, audio, peaks, thumbs
+ytedit ingest <slug> [--proxies]       # mezzanine (remux when the source already matches the project format, encode otherwise), audio, peaks, thumbs; 720p proxies only with --proxies
 ytedit transcribe <slug>               # ElevenLabs Scribe v2 -> transcripts/
 ytedit analyze <slug>                  # transcript+frames -> analysis/ + footage_log.json
 ytedit sentences <slug>                # transcripts+analysis -> analysis/sentences.json (numbered sentence catalogue; auto-runs at the start of plan)
@@ -42,11 +42,12 @@ ytedit qc <slug>                       # playbook rule checker + measured loudne
 ytedit check-render <slug> [--render draft|preview|master|<path>] [--json]  # transcribe the finished render and check how every cut actually sounds (air, chopped words, replayed audio)
 ytedit publish <slug>                  # titles, description, chapters, thumbnails
 ytedit run <slug> [--until plan]       # ingest -> transcribe -> analyze -> sentences -> plan in order, skipping what's done
-ytedit serve                           # web editor at http://localhost:8765 — BROKEN until the cut-v2 port (phase 4); edit plan/cut.json + `ytedit validate`/`resolve` instead
+ytedit serve [<slug>]                  # web editor at http://localhost:8765 (a slug builds that project's missing proxies first) — BROKEN until the cut-v2 port (phase 4); edit plan/cut.json + `ytedit validate`/`resolve` instead
 
 make serve                             # same as `ytedit serve`
 make new NAME=<slug>                   # every stage also has a make target: make ingest|transcribe|analyze|sentences|plan|resolve|validate|music|preview|master|qc|publish|run NAME=<slug>
 make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
+make ingest NAME=<slug> PROXIES=1      # ingest and build the 720p proxies as well
 ```
 
 ## Where things live
@@ -56,7 +57,7 @@ make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 - `docs/playbook/prompts.md` — canonical system/user prompt text for every LLM stage (analyze, plan, captions, titles/description, thumbnail prompts). Code loads these; edit prompt wording here, not inline in `ytedit/ai/*.py`.
 - `docs/research/youtube-production-playbook.md` — the retention/production research the playbook's rules are derived from.
 - `docs/research/technical-stack.md` — API/library specifics: ffmpeg recipes, ElevenLabs/OpenRouter/fal parameters, per-video cost table.
-- `config/defaults.yaml` — global defaults (models, loudness, grade, encoding tiers, pacing markers, prices, budget). A project's `project.yaml` deep-merges on top of this.
+- `config/defaults.yaml` — global defaults (output `format` — the render canvas *and* ingest's compatibility target, models, loudness, grade, encoding tiers, pacing markers, prices, budget). A project's `project.yaml` deep-merges on top of this.
 - `ytedit/` — the Python package (CLI, media pipeline, AI clients, QC).
 - `server/` — the FastAPI web editor.
 - `projects/<slug>/` — one directory per video; see ARCHITECTURE.md for its internal layout.
@@ -80,7 +81,7 @@ make plan NAME=<slug> NOTES="..."      # pass editor notes to the planner
 The rule that governs every step below: **the user reviews a light draft before any heavy render.** A master is rendered only after he has watched the latest draft and said it is OK (or given corrections that were applied and re-drafted). Never spend an hour of his machine on a cut he has not seen.
 
 1. Confirm the target project (`projects/<slug>/input/`) — ask if ambiguous. Post-trip narration recorded at home goes into `input/post recording/` (symlink the files into `input/`; ingest does not recurse).
-2. `ytedit ingest <slug>` (long, CPU-bound: start it and do other work); check `state.json.clips[*]` for anything flagged (VFR jitter, missing audio, corrupt/zero-duration files) before spending money on the next stage.
+2. `ytedit ingest <slug>` — only long for the clips that actually need encoding: a source that already matches the project `format` is remuxed in seconds, the rest (iPhone HLG, VFR, rotated, off-size) go through the CRF 16 encode, and the closing `mezzanine: N copy, M encode (...)` line says which and why. Start it and do other work if the encode list is long; then check `state.json.clips[*]` for anything flagged (VFR jitter, missing audio, corrupt/zero-duration files, a surprising `mezzanine_reason`) before spending money on the next stage. Add `--proxies` if the user will be doing several draft rounds (`render --draft` otherwise cuts picture from the mezzanine, which works but is slower).
 3. `ytedit transcribe <slug>` → `ytedit noise <slug>` → denoise the windy list with ElevenLabs (`ytedit noise <slug> --denoise`) before anyone listens. the user's rule: every clip where he speaks gets AI noise reduction; performances and ambience stay untouched.
 4. `ytedit analyze <slug>`; spot-check a few `analysis/<clip>.json` entries against the raw transcript (`kind`, honored editor instructions, take selection — playbook §2.2, §3). `ytedit sentences <slug>` builds the sentence catalogue (retakes, duplicates, instructions) the planner works from.
 5. `ytedit plan <slug> --notes "..."` with the editorial direction (structure, which clips are narration vs. ambient, which are post-trip voice-over, runtime target). It writes `plan/cut.json` and resolves `plan/timeline.json` from it. Review `plan/edit_plan.md` **and** its script check against the structure template and pacing rules (playbook §2.3, §4) — never forward the LLM's output to the user unreviewed.

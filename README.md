@@ -37,7 +37,7 @@ ytedit --help
 ```bash
 make new NAME=lisbon-day-1 LANG=pl      # create projects/lisbon-day-1/
 cp ~/Movies/IMG_*.MOV projects/lisbon-day-1/input/
-make ingest NAME=lisbon-day-1           # normalize, proxies, audio, peaks, thumbs
+make ingest NAME=lisbon-day-1           # mezzanine (remux or encode), audio, peaks, thumbs
 make status NAME=lisbon-day-1           # clip registry + stage status + spend
 
 ytedit run        lisbon-day-1          # transcribe -> analyze -> plan (skips what is done)
@@ -86,8 +86,8 @@ falling back to file mtime, then name) and writes:
 
 | Path | Content |
 |---|---|
-| `media/sources/<id>.mp4` | normalized mezzanine: CFR, rotation baked, HDR→SDR, always has audio |
-| `media/proxies/<id>.mp4` | 720p H.264 for the browser and vision passes |
+| `media/sources/<id>.mp4` | mezzanine: a remux of the source when it already matches the project `format`, else a normalized encode (CFR, rotation baked, HDR→SDR); always has audio |
+| `media/proxies/<id>.mp4` | 720p H.264 for the web editor and `render --draft`; opt-in (`make ingest ... PROXIES=1`, `ytedit serve <slug>`) |
 | `media/audio/<id>.wav` | mono 48 kHz PCM for STT and analysis |
 | `media/peaks/<id>.json` | pre-computed waveform peaks for wavesurfer |
 | `media/thumbs/<id>.jpg` | poster frame |

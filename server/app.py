@@ -937,8 +937,8 @@ def create_app(
         else:
             if op != "add":
                 raise HTTPException(404, "no timeline yet")
-            width, height, fps = project.settings.canvas
-            timeline = new_timeline(width=width, height=height, fps=fps,
+            fmt = project.settings.format
+            timeline = new_timeline(width=fmt.width, height=fmt.height, fps=fmt.fps,
                                     language=project.language)
             timeline.meta.generated_by = "web-editor"
 

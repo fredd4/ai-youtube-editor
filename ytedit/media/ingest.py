@@ -2,9 +2,13 @@
 
 For each file in ``input/`` the stage produces
 
-* ``media/sources/<id>.mp4`` — normalized mezzanine (CFR, rotation baked,
-  HDR tonemapped to bt709, always with a stereo 48 kHz audio track),
-* ``media/proxies/<id>.mp4`` — 720p H.264 for the browser and vision passes,
+* ``media/sources/<id>.mp4`` — the mezzanine: either a plain remux of a source
+  that already matches the project ``format`` (see :func:`mezzanine_mode`) or a
+  normalized re-encode (CFR, rotation baked, HDR tonemapped to bt709), always
+  with a stereo 48 kHz audio track,
+* ``media/proxies/<id>.mp4`` — 720p H.264 for the browser editor and
+  ``render --draft``; only built when ``ingest.proxies`` is on or
+  :func:`ensure_proxies` asks for it,
 * ``media/audio/<id>.wav`` — mono 48 kHz PCM for STT and analysis,
 * ``media/peaks/<id>.json`` — pre-computed waveform peaks for wavesurfer,
 * ``media/thumbs/<id>.jpg`` — poster frame,
@@ -27,6 +31,7 @@ from typing import Any, Iterable
 import numpy as np
 from rich.table import Table
 
+from ..config import OutputFormat
 from ..log import console, get_logger
 from ..project import Project
 from .ffmpeg import FFMPEG, FFmpegError, ff, has_encoder
@@ -48,6 +53,7 @@ class IngestResult:
         steps: Names of the steps that actually ran.
         error: Error text when ``status == "error"``.
         info: The probe result, when probing succeeded.
+        mezzanine: How the mezzanine was built, when it was built in this run.
     """
 
     clip_id: str
@@ -56,6 +62,7 @@ class IngestResult:
     steps: list[str] = None  # type: ignore[assignment]
     error: str = ""
     info: MediaInfo | None = None
+    mezzanine: MezzanineMode | None = None
 
     def __post_init__(self) -> None:
         if self.steps is None:
@@ -108,57 +115,163 @@ def _recorded_at(path: Path, info: MediaInfo | None) -> str:
 
 
 # ----------------------------------------------------------------------
+# compatibility rule
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class MezzanineMode:
+    """How ingest must build one clip's mezzanine.
+
+    Attributes:
+        mode: ``"copy"`` (remux, stream copy) or ``"encode"``.
+        reason: Why the clip must be encoded; ``""`` when copying.
+    """
+
+    mode: str
+    reason: str = ""
+
+    @property
+    def is_copy(self) -> bool:
+        """True when the mezzanine is a plain remux of the source."""
+        return self.mode == "copy"
+
+
+def mezzanine_mode(info: MediaInfo, fmt: OutputFormat) -> MezzanineMode:
+    """Decide whether a source can become the mezzanine by remux alone.
+
+    A clip that already *is* what the project renders costs nothing to remux
+    and gains nothing from a CRF 16 re-encode — a 1080p30 H.264 source at
+    1.7 Mb/s measured 10x bigger for the same pixels. Everything else still
+    goes through :func:`normalize`'s encode path.
+
+    The checks run in a fixed order so the recorded reason is deterministic
+    (it ends up in ``state.json`` and in the ingest summary).
+
+    Args:
+        info: Probe result for the raw source.
+        fmt: The project's output format (also its compatibility target).
+
+    Returns:
+        A :class:`MezzanineMode`; ``reason`` names the first failed check.
+    """
+    if info.codec != fmt.codec:
+        return MezzanineMode("encode", f"codec {info.codec}")
+    if info.pix_fmt != fmt.pix_fmt:
+        return MezzanineMode("encode", f"pix_fmt {info.pix_fmt}")
+    if info.rotation != 0:
+        # A remux keeps the display matrix in metadata instead of baking it
+        # into the pixels, and the whole render path assumes the mezzanine has
+        # rotation already baked (see the `rotation=0` argument render.py
+        # passes to `source_chain` in `render_segment`). A rotated source must
+        # therefore be re-encoded, autorotated on decode.
+        return MezzanineMode("encode", f"rotation {info.rotation}")
+    if (info.display_width, info.display_height) not in (
+        (fmt.width, fmt.height),
+        # A vertical clip is kept at its own size on purpose: the renderer's
+        # `blur-fill` fit is what puts it on the canvas, so re-encoding it to
+        # 16:9 here would bake in a decision the cut is allowed to change.
+        (fmt.height, fmt.width),
+    ):
+        return MezzanineMode("encode", f"size {info.display_width}x{info.display_height}")
+    if info.vfr:
+        return MezzanineMode("encode", "vfr")
+    if info.hdr is not None:
+        return MezzanineMode("encode", f"hdr {info.hdr}")
+    if abs(info.fps - fmt.fps) > 0.05:
+        return MezzanineMode("encode", f"fps {info.fps:g}")
+    return MezzanineMode("copy", "")
+
+
+# ----------------------------------------------------------------------
 # steps
 # ----------------------------------------------------------------------
-def normalize(project: Project, src: Path, info: MediaInfo, out: Path) -> None:
-    """Write the normalized mezzanine for a clip.
+def normalize(project: Project, src: Path, info: MediaInfo, out: Path) -> MezzanineMode:
+    """Write the mezzanine for a clip, remuxing it when that is enough.
 
-    Bakes display rotation (ffmpeg autorotates — ``-noautorotate`` is never
-    passed), converts to CFR at the rounded frame rate, tonemaps HDR to
-    bt709 SDR, keeps the original resolution and guarantees a stereo 48 kHz
-    audio track (silent when the source has none).
+    A source that already matches the project ``format``
+    (:func:`mezzanine_mode`) is stream-copied: seconds instead of minutes, and
+    the same bytes instead of a CRF 16 blow-up. Anything else is re-encoded —
+    display rotation baked in (ffmpeg autorotates; ``-noautorotate`` is never
+    passed), CFR at the rounded frame rate, HDR tonemapped to bt709 SDR, the
+    original resolution kept.
+
+    Either way the mezzanine comes out with a stereo 48 kHz audio track
+    (silent when the source has none), because every downstream stage — the
+    work WAV, the segment pass, the mix — assumes one is there.
 
     Args:
         project: Owning project (supplies encoding settings).
         src: Raw input file.
         info: Probe result for ``src``.
         out: Destination ``media/sources/<id>.mp4``.
+
+    Returns:
+        The :class:`MezzanineMode` that was applied.
     """
     cfg = project.settings
     enc = cfg.encoding("mezzanine")
     audio_cfg = cfg.section("audio")
-    fps = info.target_fps
-    chain = ",".join(c for c in (tonemap_chain(info.hdr, cfg), f"fps={fps}") if c)
+    sample_rate = int(audio_cfg.get("sample_rate", 48000))
+    channels = int(audio_cfg.get("channels", 2))
+    decision = mezzanine_mode(info, cfg.format)
 
     args: list[Any] = ["-i", str(src)]
     if not info.has_audio:
         args += [
             "-f", "lavfi",
-            "-i", f"anullsrc=channel_layout=stereo:sample_rate={audio_cfg.get('sample_rate', 48000)}",
+            "-i", f"anullsrc=channel_layout=stereo:sample_rate={sample_rate}",
         ]
     args += ["-map", "0:v:0", "-map", "1:a:0" if not info.has_audio else "0:a:0?"]
-    args += [
-        "-vf", chain,
-        "-fps_mode", "cfr",
-        "-r", str(fps),
-        "-c:v", enc.get("vcodec", "libx264"),
-        "-crf", str(enc.get("crf", 16)),
-        "-preset", enc.get("preset", "fast"),
-        "-pix_fmt", enc.get("pix_fmt", "yuv420p"),
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
-        "-colorspace", "bt709",
-        "-c:a", enc.get("acodec", "aac"),
-        "-b:a", str(enc.get("abitrate", "256k")),
-        "-ar", str(audio_cfg.get("sample_rate", 48000)),
-        "-ac", str(audio_cfg.get("channels", 2)),
-        "-movflags", "+faststart",
-    ]
+
+    if decision.is_copy:
+        # Video is bit-identical, so the only question left is the audio. An
+        # MP4 will not take an arbitrary source codec, and the stereo/48 kHz
+        # mezzanine invariant has to hold whatever the phone recorded, so the
+        # track is copied only when it is already exactly what we would write.
+        # Re-encoding it is cheap next to a video pass — this is still a remux.
+        copy_audio = (
+            info.has_audio
+            and info.audio_codec == "aac"
+            and info.audio_channels == channels
+            and info.audio_sample_rate == sample_rate
+        )
+        args += ["-c:v", "copy"]
+        if copy_audio:
+            args += ["-c:a", "copy"]
+        else:
+            args += [
+                "-c:a", enc.get("acodec", "aac"),
+                "-b:a", str(enc.get("abitrate", "256k")),
+                "-ar", str(sample_rate),
+                "-ac", str(channels),
+            ]
+        args += ["-movflags", "+faststart"]
+    else:
+        fps = info.target_fps
+        chain = ",".join(c for c in (tonemap_chain(info.hdr, cfg), f"fps={fps}") if c)
+        args += [
+            "-vf", chain,
+            "-fps_mode", "cfr",
+            "-r", str(fps),
+            "-c:v", enc.get("vcodec", "libx264"),
+            "-crf", str(enc.get("crf", 16)),
+            "-preset", enc.get("preset", "fast"),
+            "-pix_fmt", enc.get("pix_fmt", "yuv420p"),
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
+            "-c:a", enc.get("acodec", "aac"),
+            "-b:a", str(enc.get("abitrate", "256k")),
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            "-movflags", "+faststart",
+        ]
+
     if not info.has_audio:
         args += ["-shortest"]
     args += [str(out)]
     out.parent.mkdir(parents=True, exist_ok=True)
     ff(*args)
+    return decision
 
 
 def make_proxy(project: Project, src: Path, out: Path) -> None:
@@ -204,6 +317,49 @@ def make_proxy(project: Project, src: Path, out: Path) -> None:
         "-pix_fmt", "yuv420p",
         str(out),
     )
+
+
+def _want_proxies(project: Project, proxies: bool | None) -> bool:
+    """Resolve the proxy flag: ``None`` means "use ``ingest.proxies``"."""
+    if proxies is None:
+        return bool(project.settings.get("ingest.proxies", False))
+    return bool(proxies)
+
+
+def ensure_proxies(project: Project, clip_ids: Iterable[str] | None = None) -> list[str]:
+    """Build any missing 720p proxy from the mezzanine.
+
+    Ingest does not build proxies by default (see ``ingest.proxies``), but the
+    web editor streams them, so ``ytedit serve`` calls this first.
+
+    Args:
+        project: Project to fill in.
+        clip_ids: Restrict to these clips; ``None`` means every video clip in
+            the registry.
+
+    Returns:
+        The clip ids whose proxy was built by this call, in registry order.
+    """
+    wanted = set(clip_ids) if clip_ids is not None else None
+    built: list[str] = []
+    for clip in project.clips_in_order():
+        clip_id = str(clip.get("id") or "")
+        if not clip_id or (wanted is not None and clip_id not in wanted):
+            continue
+        if clip.get("kind") == "still":
+            continue
+        source = project.source_path(clip_id)
+        proxy = project.proxy_path(clip_id)
+        if proxy.exists() or not source.exists():
+            continue
+        try:
+            make_proxy(project, source, proxy)
+        except (FFmpegError, OSError) as exc:
+            log.error("proxy failed for %s: %s", clip_id, exc)
+            continue
+        project.add_clip({"id": clip_id, "proxy": project.rel(proxy)})
+        built.append(clip_id)
+    return built
 
 
 def extract_audio(project: Project, src: Path, out: Path) -> None:
@@ -333,7 +489,12 @@ def make_frames(project: Project, src: Path, out_dir: Path) -> int:
 # per-clip driver
 # ----------------------------------------------------------------------
 def ingest_clip(
-    project: Project, clip_id: str, src: Path, info: MediaInfo, force: bool = False
+    project: Project,
+    clip_id: str,
+    src: Path,
+    info: MediaInfo,
+    force: bool = False,
+    proxies: bool | None = None,
 ) -> IngestResult:
     """Build every derived asset for one clip.
 
@@ -343,11 +504,15 @@ def ingest_clip(
         src: Raw input file.
         info: Probe result for ``src``.
         force: Rebuild outputs that already exist.
+        proxies: Build the 720p browser proxy; ``None`` uses ``ingest.proxies``.
+            With proxies off the poster and vision frames are sampled from the
+            mezzanine instead.
 
     Returns:
         An :class:`IngestResult` describing what ran.
     """
     result = IngestResult(clip_id=clip_id, source_file=project.rel(src), info=info)
+    want_proxy = _want_proxies(project, proxies)
     project.set_clip_stage(clip_id, "ingest", "running")
     try:
         source = project.source_path(clip_id)
@@ -357,12 +522,17 @@ def ingest_clip(
         poster = project.poster_path(clip_id)
         frames_dir = project.clip_frames_dir(clip_id)
 
+        mezz: MezzanineMode | None = None
         if force or not source.exists():
-            normalize(project, src, info, source)
+            mezz = normalize(project, src, info, source)
             result.steps.append("normalize")
-        if force or not proxy.exists():
+            result.mezzanine = mezz
+        if want_proxy and (force or not proxy.exists()):
             make_proxy(project, source, proxy)
             result.steps.append("proxy")
+        # The poster and the vision frames are read off the proxy when there is
+        # one (cheap to decode) and off the mezzanine otherwise.
+        stills_from = proxy if want_proxy or proxy.exists() else source
         if force or not wav.exists():
             extract_audio(project, source, wav)
             result.steps.append("audio")
@@ -373,44 +543,52 @@ def ingest_clip(
             peaks.write_text(json.dumps(data), encoding="utf-8")
             result.steps.append("peaks")
         if force or not poster.exists():
-            make_poster(proxy, poster, at=float(project.settings.get("ingest.poster_at", 1.0)))
+            make_poster(
+                stills_from, poster, at=float(project.settings.get("ingest.poster_at", 1.0))
+            )
             result.steps.append("poster")
         frame_count = len(list(frames_dir.glob("*.jpg"))) if frames_dir.exists() else 0
         if force or frame_count == 0:
-            frame_count = make_frames(project, proxy, frames_dir)
+            frame_count = make_frames(project, stills_from, frames_dir)
             result.steps.append("frames")
 
         normalized_info = probe(source, detect_vfr=False)
-        project.add_clip(
-            {
-                "id": clip_id,
-                "source_file": project.rel(src),
-                "recorded_at": _recorded_at(src, info),
-                "kind": info.kind,
-                "duration": normalized_info.duration or info.duration,
-                "width": info.display_width,
-                "height": info.display_height,
-                "fps": info.fps,
-                "target_fps": info.target_fps,
-                "vfr": info.vfr,
-                "rotation": info.rotation,
-                "orientation": info.orientation,
-                "hdr": info.hdr,
-                "codec": info.codec,
-                "is_iphone": info.is_iphone,
-                "has_audio": info.has_audio,
-                "audio_channels": info.audio_channels,
-                "audio_sample_rate": info.audio_sample_rate,
-                "size_bytes": info.size_bytes,
-                "normalized": project.rel(source),
-                "proxy": project.rel(proxy),
-                "audio": project.rel(wav),
-                "peaks": project.rel(peaks),
-                "poster": project.rel(poster),
-                "frames": project.rel(frames_dir),
-                "frames_count": frame_count,
-            }
-        )
+        record: dict[str, Any] = {
+            "id": clip_id,
+            "source_file": project.rel(src),
+            "recorded_at": _recorded_at(src, info),
+            "kind": info.kind,
+            "duration": normalized_info.duration or info.duration,
+            "width": info.display_width,
+            "height": info.display_height,
+            "fps": info.fps,
+            "target_fps": info.target_fps,
+            "vfr": info.vfr,
+            "rotation": info.rotation,
+            "orientation": info.orientation,
+            "hdr": info.hdr,
+            "codec": info.codec,
+            "is_iphone": info.is_iphone,
+            "has_audio": info.has_audio,
+            "audio_channels": info.audio_channels,
+            "audio_sample_rate": info.audio_sample_rate,
+            "size_bytes": info.size_bytes,
+            "normalized": project.rel(source),
+            "audio": project.rel(wav),
+            "peaks": project.rel(peaks),
+            "poster": project.rel(poster),
+            "frames": project.rel(frames_dir),
+            "frames_count": frame_count,
+        }
+        if proxy.exists():
+            record["proxy"] = project.rel(proxy)
+        if mezz is not None:
+            # Only set when the mezzanine was actually (re)built — on a cached
+            # clip whatever the registry already says still describes the file
+            # on disk, and add_clip merges, so leaving the keys out keeps it.
+            record["mezzanine"] = mezz.mode
+            record["mezzanine_reason"] = mezz.reason
+        project.add_clip(record)
         project.set_clip_stage(clip_id, "ingest", "done")
         result.status = "done" if result.steps else "skipped"
     except (FFmpegError, OSError, ValueError) as exc:
@@ -476,7 +654,12 @@ def register_still(project: Project, clip_id: str, src: Path, info: MediaInfo | 
 # ----------------------------------------------------------------------
 # stage entry point
 # ----------------------------------------------------------------------
-def ingest(project: Project, force: bool = False, show_table: bool = True) -> list[IngestResult]:
+def ingest(
+    project: Project,
+    force: bool = False,
+    show_table: bool = True,
+    proxies: bool | None = None,
+) -> list[IngestResult]:
     """Ingest every file in ``input/`` into the clip registry.
 
     Files are probed serially (cheap) and ordered by recording time, then the
@@ -488,6 +671,8 @@ def ingest(project: Project, force: bool = False, show_table: bool = True) -> li
         project: Project to ingest.
         force: Rebuild assets that already exist.
         show_table: Print the summary table to the console when done.
+        proxies: Build 720p browser proxies; ``None`` uses ``ingest.proxies``
+            (off by default — see :func:`ensure_proxies`).
 
     Returns:
         One :class:`IngestResult` per input file, in clip order.
@@ -538,23 +723,57 @@ def ingest(project: Project, force: bool = False, show_table: bool = True) -> li
             return IngestResult(clip_id, project.rel(path), "error", [], "probe failed", None)
         if path.suffix.lower() in still_exts or info.kind == "still":
             return register_still(project, clip_id, path, info)
-        return ingest_clip(project, clip_id, path, info, force=force)
+        return ingest_clip(project, clip_id, path, info, force=force, proxies=proxies)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(_run, assignments))
 
     errors = [r for r in results if r.status == "error"]
+    modes = mezzanine_summary(project)
     project.set_stage(
         "ingest",
         "error" if errors else "done",
         clips=len(results),
         cost_usd=0.0,
+        mezzanine_copy=modes["copy"],
+        mezzanine_encode=modes["encode"],
+        encode_reasons=modes["reasons"],
         error="; ".join(f"{r.clip_id}: {r.error}" for r in errors)[:2000] if errors else None,
     )
     log.info("ingest finished: %d clip(s), %d error(s)", len(results), len(errors))
     if show_table:
         console.print(clips_table(project))
+        console.print(mezzanine_line(modes))
     return results
+
+
+def mezzanine_summary(project: Project) -> dict[str, Any]:
+    """Count how the registry's mezzanines were built.
+
+    Returns:
+        ``{"copy": int, "encode": int, "reasons": {first word: count}}`` —
+        encode reasons are grouped by their first word (``vfr``, ``hdr``,
+        ``size``, ...) so a summary stays one line however many clips there are.
+    """
+    copies = encodes = 0
+    reasons: dict[str, int] = {}
+    for clip in project.clips_in_order():
+        mode = str(clip.get("mezzanine") or "")
+        if mode == "copy":
+            copies += 1
+        elif mode == "encode":
+            encodes += 1
+            head = str(clip.get("mezzanine_reason") or "other").split(" ")[0] or "other"
+            reasons[head] = reasons.get(head, 0) + 1
+    return {"copy": copies, "encode": encodes, "reasons": reasons}
+
+
+def mezzanine_line(summary: dict[str, Any]) -> str:
+    """Render :func:`mezzanine_summary` as the one-line ingest footer."""
+    reasons = summary.get("reasons") or {}
+    detail = ", ".join(f"{name} {count}" for name, count in sorted(reasons.items()))
+    line = f"mezzanine: {summary['copy']} copy, {summary['encode']} encode"
+    return f"{line} ({detail})" if detail else line
 
 
 def clips_table(project: Project, title: str | None = None) -> Table:
@@ -571,7 +790,7 @@ def clips_table(project: Project, title: str | None = None) -> Table:
     for column, justify in (
         ("id", "left"), ("source", "left"), ("dur", "right"), ("size", "right"),
         ("fps", "right"), ("rot", "right"), ("orient", "left"), ("hdr", "left"),
-        ("audio", "left"), ("frames", "right"), ("ingest", "left"),
+        ("audio", "left"), ("mezz", "left"), ("frames", "right"), ("ingest", "left"),
     ):
         table.add_column(column, justify=justify)
 
@@ -590,6 +809,7 @@ def clips_table(project: Project, title: str | None = None) -> Table:
             str(clip.get("orientation", "")),
             str(clip.get("hdr") or "-"),
             "yes" if clip.get("has_audio") else "no",
+            str(clip.get("mezzanine") or "") or "[dim]-[/]",
             str(clip.get("frames_count", 0)),
             f"[{style}]{status}[/]",
         )

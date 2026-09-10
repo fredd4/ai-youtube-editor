@@ -99,7 +99,9 @@ def build_render_project(
         "c_silent.mp4": "silent.mp4",         # 1280x720, 4 s, no audio stream
     }.items():
         shutil.copy(media[fixture], project.input_dir / name)
-    results = ingest(project, show_table=False)
+    # Proxies are off by default since ingest learned to remux; the render
+    # tests need them (the --draft tier cuts picture from the proxy).
+    results = ingest(project, show_table=False, proxies=True)
     assert not [r for r in results if r.error], [r.error for r in results]
 
     subprocess.run(
@@ -283,14 +285,14 @@ def probe(path: Path) -> dict:
 # geometry and time mapping (no ffmpeg)
 # ----------------------------------------------------------------------
 def test_canvas_for_preview_letterboxes_to_720p() -> None:
-    timeline = Timeline.model_validate({"width": 1920, "height": 1080, "fps": 30})
-    assert R.canvas_for(timeline, preview=True) == R.Canvas(1280, 720, 30)
-    assert R.canvas_for(timeline, preview=False) == R.Canvas(1920, 1080, 30)
+    settings = load_settings()
+    assert R.canvas_for(settings, preview=True) == R.Canvas(1280, 720, 30)
+    assert R.canvas_for(settings, preview=False) == R.Canvas(1920, 1080, 30)
 
 
-def test_canvas_for_never_upscales_a_small_timeline() -> None:
-    timeline = Timeline.model_validate({"width": 640, "height": 360, "fps": 24})
-    assert R.canvas_for(timeline, preview=True) == R.Canvas(640, 360, 24)
+def test_canvas_for_never_upscales_a_small_format() -> None:
+    settings = load_settings(overrides={"format": {"width": 640, "height": 360, "fps": 24}})
+    assert R.canvas_for(settings, preview=True) == R.Canvas(640, 360, 24)
 
 
 def test_render_positions_overlap_both_fade_and_xfade() -> None:
@@ -421,6 +423,30 @@ def test_preview_has_the_expected_duration_and_canvas(rendered: tuple[Project, P
     assert audio["channels"] == 2
 
 
+def test_the_programme_is_cut_from_both_kinds_of_mezzanine(
+    rendered: tuple[Project, Path]
+) -> None:
+    """Two of the three segments come off a remuxed source, one off an encode.
+
+    Renders join segments cut from mezzanines that ingest built two different
+    ways, so the three-segment programme above is the end-to-end proof that a
+    remuxed source is as renderable as a re-encoded one.
+    """
+    project, out = rendered
+    modes = {
+        c["id"]: (c["mezzanine"], c["mezzanine_reason"]) for c in project.clips_in_order()
+    }
+    assert modes == {
+        "c001": ("copy", ""),                  # 1920x1080 h264 30 fps: already the format
+        "c002": ("copy", ""),                  # 1080x1920: the vertical inverse of it
+        "c003": ("encode", "size 1280x720"),   # 720p: re-encoded
+    }
+    data = probe(out)
+    assert float(data["format"]["duration"]) == pytest.approx(EXPECTED_DURATION, abs=0.1)
+    video = next(s for s in data["streams"] if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (1280, 720)
+
+
 def test_preview_is_colour_tagged_bt709(rendered: tuple[Project, Path]) -> None:
     _project, out = rendered
     video = next(s for s in probe(out)["streams"] if s["codec_type"] == "video")
@@ -491,7 +517,7 @@ def test_state_and_job_record_the_render(rendered: tuple[Project, Path]) -> None
 def test_segments_are_cached_between_renders(rendered: tuple[Project, Path]) -> None:
     project, _out = rendered
     timeline = Timeline.load(project.timeline_file)
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     cached = [
         project.renders_dir / "segments"
         / f"{R.segment_key(project, timeline, seg, canvas, 'preview')}.mp4"
@@ -507,7 +533,7 @@ def test_segments_are_cached_between_renders(rendered: tuple[Project, Path]) -> 
 def test_changing_a_segment_changes_its_cache_key(rendered: tuple[Project, Path]) -> None:
     project, _out = rendered
     timeline = Timeline.load(project.timeline_file)
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     seg = timeline.tracks.video[0]
     first = R.segment_key(project, timeline, seg, canvas, "preview")
     moved = seg.model_copy(update={"out": seg.out + 0.5})
@@ -515,10 +541,65 @@ def test_changing_a_segment_changes_its_cache_key(rendered: tuple[Project, Path]
     assert R.segment_key(project, timeline, seg, canvas, "master") != first
 
 
+def test_a_changed_format_changes_the_segment_key(tmp_path: Path) -> None:
+    """The canvas comes from ``format``, so re-targeting the project re-renders.
+
+    No ffmpeg: the key is computed from settings and ``state.json`` alone.
+    """
+    root = tmp_path / "projects"
+    project = Project.create("format-key-test", language="pl", root=root)
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "s001", "uid": "00000000000000f1", "clip": "c001", "in": 0.0, "out": 2.0},
+    ]}})
+    seg = timeline.tracks.video[0]
+
+    def key() -> str:
+        reopened = Project.load("format-key-test", root=root)
+        canvas = R.canvas_for(reopened.settings, preview=False)
+        return R.segment_key(reopened, timeline, seg, canvas, "master")
+
+    first = key()
+    assert key() == first, "the key must be stable while nothing changes"
+
+    (project.path / "project.yaml").write_text(
+        "language: pl\nformat:\n  fps: 25\n", encoding="utf-8"
+    )
+    assert key() != first, "a changed format.fps must invalidate the segment"
+
+    (project.path / "project.yaml").write_text(
+        "language: pl\nformat:\n  width: 1280\n", encoding="utf-8"
+    )
+    assert key() != first, "a changed format.width must invalidate the segment"
+
+
+def test_flipping_a_clips_mezzanine_mode_changes_the_segment_key(project: Project) -> None:
+    """A remuxed mezzanine and a re-encoded one are different pictures.
+
+    Their mtime and size may well be unchanged (a re-ingest under a changed
+    ``format`` writes the same path), so the mode itself is in the key.
+    """
+    timeline = Timeline.model_validate({"tracks": {"video": [
+        {"id": "s001", "uid": "00000000000000f2", "clip": "c001", "in": 0.0, "out": 2.0},
+    ]}})
+    seg = timeline.tracks.video[0]
+    canvas = R.canvas_for(project.settings, preview=False)
+
+    def key() -> str:
+        return R.segment_key(project, timeline, seg, canvas, "master")
+
+    project.add_clip({"id": "c001", "mezzanine": "copy", "mezzanine_reason": ""})
+    copied = key()
+    project.add_clip({"id": "c001", "mezzanine": "encode", "mezzanine_reason": "vfr"})
+    assert key() != copied
+
+    project.add_clip({"id": "c001", "mezzanine": "copy", "mezzanine_reason": "vfr"})
+    assert key() == copied, "only the mode is keyed, not the reason it was recorded with"
+
+
 def test_silent_clip_still_produces_an_audio_stream(rendered: tuple[Project, Path]) -> None:
     project, _out = rendered
     timeline = Timeline.load(project.timeline_file)
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     seg = timeline.tracks.video[2]           # c003, the fixture with no audio stream
     path = R.render_segment(project, timeline, seg, canvas, "preview")
     streams = probe(path)["streams"]
@@ -686,7 +767,7 @@ def test_xfade_join_is_frame_exact(
 
     # keep the module fixture's renders untouched
     monkeypatch.setattr(Project, "renders_dir", property(lambda self: tmp_path / "renders"))
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     segments = [
         R.render_segment(project, timeline, seg, canvas, "preview")
         for seg in timeline.tracks.video
@@ -738,7 +819,7 @@ def test_audio_from_renders_the_other_clips_tone_at_the_pictures_length(
         ]},
     })
     seg = timeline.tracks.video[0]
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     path = R.render_segment(project, timeline, seg, canvas, "preview")
 
     # exactly as many frames as the picture asks for
@@ -820,7 +901,7 @@ def test_audio_window_renders_silence_outside_the_window(
         ]},
     })
     seg = timeline.tracks.video[0]
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     path = R.render_segment(project, timeline, seg, canvas, "preview")
 
     # the picture is untouched: all 3 s of it
@@ -847,7 +928,7 @@ def test_audio_window_silences_a_borrowed_audio_range_too(
         ]},
     })
     seg = timeline.tracks.video[0]
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     path = R.render_segment(project, timeline, seg, canvas, "preview")
 
     # the window opens 1.0 s into the segment (2.0 s of c002, cut in at 1.0 s)
@@ -929,7 +1010,7 @@ def test_speech_leveling_evens_out_differing_segment_gains(tmp_path: Path) -> No
              "source_audio_gain_db": 6.0},
         ]},
     })
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     measured: list[float] = []
     for seg in timeline.tracks.video:
         path = R.render_segment(project, timeline, seg, canvas, "preview")
@@ -950,7 +1031,7 @@ def test_speech_leveling_skips_muted_and_untranscribed_segments(tmp_path: Path) 
             {"id": "s002", "clip": "c002", "in": 0.0, "out": 1.5},  # c002 has no transcript
         ]},
     })
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     for seg in timeline.tracks.video:
         R.render_segment(project, timeline, seg, canvas, "preview")
         key = R.segment_key(project, timeline, seg, canvas, "preview")
@@ -961,7 +1042,7 @@ def test_speech_leveling_skips_muted_and_untranscribed_segments(tmp_path: Path) 
 def test_speech_target_lufs_change_invalidates_the_segment_cache(tmp_path: Path) -> None:
     project = build_render_project(tmp_path, slug="target-key-test")
     timeline = Timeline.load(project.timeline_file)
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     seg = timeline.tracks.video[0]
     before = R.segment_key(project, timeline, seg, canvas, "preview")
 
@@ -1005,7 +1086,7 @@ def test_voice_pickup_gain_includes_speech_leveling(
             "voice": [{"id": "v001", "file": "voice/v001.wav", "at": 0.0, "gain_db": 1.0}],
         },
     })
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     seg = timeline.tracks.video[0]
     segment_path = R.render_segment(project, timeline, seg, canvas, "preview")
     _video_out, program_audio = R.join_segments(
@@ -1062,7 +1143,7 @@ def test_duck_ranges_for_an_audio_from_segment_come_from_the_borrowed_clips_word
                        "duck": {"mode": "auto", "amount_db": -15}}],
         },
     })
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
     seg = timeline.tracks.video[0]
     segment_path = R.render_segment(project, timeline, seg, canvas, "preview")
     _video_out, program_audio = R.join_segments(
@@ -1157,7 +1238,7 @@ def test_parallel_segment_pass_matches_sequential_output(tmp_path: Path) -> None
     """render.workers > 1 must produce the same segment files as workers=1."""
     project = build_render_project(tmp_path, slug="workers-test")
     timeline = Timeline.load(project.timeline_file)
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
 
     sequential = R.render_segments(project, timeline, canvas, "preview", workers=1)
     assert len(sequential) == 3
@@ -1181,7 +1262,7 @@ def test_parallel_segment_pass_matches_sequential_output(tmp_path: Path) -> None
 def test_render_segments_reports_progress_in_completion_order(tmp_path: Path) -> None:
     project = build_render_project(tmp_path, slug="progress-test")
     timeline = Timeline.load(project.timeline_file)
-    canvas = R.canvas_for(timeline, preview=True)
+    canvas = R.canvas_for(project.settings, preview=True)
 
     calls: list[tuple[int, int, str]] = []
     R.render_segments(
@@ -1368,7 +1449,7 @@ def test_video_dimensions_reads_the_proxys_own_coded_size(project: Project) -> N
     shutil.copy(media["vertical.mp4"], project.input_dir / "v.mp4")
     from ytedit.media.ingest import ingest
 
-    ingest(project, show_table=False)
+    ingest(project, show_table=False, proxies=True)
     proxy = project.proxy_path("c001")
     dims = R._video_dimensions(proxy)
     assert dims is not None

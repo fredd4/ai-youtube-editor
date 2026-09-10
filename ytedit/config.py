@@ -66,6 +66,34 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class OutputFormat:
+    """The video format a project renders to *and* ingests against.
+
+    One value serves both ends of the pipeline on purpose: it is the render
+    canvas (:func:`ytedit.media.render.canvas_for`) and the compatibility
+    target ingest measures every source against
+    (:func:`ytedit.media.ingest.mezzanine_mode`) — a clip that already matches
+    it is remuxed into the mezzanine instead of being re-encoded, so the two
+    definitions must never be able to drift apart.
+
+    Attributes:
+        width: Canvas width in pixels.
+        height: Canvas height in pixels.
+        fps: Constant frame rate of the programme.
+        codec: Video codec name as ffprobe reports it (``h264``).
+        pix_fmt: Pixel format (``yuv420p``).
+        sar: Sample aspect ratio as a ``num/den`` string.
+    """
+
+    width: int
+    height: int
+    fps: int
+    codec: str
+    pix_fmt: str
+    sar: str
+
+
+@dataclass(frozen=True)
 class Settings:
     """Merged configuration for a run.
 
@@ -137,12 +165,15 @@ class Settings:
         return float(self.get("budget_usd", 20.0))
 
     @property
-    def canvas(self) -> tuple[int, int, int]:
-        """``(width, height, fps)`` of the output canvas."""
-        return (
-            int(self.get("canvas.width", 1920)),
-            int(self.get("canvas.height", 1080)),
-            int(self.get("canvas.fps", 30)),
+    def format(self) -> OutputFormat:
+        """The project's :class:`OutputFormat` (``format.*``)."""
+        return OutputFormat(
+            width=int(self.get("format.width", 1920)),
+            height=int(self.get("format.height", 1080)),
+            fps=int(self.get("format.fps", 30)),
+            codec=str(self.get("format.codec", "h264")),
+            pix_fmt=str(self.get("format.pix_fmt", "yuv420p")),
+            sar=str(self.get("format.sar", "1/1")),
         )
 
     @property

@@ -1077,7 +1077,8 @@ def build_cut(
             this into one retry of the planner call.
     """
     cfg = settings or project.settings
-    width, height, fps = cfg.canvas
+    fmt = cfg.format
+    width, height, fps = fmt.width, fmt.height, fmt.fps
 
     state = project.load_state()
     clips: dict[str, dict[str, Any]] = state.get("clips", {})

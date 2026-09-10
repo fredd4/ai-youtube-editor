@@ -40,7 +40,7 @@ ai-youtube-editor/
 │   ├── media/
 │   │   ├── ffmpeg.py         # ff()/ffprobe() runners, progress parsing (-progress pipe:1)
 │   │   ├── probe.py          # MediaInfo: duration, w/h, fps, vfr, rotation, hdr (color_transfer), audio channels
-│   │   ├── ingest.py         # register sources, normalize (CFR, rotation, HDR→SDR), proxies, audio wav, peaks, thumbs
+│   │   ├── ingest.py         # register sources, mezzanine (remux when the source already matches `format`, else CFR/rotation/HDR→SDR encode), optional proxies, audio wav, peaks, thumbs
 │   │   ├── color.py          # filter builders: tonemap chain, grade chain, vertical-in-16:9
 │   │   ├── audio.py          # loudnorm 2-pass, silencedetect, duck automation (sendcmd), voice cleanup, demucs wrapper
 │   │   ├── frames.py         # frame sampling + annotation for vision models
@@ -72,8 +72,8 @@ ai-youtube-editor/
         ├── project.yaml      # language, title, style, music mood, budget, output preset
         ├── input/            # RAW DROP ZONE — user copies phone clips here (mp4/mov, any orientation)
         ├── media/
-        │   ├── sources/      # normalized mezzanine (CFR, rotation baked, SDR, ProRes or high-CRF H.264)
-        │   ├── proxies/      # 720p H.264 for browser + analysis
+        │   ├── sources/      # mezzanine: remuxed source when it already matches `format`, else high-CRF H.264 (CFR, rotation baked, SDR)
+        │   ├── proxies/      # 720p H.264 for the web editor + `render --draft`; opt-in (`ingest.proxies`), built on demand by `ytedit serve <slug>`
         │   ├── audio/        # <clip>.wav 48k mono for STT/analysis; cleaned/isolated variants
         │   ├── peaks/        # <clip>.peaks.json for wavesurfer
         │   ├── thumbs/       # <clip>.jpg poster + frames/<clip>/NNN.jpg samples
@@ -96,7 +96,7 @@ ai-youtube-editor/
 | # | Stage | Command | Input → Output | Tool |
 |---|---|---|---|---|
 | 0 | new | `ytedit new <slug> --language pl` | creates project dirs + project.yaml | — |
-| 1 | ingest | `ytedit ingest <slug>` | input/* → media/sources, proxies, audio, peaks, thumbs; state.json clips[] | ffprobe/ffmpeg |
+| 1 | ingest | `ytedit ingest <slug> [--proxies]` | input/* → media/sources (mezzanine: remux or encode, see "Output format"), audio, peaks, thumbs (+ media/proxies with `--proxies`); state.json clips[] | ffprobe/ffmpeg |
 | 2 | transcribe | `ytedit transcribe <slug>` | audio/*.wav → transcripts/*.json + .srt | ElevenLabs scribe_v2 (fallback whisper) |
 | 3 | analyze | `ytedit analyze <slug>` | transcripts + frames → analysis/*.json + footage_log.json | OpenRouter (Claude/Gemini) |
 | 3b | sentences | `ytedit sentences <slug>` | transcripts + analysis → analysis/sentences.json + .md (numbered sentence catalogue); auto-runs at the start of `plan` | deterministic (`ytedit/ai/sentences.py`) |
@@ -107,16 +107,54 @@ ai-youtube-editor/
 | 4c | voice | `ytedit voice <slug>` | voice/incoming/*.wav (manifest-mapped) → transcribe, cut retakes/instructions/stutters/pauses, insert a `voice` beat into plan/cut.json | ElevenLabs Scribe + deterministic (`ytedit/ai/voice.py`) |
 | 4d | captions | `ytedit captions <slug>` | footage_log locations → analysis/places.json (canonical, one writer call, cached) → location captions written onto beats in plan/cut.json + analysis/captions_report.md | OpenRouter (writer) + deterministic (`ytedit/ai/locations.py`) |
 | 5 | music | `ytedit music <slug>` | plan music cues → music/*.mp3 + cue beat ranges in plan/cut.json | ElevenLabs Music |
-| 6 | render | `ytedit render <slug> --draft` / `--preview` / `--master` | timeline.json → renders/draft.mp4 (from proxy, ~1 MB/10s) / renders/preview.mp4 / exports/master.mp4 (hardware tier by default, `--x264` for the slow tier) | ffmpeg |
+| 6 | render | `ytedit render <slug> --draft` / `--preview` / `--master` | timeline.json → renders/draft.mp4 (from the proxy when one exists, else the mezzanine; ~1 MB/10s) / renders/preview.mp4 / exports/master.mp4 (hardware tier by default, `--x264` for the slow tier) | ffmpeg |
 | 7 | qc | `ytedit qc <slug>` | cut (re-resolved first, validator issues prefixed `cut:`) + timeline + master → qc_report.json/md | `ytedit.cut.validate` + rules + loudnorm measure |
 | 8 | publish | `ytedit publish <slug>` | → exports/publish.json (titles, description, chapters), thumbnails/ | OpenRouter + fal |
 | — | at | `ytedit at <slug> <mm:ss>` | cut.json + timeline.json → the **beat** (id, kind, clip, sentences, which shot is on screen) plus the segment/audio/caption/chapter at that rendered timecode | deterministic (`ytedit/inspect.py`) |
 | — | check-render | `ytedit check-render <slug> [--render draft\|preview\|master]` | rendered file + timeline → `renders/check/<name>.report.md` (air, chopped words, replayed audio at every audio boundary) | ElevenLabs Scribe (`ytedit/verify.py`) |
 | — | migrate | `ytedit migrate <slug> [--dry-run]` | a v1 plan/timeline.json → plan/cut.json + plan/migrate_report.md; the v1 file moves to plan/history/timeline.v1.json | deterministic (`ytedit/migrate.py`) |
-| — | serve | `ytedit serve` | web editor at http://localhost:8765 | FastAPI |
+| — | serve | `ytedit serve [<slug>]` | web editor at http://localhost:8765; with a slug, builds that project's missing 720p proxies first | FastAPI |
 | — | run | `ytedit run <slug> [--until …]` | ingest → transcribe → analyze → sentences → plan, skipping stages already done, then re-resolves the timeline. Music is deliberately **not** in the chain: a bed is only worth generating once the cut is stable and it costs real money per track. | — |
 
 Each stage records `state.json.stages[<name>] = {status, started, finished, cost_usd, error}`; per-clip stage status lives in `state.json.clips[<id>]`.
+
+---
+
+## Output format (`format`) and the mezzanine
+
+One config section describes what a project renders **and** what ingest measures its sources against, because the moment those are two values they can drift and ingest starts re-encoding footage the renderer would have taken as-is:
+
+```yaml
+format:
+  width: 1920
+  height: 1080
+  fps: 30
+  codec: h264
+  pix_fmt: yuv420p
+  sar: "1/1"
+```
+
+`config/defaults.yaml` ships 1080p30; a `project.yaml` overrides it wholesale — `format: {width: 3840, height: 2160, fps: 30, ...}` for a 4K project, `format: {width: 1080, height: 1920, fps: 30, ...}` for a vertical one. `Settings.format` returns an `OutputFormat` (`ytedit/config.py`); the old `canvas:` section and `Settings.canvas` are gone.
+
+**The render reads the canvas and the frame rate from the project format, not from the timeline.** `canvas_for(settings, preview)` (`media/render.py`) builds the master canvas from `format.width/height/fps` and the preview/draft canvas by scaling that down to 720p on the same aspect ratio. `timeline.width/height/fps` still exist and still describe the programme, but they are a copy the resolver made of `cut.json`'s own copy of the same settings — reading them at render time would let a stale derived file decide the output size. (The resolver's frame arithmetic does use `cut.fps`, which `ytedit plan` writes from `format.fps` when it builds the cut.)
+
+**The compatibility rule** (`mezzanine_mode(info, fmt)` in `media/ingest.py`) decides per clip whether `media/sources/<id>.mp4` can be a plain remux of the input. The checks run in a fixed order, so the reason recorded in `state.json` is deterministic rather than "whichever mismatch the code noticed first":
+
+1. `codec` differs from `format.codec` — HEVC, ProRes, anything that is not the delivery codec.
+2. `pix_fmt` differs — 10-bit `yuv420p10le` from a phone, 4:2:2, etc.
+3. rotation is non-zero — a remux would leave the display matrix in metadata instead of baking it into the pixels, and the whole render path assumes the mezzanine has rotation already baked (`render_segment` passes `rotation=0` into `source_chain`).
+4. size is neither `format.width × height` nor its vertical inverse — a vertical clip is deliberately kept at its own size, because the renderer's `blur-fill` fit is what puts it on the canvas; re-encoding it to 16:9 at ingest would bake in a decision the cut is allowed to change.
+5. `vfr` — variable frame rate has to be resampled to CFR.
+6. `hdr` — HLG/PQ must be tonemapped to bt709.
+7. `fps` differs from `format.fps` by more than 0.05.
+
+A clip that passes all seven is written with `-c:v copy`: seconds instead of minutes, and the same bytes instead of a CRF 16 blow-up. Its audio is copied too (`-c:a copy`) only when the source track is already AAC at `audio.sample_rate`/`audio.channels`; otherwise just the audio is re-encoded, which is cheap next to a video pass and keeps the invariant every downstream stage relies on — **every mezzanine carries a stereo 48 kHz track**, silent (`anullsrc`) when the source has none. Anything that fails a check goes through the unchanged encode path (`encoding.mezzanine`: `libx264 -crf 16 -preset fast`, tonemap chain, `fps=<target>`, `-fps_mode cfr`, bt709 tags).
+
+The decision is visible in four places: `state.json.clips[<id>].mezzanine`/`.mezzanine_reason`, the `mezz` column of the clip table (printed by ingest and by `ytedit status`), a one-line footer ingest prints under it (`mezzanine: 4 copy, 2 encode (vfr 1, hdr 1)`, from `mezzanine_summary`/`mezzanine_line`), and the `stages.ingest` counters.
+
+**Proxies are opt-in.** `ingest.proxies` defaults to `false`, so a plain `ytedit ingest` builds no `media/proxies/`; `ytedit ingest <slug> --proxies` (or `make ingest NAME=x PROXIES=1`) builds them up front and `ytedit serve <slug>` builds the missing ones for that project before the editor starts. `ytedit serve` with no slug starts immediately and says so, because silently building every project's proxies can be an hour of ffmpeg the user did not ask for. Without a proxy the poster frame and the vision frames are sampled from the mezzanine instead, and `render --draft` keeps its existing fallback: cut picture from the mezzanine and warn (slower, and the point of a draft is speed — so build proxies for a project that will go through several correction rounds).
+
+**Cache.** A clip's `mezzanine` mode is part of the render's per-segment cache payload (`segment_key`, payload `version` 7), because a remuxed and a re-encoded mezzanine are different pictures even at the same mtime and size; flipping a clip between the two invalidates the segments cut from it. A changed `format` invalidates them through the canvas, which is part of the same key.
 
 ---
 
@@ -131,17 +169,21 @@ Each stage records `state.json.stages[<name>] = {status, started, finished, cost
       "id": "c001", "source_file": "input/a clip.MOV", "recorded_at": "2026-08-12T10:31:05",
       "order": 1, "duration": 42.3, "width": 3840, "height": 2160, "fps": 29.97, "vfr": true,
       "rotation": 90, "orientation": "vertical", "hdr": "hlg", "has_audio": true,
+      "mezzanine": "encode", "mezzanine_reason": "rotation 90",
       "normalized": "media/sources/c001.mp4", "proxy": "media/proxies/c001.mp4",
       "audio": "media/audio/c001.wav", "peaks": "media/peaks/c001.json", "poster": "media/thumbs/c001.jpg",
       "stages": {"ingest": "done", "transcribe": "done", "analyze": "pending"}
     }
   },
-  "stages": {"ingest": {"status": "done", "finished": "...", "cost_usd": 0}},
+  "stages": {"ingest": {"status": "done", "finished": "...", "cost_usd": 0,
+                        "mezzanine_copy": 4, "mezzanine_encode": 2, "encode_reasons": {"vfr": 1, "hdr": 1}}},
   "costs": [{"ts": "...", "service": "elevenlabs", "op": "stt", "units": "42.3s", "usd": 0.0026}],
   "budget_usd": 20.0
 }
 ```
 Clip ids are `c` + zero-padded index in **recording order** (from `creation_time` metadata, fallback file mtime, fallback name). Order is the travel chronology and is the default narrative order.
+
+`mezzanine` is `copy` or `encode` and `mezzanine_reason` names the first compatibility check the source failed (`""` for a copy) — see "Output format" above. They are written only when the mezzanine was actually built in that run, so a cached clip keeps whatever the registry already says about the file on disk. `proxy` is present only when a proxy exists: with `ingest.proxies` off nothing under `media/proxies/` is created until `ytedit ingest --proxies` or `ytedit serve <slug>` runs. The `stages.ingest` record carries the run's totals — `mezzanine_copy`, `mezzanine_encode` and `encode_reasons` (encode reasons grouped by their first word, so the summary stays one line at 218 clips).
 
 ### transcripts/<clip>.json
 ```json
@@ -356,7 +398,7 @@ Story outline (beats with target timecodes per playbook: 0:00 hook, 0:07 promise
 ## Rendering model (`media/render.py`)
 
 0. **Pre-flight** (`preflight()`, before any ffmpeg work): runs `Timeline.validate(project, skip_music=, skip_voice=)` — structural checks plus, for every video segment and every `audio_from` override, its range checked against that clip's known duration from the registry (`0 <= in < out <= duration + 0.05`) — and additionally confirms every referenced clip actually has a normalized source on disk (the one thing the JSON-only validator cannot see). This is a structural backstop on the derived file: the editorial gate is `ytedit validate`, which runs the cut validator over `plan/cut.json` (and `ytedit.cut.ensure_resolved` re-resolves the timeline before the render reads it, so pre-flight never sees a stale file). All problems are collected and reported at once as a numbered list; `render` refuses before touching ffmpeg rather than failing 20 minutes in on segment 179 of 190. `--no-music`/`--no-voice` skip the corresponding track's checks (a missing music file is not a reason to refuse a render that ignores music) and, symmetrically, drop that track from the mix without modifying the timeline file. A disk-space guard (`render.mb_per_second` × programme seconds × `render.disk_headroom_factor`, defaults 20 MB/s × 3x; `render.draft_mb_per_second`, default 1, for `--draft`) logs free space and refuses early when there isn't enough headroom for the segment cache + intermediates + export to coexist.
-1. **Segment pass** (cached by hash of segment spec, including its frame count, canvas and mode): for each video segment cut from the normalized source: `-ss in`, then exactly `round((out−in)/speed × fps)` frames (`setpts=PTS-STARTPTS` + `-frames:v`, audio `atrim`/`apad` to the same number of samples), apply transform (fit for vertical, crop-pan), grade chain, scale/pad to canvas, `fps=30`, set source-audio gain / mute ranges. A segment carrying an `audio_window` also gets a `volume=enable='not(between(t,w0,w1))':volume=0` gate in its audio chain — applied in the same post-`atempo`, post-`-ss` time base as the mute ranges and *before* the speech measurement below, so audio outside the window renders silent inside that segment: the picture can hold the full `speech_pad_before`/`speech_pad_after` while a neighbouring word that happens to be on screen is never heard, and a silenced word never pulls the cut's measured level. `--draft` cuts *picture* from the 720p ingest proxy (`media/proxies/<clip>.mp4`) instead of the mezzanine — using the proxy's own probed size, not the mezzanine's `state.json` width/height, since a vertical clip's proxy is a different shape — falling back to the mezzanine with a warning when a clip has no proxy yet; its *audio* always still comes from the mezzanine/denoised WAV, never the proxy's lossy 128k AAC, so a draft sounds exactly like the master. Immediately after that (still inside the segment's own audio chain, before `atrim`/`apad`), any cut whose audio carries transcript words is **speech-levelled**: `measure_speech_gain` (`ytedit/media/audio.py`) runs a `loudnorm print_format=json` analysis pass over the cut's own `-ss/-t` range — gated to just the word ranges via a `volume=enable=...` mute of everything else when they cover under 60% of the cut, measured whole otherwise — and the resulting gain (target `audio.speech_target_lufs`, default −16 LUFS, clamped to ±`audio.speech_gain_max_db`, default 10 dB) is folded into the same `volume=` filter used for the manual `source_audio_gain_db`. Ambient/B-roll cuts (no transcript) and muted cuts are left at their recorded level. The gain actually applied is written next to the cached segment as `<hash>.gain.json` (read back for the render log's speech-leveling table and the job's `speech_gains` list, on a cache hit too) and takes part in the segment's cache key (alongside `audio.speech_target_lufs`/`speech_gain_max_db` and the source clip's transcript mtime) so a re-transcribe or a changed target invalidates it. `Timeline.segment_positions()` does the same whole-frame arithmetic, so absolute placements (voice, captions, music, markers, chapters) match the rendered file to the frame regardless of how many fractional cuts precede them. Intermediate: `libx264 -crf 16 -preset fast` (`h264_videotoolbox` for previews, `-q:v 45`/libx264 ultrafast crf 26 for drafts) + `pcm_s16le` audio, 48 kHz stereo, cached in `renders/segments/` (`renders/segments_draft/` for `--draft` — its own namespace, so a draft render never invalidates or is invalidated by the preview/master cache). `render_segments()` runs this pass across a `ThreadPoolExecutor` sized by `render.workers` (default 3 — each ffmpeg process is already internally multi-threaded, so more than 3-4 rarely helps on an 8-core machine); a cache hit costs a stat + probe, never spawns ffmpeg (and never re-measures speech gain — the sidecar from the original render is reused), so extra workers are free on an already-rendered timeline. Segment order in the output list always matches the timeline regardless of completion order; a failure names its segment id precisely.
+1. **Segment pass** (cached by hash of segment spec, including its frame count, canvas, mode and the source clip's `mezzanine` mode; canvas comes from the project `format`, see above): for each video segment cut from the normalized source: `-ss in`, then exactly `round((out−in)/speed × fps)` frames (`setpts=PTS-STARTPTS` + `-frames:v`, audio `atrim`/`apad` to the same number of samples), apply transform (fit for vertical, crop-pan), grade chain, scale/pad to canvas, `fps=30`, set source-audio gain / mute ranges. A segment carrying an `audio_window` also gets a `volume=enable='not(between(t,w0,w1))':volume=0` gate in its audio chain — applied in the same post-`atempo`, post-`-ss` time base as the mute ranges and *before* the speech measurement below, so audio outside the window renders silent inside that segment: the picture can hold the full `speech_pad_before`/`speech_pad_after` while a neighbouring word that happens to be on screen is never heard, and a silenced word never pulls the cut's measured level. `--draft` cuts *picture* from the 720p ingest proxy (`media/proxies/<clip>.mp4`) instead of the mezzanine — using the proxy's own probed size, not the mezzanine's `state.json` width/height, since a vertical clip's proxy is a different shape — falling back to the mezzanine with a warning when a clip has no proxy yet (the common case now that `ingest.proxies` is off by default: build them with `ytedit ingest --proxies` for a project that will go through several draft rounds); its *audio* always still comes from the mezzanine/denoised WAV, never the proxy's lossy 128k AAC, so a draft sounds exactly like the master. Immediately after that (still inside the segment's own audio chain, before `atrim`/`apad`), any cut whose audio carries transcript words is **speech-levelled**: `measure_speech_gain` (`ytedit/media/audio.py`) runs a `loudnorm print_format=json` analysis pass over the cut's own `-ss/-t` range — gated to just the word ranges via a `volume=enable=...` mute of everything else when they cover under 60% of the cut, measured whole otherwise — and the resulting gain (target `audio.speech_target_lufs`, default −16 LUFS, clamped to ±`audio.speech_gain_max_db`, default 10 dB) is folded into the same `volume=` filter used for the manual `source_audio_gain_db`. Ambient/B-roll cuts (no transcript) and muted cuts are left at their recorded level. The gain actually applied is written next to the cached segment as `<hash>.gain.json` (read back for the render log's speech-leveling table and the job's `speech_gains` list, on a cache hit too) and takes part in the segment's cache key (alongside `audio.speech_target_lufs`/`speech_gain_max_db` and the source clip's transcript mtime) so a re-transcribe or a changed target invalidates it. `Timeline.segment_positions()` does the same whole-frame arithmetic, so absolute placements (voice, captions, music, markers, chapters) match the rendered file to the frame regardless of how many fractional cuts precede them. Intermediate: `libx264 -crf 16 -preset fast` (`h264_videotoolbox` for previews, `-q:v 45`/libx264 ultrafast crf 26 for drafts) + `pcm_s16le` audio, 48 kHz stereo, cached in `renders/segments/` (`renders/segments_draft/` for `--draft` — its own namespace, so a draft render never invalidates or is invalidated by the preview/master cache). `render_segments()` runs this pass across a `ThreadPoolExecutor` sized by `render.workers` (default 3 — each ffmpeg process is already internally multi-threaded, so more than 3-4 rarely helps on an 8-core machine); a cache hit costs a stat + probe, never spawns ffmpeg (and never re-measures speech gain — the sidecar from the original render is reused), so extra workers are free on an already-rendered timeline. Segment order in the output list always matches the timeline regardless of completion order; a failure names its segment id precisely.
 2. **Join pass**: concat demuxer for cuts (each entry carries a `duration` directive pinned to its frame count); `xfade`/`acrossfade` chained for transitions with frame-rounded offsets/overlaps (only when requested; default hard cuts).
 3. **Audio bus**: `[program_audio]` = joined source audio (already speech-levelled per cut, see above) + voice track overlays, unless `--no-voice`. Each voice pickup is levelled to the same `audio.speech_target_lufs` target (measured once and cached alongside the file as `<file>.loudness.json`, keyed on its mtime and the target/clamp) before its own `gain_db` is added on top. Speech ranges for ducking come from transcripts mapped to timeline time (`duck.mode=auto`) or from an explicit list — for an `audio_from` overlay these already come from the borrowed clip, not the picture clip, and both the ducking ranges (`speech_ranges_from_transcripts`) and the per-cut speech levelling (`segment_speech_ranges`) are clipped to the segment's `audio_window`: a word that is never heard must not duck the music either. Music gain automation via `sendcmd` file with ramps (attack/release), ducking `ducking.amount_db` (default −15 dB, chosen against a −16 LUFS levelled voice and a −18…−21 dB cue gain) → mixed with `amix=normalize=0` (skipped entirely with `--no-music`). Then voice cleanup (optional: `none`/`light`/`full`, see `audio.voice_cleanup`) — a gentle `acompressor` that runs *after* the leveling above, so it is consistency glue rather than gain-riding — then **loudnorm to −14 LUFS / −1 dBTP** on the final mix (two-pass for `--master`, single-pass for `--preview`/`--draft`). This whole pass is identical across all three tiers, so a `--draft` already sounds like the eventual master.
 4. **Captions**: generated ASS (libass) with fonts checked for Polish glyphs, burned in the final pass via `ass=` filter. Separate `captions.srt` (subtitles from transcript) written for upload, not burned.
@@ -388,7 +430,7 @@ Views: **Clips** (source review: transcript, waveform, mute tool, denoise button
 **The Program view edits beats, not seconds.** A beat strip with frames; a speech beat shows its sentences (drop the first or last sentence, split the beat at a sentence, switch to `words` and drag a word boundary), its shots (add from the clip grid, trim in seconds, move `after`) and `on_camera`; a broll beat has in/out nudges as today; a voice beat has its shots and the WAV; beats are dragged to reorder; music cues, captions, chapters and markers pick a beat rather than a time. Save → `validate` → `resolve` → `plan/timeline.json` → the existing player/preview. "Tidy cuts", "Accept draft", the anchor retrofit and split-by-frame on a speech segment are gone — there is nothing left for them to do.
 
 Original v1 feature list (still valid, lives under Clips/Advanced):
-- Video player (proxy) synced with wavesurfer waveform + regions: transcript words rendered under the waveform, takes highlighted, detected music regions shaded.
+- Video player (proxy — `ytedit serve <slug>` builds the ones ingest skipped, so name the project when starting the editor) synced with wavesurfer waveform + regions: transcript words rendered under the waveform, takes highlighted, detected music regions shaded.
 - Clip list in order with kind/role badges; drag to reorder segments; set in/out; toggle include; choose transform for vertical clips.
 - **Mute/duck tool**: select a range on the waveform → set gain (mute / −12 dB / custom) → saved to `mute_ranges`.
 - Captions list (edit text/time/style); music cues list (choose track, gain, duck amount); markers.

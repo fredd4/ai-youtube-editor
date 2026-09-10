@@ -121,3 +121,38 @@ The lesson for the next design decision of this size: when the same defect keeps
 in a new pass's clothing, the passes are not the problem — the representation they are all
 guessing against is. Making the ambiguity unrepresentable was cheaper than making six passes
 agree, and it is the only version of the fix that stays fixed.
+
+## 6. The mezzanine was re-encoding footage that was already finished (2026-09-10)
+
+Ingest normalized every clip the same way: `libx264 -crf 16 -preset fast`, CFR, rotation baked,
+HLG tonemapped. The default was chosen for the worst case — phone footage that is 10-bit, HDR,
+variably-timed and rotated in metadata, none of which the render path is willing to deal with
+per segment — and it is the right default for that footage. It was simply also being paid on
+clips that needed nothing: a 1080p30 H.264 file at the size we render is already the mezzanine,
+and encoding it produces a different file with the same pixels.
+
+The cost of that is not a constant, which is why it went unnoticed: it depends entirely on how
+compressed the source was relative to its resolution. Measured on this machine with the ingest
+recipe, a 1080p30 H.264 source at 1.7 Mb/s comes out **10x** bigger at CRF 16 — that is the
+class the copy path now eliminates outright, because it is exactly the class that needed no
+work. iPhone HEVC 10-bit HLG at 9–16 Mb/s grows **1.8–2.6x** (a clip 2.6x, a clip 1.8x,
+a clip 2.2x, tonemapped), and the three 478x850 h264 clips at ~1.7–1.9 Mb/s grow **2.2–3.0x**.
+A near-delivery-bitrate H.264 file is where CRF 16 is most wasteful and where it buys least.
+
+The honest limit is that on the the reference project footage the copy path fires **zero** times. 215 of the 218
+input clips are iPhone HEVC 10-bit HLG — they have to be tonemapped and transcoded, and no
+compatibility rule can change that — and the other three are 478x850 at ~29 fps, wrong on both
+size and frame rate. The remux wins on H.264 material that is already the delivery format: drone
+and action-cam files, clips from other people's phones and cameras, re-imported renders, anything
+that arrives finished. For iPhone HLG footage the ~2x lives in `encoding.mezzanine.crf` instead,
+and whether an archival CRF 16 intermediate is worth 2x the disk for footage that will be graded
+once and encoded again at export is a separate decision that has not been taken. §3.3's lazy
+mezzanine (normalize only the clips the cut actually uses) is still the bigger win on a trip
+where 59 of 76 minutes were never cut in.
+
+The lesson is a small one next to §5's, and worth stating as such: a default sized for the
+fragile case was applied to every case, including the ones that were already correct. The fix
+was not a better encode but a measurement — compare the source against the target the project
+already declares, and when they match, do nothing. That is also why `format` replaced `canvas`:
+the comparison is only trustworthy while the thing ingest measures against and the thing the
+renderer produces are the same value, and two values that must agree eventually don't.
